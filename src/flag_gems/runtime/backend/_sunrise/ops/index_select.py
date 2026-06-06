@@ -6,9 +6,9 @@ import triton.language as tl
 
 from flag_gems import runtime
 from flag_gems.utils import dim_compress, libentry
-from flag_gems.utils import triton_lang_extension as tle
+from flag_gems.utils import triton_lang_extension as ext
 
-logger = logging.getLogger("flag_gems").getChild(__name__.lstrip("."))
+logger = logging.getLogger(__name__)
 
 
 @libentry()
@@ -17,13 +17,13 @@ logger = logging.getLogger("flag_gems").getChild(__name__.lstrip("."))
 def index_select_kernel(
     inp, out, M, N, index, index_len, BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr
 ):
-    pid_x = tle.program_id(axis=0)
-    pid_y = tle.program_id(axis=1)
+    pid_x = ext.program_id(axis=0)
+    pid_y = ext.program_id(axis=1)
     rows_offsets = pid_x * BLOCK_M + tl.arange(0, BLOCK_M)[:, None]
     rows_mask = rows_offsets < M
     cols_offsets = pid_y * BLOCK_N + tl.arange(0, BLOCK_N)
 
-    out_mask = rows_mask and (cols_offsets < index_len)
+    out_mask = rows_mask & (cols_offsets < index_len)
 
     indices = tl.load(index + cols_offsets, mask=(cols_offsets < index_len), other=0)
     valid_lower_bound = indices >= 0
@@ -53,8 +53,8 @@ def index_select_heur_block_m(args):
 @triton.heuristics({"BLOCK_N": index_select_heur_block_m})
 @triton.jit
 def index_select_dim0_kernel(inp, out, N, index, BLOCK_N: tl.constexpr):
-    pid_x = tle.program_id(axis=0)
-    pid_y = tle.program_id(axis=1)
+    pid_x = ext.program_id(axis=0)
+    pid_y = ext.program_id(axis=1)
     cols_offsets = pid_y * BLOCK_N + tl.arange(0, BLOCK_N)
     mask = cols_offsets < N
     indices = tl.load(index + pid_x)
