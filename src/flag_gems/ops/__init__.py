@@ -262,6 +262,7 @@ from flag_gems.ops.lerp import lerp_scalar, lerp_scalar_, lerp_tensor, lerp_tens
 from flag_gems.ops.lgamma_ import lgamma, lgamma_
 from flag_gems.ops.lift_fresh_copy import lift_fresh_copy, lift_fresh_copy_out
 from flag_gems.ops.linalg_cholesky import linalg_cholesky
+from flag_gems.ops.linalg_cholesky_solve import linalg_cholesky_solve
 from flag_gems.ops.linear import linear
 from flag_gems.ops.linspace import linspace
 from flag_gems.ops.log import log
@@ -849,6 +850,7 @@ __all__ = [
     "lift_fresh_copy",
     "lift_fresh_copy_out",
     "linalg_cholesky",
+    "linalg_cholesky_solve",
     "linear",
     "linspace",
     "log",
