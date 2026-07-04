@@ -68,7 +68,7 @@ def cholesky_solve_kernel(
             tl.store(X_ptr + B_base + i * stride_B + c, sum_val / diag)
 
 
-def linalg_cholesky_solve(B, L, upper=False):
+def cholesky_solve(B, L, upper=False):
     """Solves a system of linear equations with a symmetric positive-definite
     matrix using the Cholesky factorization.
 
@@ -83,11 +83,11 @@ def linalg_cholesky_solve(B, L, upper=False):
     Returns:
         X: solution tensor of shape (*, N, nrhs)
     """
-    logger.debug("GEMS LINALG_CHOLESKY_SOLVE")
+    logger.debug("GEMS CHOLESKY_SOLVE")
     assert L.dtype in (
         torch.float32,
         torch.float64,
-    ), "linalg_cholesky_solve only supports float32 and float64"
+    ), "cholesky_solve only supports float32 and float64"
     assert B.dtype == L.dtype, "B and L must have the same dtype"
     if B.device != L.device:
         raise ValueError("B and L must be on the same device")

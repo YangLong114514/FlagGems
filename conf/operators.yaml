@@ -4210,7 +4210,7 @@ ops:
       - BLAS
     stages:
       - alpha: '5.4'
-  - id: linalg_cholesky_solve
+  - id: cholesky_solve
     description: |-
       Solves a system of linear equations with a symmetric positive-definite matrix
       using its Cholesky factorization.

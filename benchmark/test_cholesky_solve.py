@@ -50,8 +50,8 @@ class CholeskySolveBenchmark(base.Benchmark):
             yield (rhs, L)
 
 
-@pytest.mark.linalg_cholesky_solve
-def test_linalg_cholesky_solve():
+@pytest.mark.cholesky_solve
+def test_cholesky_solve():
     bench = CholeskySolveBenchmark(
         op_name="cholesky_solve",
         torch_op=torch.ops.aten.cholesky_solve,
