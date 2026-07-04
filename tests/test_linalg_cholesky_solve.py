@@ -69,12 +69,13 @@ def _solve_with_gems(rhs, L, upper=False):
         return torch.cholesky_solve(rhs, L, upper=upper)
 
 
-def _assert_relative_residual(A, X, rhs, dtype):
+def _assert_backward_error(A, X, rhs, dtype):
     residual = A @ X - rhs
-    rel_residual = residual.norm() / rhs.norm().clamp_min(torch.finfo(dtype).eps)
-    threshold = 1e-2 if dtype == torch.float32 else 1e-8
-    assert rel_residual.item() < threshold, (
-        f"Relative residual too large: {rel_residual.item()} >= {threshold}"
+    denom = A.norm() * X.norm() + rhs.norm()
+    backward_error = residual.norm() / denom.clamp_min(torch.finfo(dtype).eps)
+    threshold = 1e-3 if dtype == torch.float32 else 1e-10
+    assert backward_error.item() < threshold, (
+        f"Backward error too large: {backward_error.item()} >= {threshold}"
     )
 
 
@@ -163,7 +164,7 @@ def test_linalg_cholesky_solve_scaled_inputs(dtype):
         res_out = _solve_with_gems(rhs, L, upper=False)
 
         utils.gems_assert_close(res_out, ref_out, dtype)
-        _assert_relative_residual(A, res_out, rhs, dtype)
+        _assert_backward_error(A, res_out, rhs, dtype)
 
 
 @pytest.mark.linalg_cholesky_solve
@@ -174,7 +175,7 @@ def test_linalg_cholesky_solve_conditioned_matrix(dtype):
     res_out = _solve_with_gems(rhs, L, upper=False)
 
     utils.gems_assert_close(res_out, ref_out, dtype)
-    _assert_relative_residual(A, res_out, rhs, dtype)
+    _assert_backward_error(A, res_out, rhs, dtype)
 
 
 @pytest.mark.linalg_cholesky_solve
@@ -183,7 +184,7 @@ def test_linalg_cholesky_solve_accuracy(dtype):
     A, L, rhs = _make_cholesky_solve_inputs((4, 2), dtype)
     X = _solve_with_gems(rhs, L, upper=False)
 
-    _assert_relative_residual(A, X, rhs, dtype)
+    _assert_backward_error(A, X, rhs, dtype)
 
 
 @pytest.mark.linalg_cholesky_solve
