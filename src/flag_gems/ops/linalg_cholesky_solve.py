@@ -45,9 +45,7 @@ def cholesky_solve_kernel(
     L_base = pid * batch_stride_L
     B_base = pid * batch_stride_B
 
-    # Phase 1: Forward substitution — solve L * Y = B
-    # L is lower-triangular, L[i,i] are the diagonal entries.
-    # Y[i,c] = (B[i,c] - sum_{j=0}^{i-1} L[i,j] * Y[j,c]) / L[i,i]
+    # Phase 1: Forward substitution: solve L * Y = B.
     for c in range(nrhs):
         for i in range(N):
             sum_val = tl.load(B_ptr + B_base + i * stride_B + c)
@@ -58,15 +56,11 @@ def cholesky_solve_kernel(
             diag = tl.load(L_ptr + L_base + i * stride_L + i)
             tl.store(X_ptr + B_base + i * stride_B + c, sum_val / diag)
 
-    # Phase 2: Backward substitution — solve L^T * X = Y
-    # L^T is upper-triangular. We go from bottom to top.
-    # X[i,c] = (Y[i,c] - sum_{j=i+1}^{N-1} L[j,i] * X[j,c]) / L[i,i]
+    # Phase 2: Backward substitution: solve L^T * X = Y.
     for c in range(nrhs):
         for i in range(N - 1, -1, -1):
             sum_val = tl.load(X_ptr + B_base + i * stride_B + c)
             for j in range(i + 1, N):
-                # L[j,i] is the element at row j, column i of L
-                # which corresponds to L^T[i,j]
                 L_val = tl.load(L_ptr + L_base + j * stride_L + i)
                 Xj_val = tl.load(X_ptr + B_base + j * stride_B + c)
                 sum_val = sum_val - L_val * Xj_val
@@ -94,6 +88,9 @@ def linalg_cholesky_solve(B, L, upper=False):
         torch.float32,
         torch.float64,
     ), "linalg_cholesky_solve only supports float32 and float64"
+    assert B.dtype == L.dtype, "B and L must have the same dtype"
+    if B.device != L.device:
+        raise ValueError("B and L must be on the same device")
 
     if B.numel() == 0 or L.numel() == 0:
         return B
@@ -117,7 +114,17 @@ def linalg_cholesky_solve(B, L, upper=False):
 
     nrhs = B_shape[-1]
 
-    # If upper=True, use L^T as the lower-triangular factor
+    try:
+        batch_shape = torch.broadcast_shapes(B_shape[:-2], L_shape[:-2])
+    except RuntimeError as exc:
+        raise ValueError(
+            f"B and L batch dimensions are not broadcastable: "
+            f"{B_shape[:-2]} vs {L_shape[:-2]}"
+        ) from exc
+
+    L = L.expand(batch_shape + L_shape[-2:])
+    B = B.expand(batch_shape + B_shape[-2:])
+
     if upper:
         L = L.transpose(-2, -1).contiguous()
     else:
@@ -126,16 +133,10 @@ def linalg_cholesky_solve(B, L, upper=False):
     B = B.contiguous()
     X = torch.empty_like(B)
 
-    # Flatten batch dimensions
-    if len(L_shape) == 2:
-        batch_size = 1
-    else:
-        batch_dims = L_shape[:-2]
-        batch_size = 1
-        for dim in batch_dims:
-            batch_size *= dim
+    batch_size = 1
+    for dim in batch_shape:
+        batch_size *= dim
 
-    # Reshape to (batch, N, N) and (batch, N, nrhs)
     L_kernel = L.reshape(-1, N, N)
     B_kernel = B.reshape(-1, N, nrhs)
     X_kernel = X.reshape(-1, N, nrhs)
