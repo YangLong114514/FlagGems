@@ -27,45 +27,62 @@ logger = logging.getLogger(__name__)
 @libentry()
 @triton.jit
 def cholesky_solve_kernel(
-    L_ptr, B_ptr, X_ptr, N, nrhs,
-    batch_stride_L, batch_stride_B,
-    stride_L, stride_B,
+    L_ptr,
+    B_ptr,
+    X_ptr,
+    N: tl.constexpr,
+    nrhs: tl.constexpr,
+    batch_stride_L,
+    batch_stride_B,
+    stride_L,
+    stride_B,
+    BLOCK_RHS: tl.constexpr,
 ):
     """Cholesky solve kernel.
 
     Solves LL^T * X = B for X, given the lower-triangular Cholesky factor L
-    and the right-hand side B. Each program computes one matrix in the batch.
+    and the right-hand side B. Each program computes one RHS tile for one
+    matrix in the batch.
 
     Algorithm:
       1. Forward substitution:  L * Y = B  (solve for Y, store in X)
       2. Backward substitution: L^T * X = Y (solve for X, in-place from Y)
     """
-    pid = program_id(0)
+    batch_pid = program_id(0)
+    rhs_tile_pid = program_id(1)
 
-    L_base = pid * batch_stride_L
-    B_base = pid * batch_stride_B
+    L_base = batch_pid * batch_stride_L
+    B_base = batch_pid * batch_stride_B
+    cols = rhs_tile_pid * BLOCK_RHS + tl.arange(0, BLOCK_RHS)
+    cols_mask = cols < nrhs
 
     # Phase 1: Forward substitution: solve L * Y = B.
-    for c in range(nrhs):
-        for i in range(N):
-            sum_val = tl.load(B_ptr + B_base + i * stride_B + c)
-            for j in range(i):
-                L_val = tl.load(L_ptr + L_base + i * stride_L + j)
-                Y_val = tl.load(X_ptr + B_base + j * stride_B + c)
-                sum_val = sum_val - L_val * Y_val
-            diag = tl.load(L_ptr + L_base + i * stride_L + i)
-            tl.store(X_ptr + B_base + i * stride_B + c, sum_val / diag)
+    for i in range(N):
+        sum_val = tl.load(B_ptr + B_base + i * stride_B + cols, mask=cols_mask)
+        for j in range(i):
+            L_val = tl.load(L_ptr + L_base + i * stride_L + j)
+            Y_val = tl.load(
+                X_ptr + B_base + j * stride_B + cols, mask=cols_mask
+            )
+            sum_val = sum_val - L_val * Y_val
+        diag = tl.load(L_ptr + L_base + i * stride_L + i)
+        tl.store(
+            X_ptr + B_base + i * stride_B + cols, sum_val / diag, mask=cols_mask
+        )
 
     # Phase 2: Backward substitution: solve L^T * X = Y.
-    for c in range(nrhs):
-        for i in range(N - 1, -1, -1):
-            sum_val = tl.load(X_ptr + B_base + i * stride_B + c)
-            for j in range(i + 1, N):
-                L_val = tl.load(L_ptr + L_base + j * stride_L + i)
-                Xj_val = tl.load(X_ptr + B_base + j * stride_B + c)
-                sum_val = sum_val - L_val * Xj_val
-            diag = tl.load(L_ptr + L_base + i * stride_L + i)
-            tl.store(X_ptr + B_base + i * stride_B + c, sum_val / diag)
+    for i in range(N - 1, -1, -1):
+        sum_val = tl.load(X_ptr + B_base + i * stride_B + cols, mask=cols_mask)
+        for j in range(i + 1, N):
+            L_val = tl.load(L_ptr + L_base + j * stride_L + i)
+            Xj_val = tl.load(
+                X_ptr + B_base + j * stride_B + cols, mask=cols_mask
+            )
+            sum_val = sum_val - L_val * Xj_val
+        diag = tl.load(L_ptr + L_base + i * stride_L + i)
+        tl.store(
+            X_ptr + B_base + i * stride_B + cols, sum_val / diag, mask=cols_mask
+        )
 
 
 def cholesky_solve(B, L, upper=False):
@@ -146,7 +163,9 @@ def cholesky_solve(B, L, upper=False):
     batch_stride_L = L_kernel.stride(0)
     batch_stride_B = B_kernel.stride(0)
 
-    grid = (batch_size,)
+    block_rhs = min(triton.next_power_of_2(nrhs), 16)
+    rhs_tiles = triton.cdiv(nrhs, block_rhs)
+    grid = (batch_size, rhs_tiles)
 
     with torch.no_grad():
         cholesky_solve_kernel[grid](
@@ -159,6 +178,7 @@ def cholesky_solve(B, L, upper=False):
             batch_stride_B,
             stride_L,
             stride_B,
+            BLOCK_RHS=block_rhs,
         )
 
     return X
