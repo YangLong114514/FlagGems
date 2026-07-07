@@ -24,7 +24,14 @@ from flag_gems.utils.triton_lang_extension import program_id
 logger = logging.getLogger(__name__)
 
 
+CHOLESKY_SOLVE_AUTOTUNE_CONFIGS = [
+    triton.Config({"BLOCK_RHS": block_rhs}, num_warps=1, num_stages=1)
+    for block_rhs in (1, 2, 4, 8, 16, 32)
+]
+
+
 @libentry()
+@triton.autotune(configs=CHOLESKY_SOLVE_AUTOTUNE_CONFIGS, key=["N", "nrhs"])
 @triton.jit
 def cholesky_solve_kernel(
     L_ptr,
@@ -163,9 +170,7 @@ def cholesky_solve(B, L, upper=False):
     batch_stride_L = L_kernel.stride(0)
     batch_stride_B = B_kernel.stride(0)
 
-    block_rhs = min(triton.next_power_of_2(nrhs), 16)
-    rhs_tiles = triton.cdiv(nrhs, block_rhs)
-    grid = (batch_size, rhs_tiles)
+    grid = lambda meta: (batch_size, triton.cdiv(nrhs, meta["BLOCK_RHS"]))
 
     with torch.no_grad():
         cholesky_solve_kernel[grid](
@@ -178,7 +183,6 @@ def cholesky_solve(B, L, upper=False):
             batch_stride_B,
             stride_L,
             stride_B,
-            BLOCK_RHS=block_rhs,
         )
 
     return X
