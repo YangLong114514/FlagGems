@@ -187,7 +187,7 @@ def cholesky_solve(B, L, upper=False):
             batch_stride_B,
             stride_L,
             stride_B,
-            dtype_flag,
+            dtype_flag=dtype_flag,
         )
 
     return X
