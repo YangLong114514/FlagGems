@@ -32,7 +32,7 @@ CHOLESKY_SOLVE_AUTOTUNE_CONFIGS = [
 
 @libentry()
 @triton.autotune(
-    configs=CHOLESKY_SOLVE_AUTOTUNE_CONFIGS, key=["N", "nrhs", "dtype_flag"]
+    configs=CHOLESKY_SOLVE_AUTOTUNE_CONFIGS, key=["N", "nrhs", "dtype_flag", "upper"]
 )
 @triton.jit
 def cholesky_solve_kernel(
@@ -47,16 +47,17 @@ def cholesky_solve_kernel(
     stride_B,
     BLOCK_RHS: tl.constexpr,
     dtype_flag: tl.constexpr,
+    upper: tl.constexpr,
 ):
     """Cholesky solve kernel.
 
-    Solves LL^T * X = B for X, given the lower-triangular Cholesky factor L
-    and the right-hand side B. Each program computes one RHS tile for one
-    matrix in the batch.
+    Solves LL^T * X = B or U^T U * X = B for X, given the lower- or
+    upper-triangular Cholesky factor and the right-hand side B. Each program
+    computes one RHS tile for one matrix in the batch.
 
     Algorithm:
-      1. Forward substitution:  L * Y = B  (solve for Y, store in X)
-      2. Backward substitution: L^T * X = Y (solve for X, in-place from Y)
+      lower=False path: L * Y = B, then L^T * X = Y.
+      upper=True path: U^T * Y = B, then U * X = Y.
     """
     batch_pid = program_id(0)
     rhs_tile_pid = program_id(1)
@@ -70,7 +71,10 @@ def cholesky_solve_kernel(
     for i in range(N):
         sum_val = tl.load(B_ptr + B_base + i * stride_B + cols, mask=cols_mask)
         for j in range(i):
-            L_val = tl.load(L_ptr + L_base + i * stride_L + j)
+            if upper:
+                L_val = tl.load(L_ptr + L_base + j * stride_L + i)
+            else:
+                L_val = tl.load(L_ptr + L_base + i * stride_L + j)
             Y_val = tl.load(
                 X_ptr + B_base + j * stride_B + cols, mask=cols_mask
             )
@@ -84,7 +88,10 @@ def cholesky_solve_kernel(
     for i in range(N - 1, -1, -1):
         sum_val = tl.load(X_ptr + B_base + i * stride_B + cols, mask=cols_mask)
         for j in range(i + 1, N):
-            L_val = tl.load(L_ptr + L_base + j * stride_L + i)
+            if upper:
+                L_val = tl.load(L_ptr + L_base + i * stride_L + j)
+            else:
+                L_val = tl.load(L_ptr + L_base + j * stride_L + i)
             Xj_val = tl.load(
                 X_ptr + B_base + j * stride_B + cols, mask=cols_mask
             )
@@ -152,11 +159,7 @@ def cholesky_solve(B, L, upper=False):
     L = L.expand(batch_shape + L_shape[-2:])
     B = B.expand(batch_shape + B_shape[-2:])
 
-    if upper:
-        L = L.transpose(-2, -1).contiguous()
-    else:
-        L = L.contiguous()
-
+    L = L.contiguous()
     B = B.contiguous()
     X = torch.empty_like(B)
 
@@ -188,6 +191,7 @@ def cholesky_solve(B, L, upper=False):
             stride_L,
             stride_B,
             dtype_flag=dtype_flag,
+            upper=upper,
         )
 
     return X
