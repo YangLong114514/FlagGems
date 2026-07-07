@@ -31,7 +31,9 @@ CHOLESKY_SOLVE_AUTOTUNE_CONFIGS = [
 
 
 @libentry()
-@triton.autotune(configs=CHOLESKY_SOLVE_AUTOTUNE_CONFIGS, key=["N", "nrhs"])
+@triton.autotune(
+    configs=CHOLESKY_SOLVE_AUTOTUNE_CONFIGS, key=["N", "nrhs", "dtype_flag"]
+)
 @triton.jit
 def cholesky_solve_kernel(
     L_ptr,
@@ -44,6 +46,7 @@ def cholesky_solve_kernel(
     stride_L,
     stride_B,
     BLOCK_RHS: tl.constexpr,
+    dtype_flag: tl.constexpr,
 ):
     """Cholesky solve kernel.
 
@@ -171,6 +174,7 @@ def cholesky_solve(B, L, upper=False):
     batch_stride_B = B_kernel.stride(0)
 
     grid = lambda meta: (batch_size, triton.cdiv(nrhs, meta["BLOCK_RHS"]))
+    dtype_flag = 0 if B.dtype == torch.float32 else 1
 
     with torch.no_grad():
         cholesky_solve_kernel[grid](
@@ -183,6 +187,7 @@ def cholesky_solve(B, L, upper=False):
             batch_stride_B,
             stride_L,
             stride_B,
+            dtype_flag,
         )
 
     return X
