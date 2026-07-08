@@ -102,6 +102,57 @@ def cholesky_solve_kernel(
         )
 
 
+@libentry()
+@triton.jit
+def cholesky_solve_single_rhs_kernel(
+    L_ptr,
+    B_ptr,
+    X_ptr,
+    N: tl.constexpr,
+    batch_stride_L,
+    batch_stride_B,
+    stride_L,
+    stride_B,
+    dtype_flag: tl.constexpr,
+    upper: tl.constexpr,
+):
+    """Specialized Cholesky solve kernel for nrhs == 1.
+
+    This path avoids RHS tile vectors and tail masks used by the general
+    multi-RHS kernel. Each program solves one single-RHS system for one batch.
+    """
+    batch_pid = program_id(0)
+
+    L_base = batch_pid * batch_stride_L
+    B_base = batch_pid * batch_stride_B
+
+    # Phase 1: solve L * Y = B or U^T * Y = B.
+    for i in range(N):
+        sum_val = tl.load(B_ptr + B_base + i * stride_B)
+        for j in range(i):
+            if upper:
+                L_val = tl.load(L_ptr + L_base + j * stride_L + i)
+            else:
+                L_val = tl.load(L_ptr + L_base + i * stride_L + j)
+            Y_val = tl.load(X_ptr + B_base + j * stride_B)
+            sum_val = sum_val - L_val * Y_val
+        diag = tl.load(L_ptr + L_base + i * stride_L + i)
+        tl.store(X_ptr + B_base + i * stride_B, sum_val / diag)
+
+    # Phase 2: solve L^T * X = Y or U * X = Y.
+    for i in range(N - 1, -1, -1):
+        sum_val = tl.load(X_ptr + B_base + i * stride_B)
+        for j in range(i + 1, N):
+            if upper:
+                L_val = tl.load(L_ptr + L_base + i * stride_L + j)
+            else:
+                L_val = tl.load(L_ptr + L_base + j * stride_L + i)
+            Xj_val = tl.load(X_ptr + B_base + j * stride_B)
+            sum_val = sum_val - L_val * Xj_val
+        diag = tl.load(L_ptr + L_base + i * stride_L + i)
+        tl.store(X_ptr + B_base + i * stride_B, sum_val / diag)
+
+
 def cholesky_solve(B, L, upper=False):
     """Solves a system of linear equations with a symmetric positive-definite
     matrix using the Cholesky factorization.
@@ -176,22 +227,36 @@ def cholesky_solve(B, L, upper=False):
     batch_stride_L = L_kernel.stride(0)
     batch_stride_B = B_kernel.stride(0)
 
-    grid = lambda meta: (batch_size, triton.cdiv(nrhs, meta["BLOCK_RHS"]))
     dtype_flag = 0 if B.dtype == torch.float32 else 1
 
     with torch.no_grad():
-        cholesky_solve_kernel[grid](
-            L_kernel,
-            B_kernel,
-            X_kernel,
-            N,
-            nrhs,
-            batch_stride_L,
-            batch_stride_B,
-            stride_L,
-            stride_B,
-            dtype_flag=dtype_flag,
-            upper=upper,
-        )
+        if nrhs == 1:
+            cholesky_solve_single_rhs_kernel[(batch_size,)](
+                L_kernel,
+                B_kernel,
+                X_kernel,
+                N,
+                batch_stride_L,
+                batch_stride_B,
+                stride_L,
+                stride_B,
+                dtype_flag=dtype_flag,
+                upper=upper,
+            )
+        else:
+            grid = lambda meta: (batch_size, triton.cdiv(nrhs, meta["BLOCK_RHS"]))
+            cholesky_solve_kernel[grid](
+                L_kernel,
+                B_kernel,
+                X_kernel,
+                N,
+                nrhs,
+                batch_stride_L,
+                batch_stride_B,
+                stride_L,
+                stride_B,
+                dtype_flag=dtype_flag,
+                upper=upper,
+            )
 
     return X
