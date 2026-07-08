@@ -37,7 +37,11 @@ CHOLESKY_SOLVE_CASES = [
     # Upper-factor cases exercise the no-transpose upper=True path.
     ((16, 1), True),
     ((64, 8), True),
+    ((64, 31), True),
+    ((64, 32), True),
+    ((64, 33), True),
     ((128, 16), True),
+    ((256, 128), True),
     ((8, 128, 16), True),
 ]
 

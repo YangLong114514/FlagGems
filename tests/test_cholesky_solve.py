@@ -18,6 +18,28 @@ CHOLESKY_SOLVE_BASIC_SHAPES = [
 ]
 CHOLESKY_SOLVE_LARGE_SHAPES = [(64, 8), (128, 4)]
 CHOLESKY_SOLVE_BATCH_SHAPES = [(2, 4, 1), (3, 8, 2), (2, 3, 16, 4)]
+CHOLESKY_SOLVE_RHS_BOUNDARY_SHAPES = [
+    (64, 15),
+    (64, 16),
+    (64, 17),
+    (64, 31),
+    (64, 32),
+    (64, 33),
+]
+CHOLESKY_SOLVE_UPPER_SHAPES = [
+    (2, 1),
+    (4, 2),
+    (8, 4),
+    (16, 8),
+    (2, 16, 4),
+    (8, 32, 8),
+]
+CHOLESKY_SOLVE_BROADCAST_SHAPES = [
+    ((2, 1, 3, 4, 4), (2, 1, 3, 4, 6)),
+    ((2, 1, 3, 4, 4), (4, 6)),
+    ((4, 4), (2, 1, 3, 4, 2)),
+    ((1, 3, 1, 4, 4), (2, 1, 3, 4, 5)),
+]
 
 
 def _make_cholesky_solve_inputs(shape, dtype, matrix_scale=1.0, rhs_scale=1.0):
@@ -32,6 +54,18 @@ def _make_cholesky_solve_inputs(shape, dtype, matrix_scale=1.0, rhs_scale=1.0):
         *batch_dims, n, nrhs, dtype=dtype, device=flag_gems.device
     )
     return A, L, rhs
+
+
+def _make_cholesky_solve_broadcast_inputs(A_shape, rhs_shape, dtype, upper=False):
+    *batch_dims, n, _ = A_shape
+    B_mat = torch.randn(*batch_dims, n, n, dtype=dtype, device=flag_gems.device)
+    eye = torch.eye(n, dtype=dtype, device=flag_gems.device)
+    for _ in batch_dims:
+        eye = eye.unsqueeze(0)
+    A = B_mat @ B_mat.transpose(-2, -1) + eye * 0.5
+    factor = torch.linalg.cholesky(A, upper=upper)
+    rhs = torch.randn(*rhs_shape, dtype=dtype, device=flag_gems.device)
+    return A, factor, rhs
 
 
 def _make_conditioned_inputs(shape, dtype):
@@ -79,11 +113,22 @@ def _assert_backward_error(A, X, rhs, dtype):
     )
 
 
+def _assert_cholesky_solve_matches(A, factor, rhs, dtype, upper=False):
+    ref_out = torch.cholesky_solve(rhs, factor, upper=upper)
+    res_out = _solve_with_gems(rhs, factor, upper=upper)
+
+    utils.gems_assert_close(res_out, ref_out, dtype)
+    _assert_backward_error(A, res_out, rhs.expand_as(res_out), dtype)
+
+
 @pytest.mark.cholesky_solve
 @pytest.mark.parametrize("shape", CHOLESKY_SOLVE_BASIC_SHAPES)
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
-def test_cholesky_solve(shape, dtype):
+@pytest.mark.parametrize("contiguous_factor", [False, True])
+def test_cholesky_solve(shape, dtype, contiguous_factor):
     _, L, rhs = _make_cholesky_solve_inputs(shape, dtype)
+    if contiguous_factor:
+        L = L.contiguous()
     ref_out = torch.cholesky_solve(rhs, L, upper=False)
     res_out = _solve_with_gems(rhs, L, upper=False)
 
@@ -102,22 +147,34 @@ def test_cholesky_solve_larger_shapes(shape, dtype):
 
 
 @pytest.mark.cholesky_solve
-@pytest.mark.parametrize("shape", [(2, 1), (4, 2), (8, 4)])
+@pytest.mark.parametrize("shape", CHOLESKY_SOLVE_RHS_BOUNDARY_SHAPES)
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
+def test_cholesky_solve_rhs_boundaries(shape, dtype):
+    A, L, rhs = _make_cholesky_solve_inputs(shape, dtype)
+    _assert_cholesky_solve_matches(A, L, rhs, dtype, upper=False)
+
+
+@pytest.mark.cholesky_solve
+@pytest.mark.parametrize("shape", CHOLESKY_SOLVE_UPPER_SHAPES)
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
 def test_cholesky_solve_upper(shape, dtype):
-    _, L, rhs = _make_cholesky_solve_inputs(shape, dtype)
+    A, L, rhs = _make_cholesky_solve_inputs(shape, dtype)
     U = L.mT.contiguous()
     ref_out = torch.cholesky_solve(rhs, U, upper=True)
     res_out = _solve_with_gems(rhs, U, upper=True)
 
     utils.gems_assert_close(res_out, ref_out, dtype)
+    _assert_backward_error(A, res_out, rhs, dtype)
 
 
 @pytest.mark.cholesky_solve
 @pytest.mark.parametrize("shape", CHOLESKY_SOLVE_BATCH_SHAPES)
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
-def test_cholesky_solve_batch(shape, dtype):
+@pytest.mark.parametrize("contiguous_factor", [False, True])
+def test_cholesky_solve_batch(shape, dtype, contiguous_factor):
     _, L, rhs = _make_cholesky_solve_inputs(shape, dtype)
+    if contiguous_factor:
+        L = L.contiguous()
     ref_out = torch.cholesky_solve(rhs, L, upper=False)
     res_out = _solve_with_gems(rhs, L, upper=False)
 
@@ -125,13 +182,15 @@ def test_cholesky_solve_batch(shape, dtype):
 
 
 @pytest.mark.cholesky_solve
+@pytest.mark.parametrize("shapes", CHOLESKY_SOLVE_BROADCAST_SHAPES)
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
-def test_cholesky_solve_broadcast_batch(dtype):
-    _, L, rhs = _make_cholesky_solve_inputs((2, 8, 3), dtype)
-    rhs = rhs[:1]
+@pytest.mark.parametrize("upper", [False, True])
+def test_cholesky_solve_broadcast_batch(shapes, dtype, upper):
+    A_shape, rhs_shape = shapes
+    _, L, rhs = _make_cholesky_solve_broadcast_inputs(A_shape, rhs_shape, dtype, upper)
 
-    ref_out = torch.cholesky_solve(rhs, L, upper=False)
-    res_out = _solve_with_gems(rhs, L, upper=False)
+    ref_out = torch.cholesky_solve(rhs, L, upper=upper)
+    res_out = _solve_with_gems(rhs, L, upper=upper)
 
     utils.gems_assert_close(res_out, ref_out, dtype)
     assert res_out.shape == ref_out.shape
@@ -190,11 +249,13 @@ def test_cholesky_solve_accuracy(dtype):
 @pytest.mark.cholesky_solve
 @pytest.mark.parametrize("shape", [(4, 2), (2, 4, 1)])
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
-def test_cholesky_solve_direct(shape, dtype):
+@pytest.mark.parametrize("upper", [False, True])
+def test_cholesky_solve_direct(shape, dtype, upper):
     _, L, rhs = _make_cholesky_solve_inputs(shape, dtype)
+    factor = L.mT.contiguous() if upper else L
 
-    ref_out = torch.cholesky_solve(rhs, L, upper=False)
-    res_out = cholesky_solve(rhs, L, upper=False)
+    ref_out = torch.cholesky_solve(rhs, factor, upper=upper)
+    res_out = cholesky_solve(rhs, factor, upper=upper)
 
     utils.gems_assert_close(res_out, ref_out, dtype)
 
