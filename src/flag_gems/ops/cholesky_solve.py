@@ -422,6 +422,244 @@ def _can_use_blocked_upper_path(B, upper, N, nrhs):
     )
 
 
+
+def _can_use_blocked_single_rhs_path(B, N, nrhs):
+    return B.dtype == torch.float32 and nrhs == 1 and N >= 128 and N % 32 == 0
+
+
+@libentry()
+@triton.jit
+def cholesky_solve_single_rhs_blocked_lower_kernel(
+    L_ptr,
+    B_ptr,
+    X_ptr,
+    N: tl.constexpr,
+    batch_stride_L,
+    batch_stride_B,
+    stride_L,
+    stride_B,
+    BLOCK_K: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+):
+    """Blocked lower-factor single-RHS Cholesky solve."""
+    batch_pid = program_id(0)
+
+    L_base = batch_pid * batch_stride_L
+    B_base = batch_pid * batch_stride_B
+    k_offsets = tl.arange(0, BLOCK_K)
+    m_offsets = tl.arange(0, BLOCK_M)
+
+    # Forward blocked TRSV: L * Y = B.
+    for k in range(0, N, BLOCK_K):
+        rows_k = k + k_offsets
+        if k == 0:
+            y_block = tl.load(
+                B_ptr + B_base + rows_k * stride_B,
+                mask=rows_k < N,
+                other=0.0,
+            )
+        else:
+            y_block = tl.load(
+                X_ptr + B_base + rows_k * stride_B,
+                mask=rows_k < N,
+                other=0.0,
+            )
+
+        for i in range(BLOCK_K):
+            row_i = k + i
+            if row_i < N:
+                L_vals = tl.load(
+                    L_ptr + L_base + row_i * stride_L + rows_k,
+                    mask=rows_k < row_i,
+                    other=0.0,
+                )
+                dot = tl.sum(L_vals * y_block, axis=0)
+                rhs_val = tl.sum(tl.where(rows_k == row_i, y_block, 0.0), axis=0)
+                diag = tl.load(L_ptr + L_base + row_i * stride_L + row_i)
+                y_val = (rhs_val - dot) / diag
+                y_block = tl.where(rows_k == row_i, y_val, y_block)
+
+        tl.store(X_ptr + B_base + rows_k * stride_B, y_block, mask=rows_k < N)
+
+        for m in range(k + BLOCK_K, N, BLOCK_M):
+            rows_m = m + m_offsets
+            L_tile = tl.load(
+                L_ptr + L_base + rows_m[:, None] * stride_L + rows_k[None, :],
+                mask=(rows_m[:, None] < N) & (rows_k[None, :] < N),
+                other=0.0,
+            )
+            if k == 0:
+                tail = tl.load(
+                    B_ptr + B_base + rows_m * stride_B,
+                    mask=rows_m < N,
+                    other=0.0,
+                )
+            else:
+                tail = tl.load(
+                    X_ptr + B_base + rows_m * stride_B,
+                    mask=rows_m < N,
+                    other=0.0,
+                )
+            tail = tail - tl.sum(L_tile * y_block[None, :], axis=1)
+            tl.store(X_ptr + B_base + rows_m * stride_B, tail, mask=rows_m < N)
+
+    # Backward blocked TRSV: L^T * X = Y.
+    for k in range(N - BLOCK_K, -1, -BLOCK_K):
+        rows_k = k + k_offsets
+        x_block = tl.load(
+            X_ptr + B_base + rows_k * stride_B,
+            mask=rows_k < N,
+            other=0.0,
+        )
+
+        for ii in range(BLOCK_K - 1, -1, -1):
+            row_i = k + ii
+            if row_i < N:
+                L_vals = tl.load(
+                    L_ptr + L_base + rows_k * stride_L + row_i,
+                    mask=(rows_k > row_i) & (rows_k < N),
+                    other=0.0,
+                )
+                dot = tl.sum(L_vals * x_block, axis=0)
+                y_val = tl.sum(tl.where(rows_k == row_i, x_block, 0.0), axis=0)
+                diag = tl.load(L_ptr + L_base + row_i * stride_L + row_i)
+                x_val = (y_val - dot) / diag
+                x_block = tl.where(rows_k == row_i, x_val, x_block)
+
+        tl.store(X_ptr + B_base + rows_k * stride_B, x_block, mask=rows_k < N)
+
+        for m in range(0, k, BLOCK_M):
+            rows_m = m + m_offsets
+            L_tile = tl.load(
+                L_ptr + L_base + rows_k[None, :] * stride_L + rows_m[:, None],
+                mask=(rows_m[:, None] < N) & (rows_k[None, :] < N),
+                other=0.0,
+            )
+            head = tl.load(
+                X_ptr + B_base + rows_m * stride_B,
+                mask=rows_m < N,
+                other=0.0,
+            )
+            head = head - tl.sum(L_tile * x_block[None, :], axis=1)
+            tl.store(X_ptr + B_base + rows_m * stride_B, head, mask=rows_m < N)
+
+
+@libentry()
+@triton.jit
+def cholesky_solve_single_rhs_blocked_upper_kernel(
+    L_ptr,
+    B_ptr,
+    X_ptr,
+    N: tl.constexpr,
+    batch_stride_L,
+    batch_stride_B,
+    stride_L,
+    stride_B,
+    BLOCK_K: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+):
+    """Blocked upper-factor single-RHS Cholesky solve."""
+    batch_pid = program_id(0)
+
+    L_base = batch_pid * batch_stride_L
+    B_base = batch_pid * batch_stride_B
+    k_offsets = tl.arange(0, BLOCK_K)
+    m_offsets = tl.arange(0, BLOCK_M)
+
+    # Forward blocked TRSV: U^T * Y = B.
+    for k in range(0, N, BLOCK_K):
+        rows_k = k + k_offsets
+        if k == 0:
+            y_block = tl.load(
+                B_ptr + B_base + rows_k * stride_B,
+                mask=rows_k < N,
+                other=0.0,
+            )
+        else:
+            y_block = tl.load(
+                X_ptr + B_base + rows_k * stride_B,
+                mask=rows_k < N,
+                other=0.0,
+            )
+
+        for i in range(BLOCK_K):
+            row_i = k + i
+            if row_i < N:
+                U_vals = tl.load(
+                    L_ptr + L_base + rows_k * stride_L + row_i,
+                    mask=rows_k < row_i,
+                    other=0.0,
+                )
+                dot = tl.sum(U_vals * y_block, axis=0)
+                rhs_val = tl.sum(tl.where(rows_k == row_i, y_block, 0.0), axis=0)
+                diag = tl.load(L_ptr + L_base + row_i * stride_L + row_i)
+                y_val = (rhs_val - dot) / diag
+                y_block = tl.where(rows_k == row_i, y_val, y_block)
+
+        tl.store(X_ptr + B_base + rows_k * stride_B, y_block, mask=rows_k < N)
+
+        for m in range(k + BLOCK_K, N, BLOCK_M):
+            rows_m = m + m_offsets
+            U_tile = tl.load(
+                L_ptr + L_base + rows_k[:, None] * stride_L + rows_m[None, :],
+                mask=(rows_k[:, None] < N) & (rows_m[None, :] < N),
+                other=0.0,
+            )
+            if k == 0:
+                tail = tl.load(
+                    B_ptr + B_base + rows_m * stride_B,
+                    mask=rows_m < N,
+                    other=0.0,
+                )
+            else:
+                tail = tl.load(
+                    X_ptr + B_base + rows_m * stride_B,
+                    mask=rows_m < N,
+                    other=0.0,
+                )
+            tail = tail - tl.sum(U_tile * y_block[:, None], axis=0)
+            tl.store(X_ptr + B_base + rows_m * stride_B, tail, mask=rows_m < N)
+
+    # Backward blocked TRSV: U * X = Y.
+    for k in range(N - BLOCK_K, -1, -BLOCK_K):
+        rows_k = k + k_offsets
+        x_block = tl.load(
+            X_ptr + B_base + rows_k * stride_B,
+            mask=rows_k < N,
+            other=0.0,
+        )
+
+        for ii in range(BLOCK_K - 1, -1, -1):
+            row_i = k + ii
+            if row_i < N:
+                U_vals = tl.load(
+                    L_ptr + L_base + row_i * stride_L + rows_k,
+                    mask=(rows_k > row_i) & (rows_k < N),
+                    other=0.0,
+                )
+                dot = tl.sum(U_vals * x_block, axis=0)
+                y_val = tl.sum(tl.where(rows_k == row_i, x_block, 0.0), axis=0)
+                diag = tl.load(L_ptr + L_base + row_i * stride_L + row_i)
+                x_val = (y_val - dot) / diag
+                x_block = tl.where(rows_k == row_i, x_val, x_block)
+
+        tl.store(X_ptr + B_base + rows_k * stride_B, x_block, mask=rows_k < N)
+
+        for m in range(0, k, BLOCK_M):
+            rows_m = m + m_offsets
+            U_tile = tl.load(
+                L_ptr + L_base + rows_m[:, None] * stride_L + rows_k[None, :],
+                mask=(rows_m[:, None] < N) & (rows_k[None, :] < N),
+                other=0.0,
+            )
+            head = tl.load(
+                X_ptr + B_base + rows_m * stride_B,
+                mask=rows_m < N,
+                other=0.0,
+            )
+            head = head - tl.sum(U_tile * x_block[None, :], axis=1)
+            tl.store(X_ptr + B_base + rows_m * stride_B, head, mask=rows_m < N)
+
 @libentry()
 @triton.jit
 def cholesky_solve_small_single_rhs_kernel(
@@ -761,6 +999,37 @@ def cholesky_solve(B, L, upper=False):
                 num_warps=4,
                 num_stages=3,
             )
+        elif _can_use_blocked_single_rhs_path(B, N, nrhs):
+            if upper:
+                cholesky_solve_single_rhs_blocked_upper_kernel[(batch_size,)](
+                    L_kernel,
+                    B_kernel,
+                    X_kernel,
+                    N,
+                    batch_stride_L,
+                    batch_stride_B,
+                    stride_L,
+                    stride_B,
+                    BLOCK_K=32,
+                    BLOCK_M=32,
+                    num_warps=4,
+                    num_stages=3,
+                )
+            else:
+                cholesky_solve_single_rhs_blocked_lower_kernel[(batch_size,)](
+                    L_kernel,
+                    B_kernel,
+                    X_kernel,
+                    N,
+                    batch_stride_L,
+                    batch_stride_B,
+                    stride_L,
+                    stride_B,
+                    BLOCK_K=32,
+                    BLOCK_M=32,
+                    num_warps=4,
+                    num_stages=3,
+                )
         elif nrhs == 1 and N <= 64:
             block_n = triton.next_power_of_2(N)
             cholesky_solve_small_single_rhs_kernel[(batch_size,)](
