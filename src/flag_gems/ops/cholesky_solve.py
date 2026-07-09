@@ -323,11 +323,12 @@ def cholesky_solve_blocked_upper_kernel(
 
         for m in range(k + BLOCK_K, N, BLOCK_M):
             rows_m = m + m_offsets
-            U_tile = tl.load(
-                L_ptr + L_base + rows_k[None, :] * stride_L + rows_m[:, None],
-                mask=(rows_m[:, None] < N) & (rows_k[None, :] < N),
+            U_tile_km = tl.load(
+                L_ptr + L_base + rows_k[:, None] * stride_L + rows_m[None, :],
+                mask=(rows_k[:, None] < N) & (rows_m[None, :] < N),
                 other=0.0,
             )
+            U_tile = tl.trans(U_tile_km)
             if k == 0:
                 tail = tl.load(
                     B_ptr + B_base + rows_m[:, None] * stride_B + rhs_cols[None, :],
