@@ -15,6 +15,10 @@ CHOLESKY_SOLVE_CASES = [
     ((64, 1), False),
     ((128, 1), False),
     ((256, 1), False),
+    # Small-N small-RHS fused path coverage.
+    ((16, 2), False),
+    ((16, 4), False),
+    ((32, 4), False),
     # RHS sweep around BLOCK_RHS boundaries and tail cases.
     ((64, 4), False),
     ((64, 16), False),
@@ -31,6 +35,8 @@ CHOLESKY_SOLVE_CASES = [
     ((16, 16, 1), False),
     ((64, 16, 1), False),
     ((256, 16, 1), False),
+    ((16, 16, 4), False),
+    ((16, 32, 4), False),
     ((16, 32, 8), False),
     ((32, 64, 16), False),
     ((8, 128, 16), False),

@@ -185,6 +185,100 @@ def cholesky_solve_small_single_rhs_kernel(
 
 @libentry()
 @triton.jit
+def cholesky_solve_small_nrhs_kernel(
+    L_ptr,
+    B_ptr,
+    X_ptr,
+    N: tl.constexpr,
+    nrhs: tl.constexpr,
+    batch_stride_L,
+    batch_stride_B,
+    stride_L,
+    stride_B,
+    BLOCK_N: tl.constexpr,
+    BLOCK_RHS: tl.constexpr,
+    dtype_flag: tl.constexpr,
+    upper: tl.constexpr,
+):
+    """Small-N/small-RHS fused kernel with register-resident Y/X.
+
+    This keeps the intermediate triangular-solve result as a [N, nrhs]
+    register tile and writes the final X once. It is limited to small systems
+    to avoid excessive register pressure.
+    """
+    batch_pid = program_id(0)
+
+    L_base = batch_pid * batch_stride_L
+    B_base = batch_pid * batch_stride_B
+    rows = tl.arange(0, BLOCK_N)
+    cols = tl.arange(0, BLOCK_RHS)
+    cols_mask = cols < nrhs
+
+    if dtype_flag == 0:
+        y_tile = tl.zeros([BLOCK_N, BLOCK_RHS], dtype=tl.float32)
+    else:
+        y_tile = tl.zeros([BLOCK_N, BLOCK_RHS], dtype=tl.float64)
+
+    # Phase 1: solve L * Y = B or U^T * Y = B for all small RHS columns.
+    for i in range(N):
+        if upper:
+            L_vals = tl.load(
+                L_ptr + L_base + rows * stride_L + i,
+                mask=rows < i,
+                other=0.0,
+            )
+        else:
+            L_vals = tl.load(
+                L_ptr + L_base + i * stride_L + rows,
+                mask=rows < i,
+                other=0.0,
+            )
+        dot = tl.sum(L_vals[:, None] * y_tile, axis=0)
+        rhs_vals = tl.load(
+            B_ptr + B_base + i * stride_B + cols,
+            mask=cols_mask,
+            other=0.0,
+        )
+        diag = tl.load(L_ptr + L_base + i * stride_L + i)
+        y_vals = (rhs_vals - dot) / diag
+        y_tile = tl.where(rows[:, None] == i, y_vals[None, :], y_tile)
+
+    x_tile = y_tile
+
+    # Phase 2: solve L^T * X = Y or U * X = Y.
+    for i in range(N - 1, -1, -1):
+        active = (rows > i) & (rows < N)
+        if upper:
+            L_vals = tl.load(
+                L_ptr + L_base + i * stride_L + rows,
+                mask=active,
+                other=0.0,
+            )
+        else:
+            L_vals = tl.load(
+                L_ptr + L_base + rows * stride_L + i,
+                mask=active,
+                other=0.0,
+            )
+        dot = tl.sum(L_vals[:, None] * x_tile, axis=0)
+        y_vals = tl.sum(tl.where(rows[:, None] == i, y_tile, 0.0), axis=0)
+        diag = tl.load(L_ptr + L_base + i * stride_L + i)
+        x_vals = (y_vals - dot) / diag
+        x_tile = tl.where(rows[:, None] == i, x_vals[None, :], x_tile)
+
+    tl.store(
+        X_ptr + B_base + rows[:, None] * stride_B + cols[None, :],
+        x_tile,
+        mask=(rows[:, None] < N) & cols_mask[None, :],
+    )
+
+
+def _can_use_small_nrhs_path(N, nrhs):
+    return N <= 32 and 1 < nrhs <= 4
+
+
+@libentry()
+@triton.jit
 def cholesky_solve_single_rhs_kernel(
     L_ptr,
     B_ptr,
@@ -336,6 +430,24 @@ def cholesky_solve(B, L, upper=False):
                 batch_stride_B,
                 stride_L,
                 stride_B,
+                dtype_flag=dtype_flag,
+                upper=upper,
+            )
+        elif _can_use_small_nrhs_path(N, nrhs):
+            block_n = triton.next_power_of_2(N)
+            block_rhs = triton.next_power_of_2(nrhs)
+            cholesky_solve_small_nrhs_kernel[(batch_size,)](
+                L_kernel,
+                B_kernel,
+                X_kernel,
+                N,
+                nrhs,
+                batch_stride_L,
+                batch_stride_B,
+                stride_L,
+                stride_B,
+                BLOCK_N=block_n,
+                BLOCK_RHS=block_rhs,
                 dtype_flag=dtype_flag,
                 upper=upper,
             )
