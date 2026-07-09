@@ -483,11 +483,6 @@ def cholesky_solve_single_rhs_blocked_lower_kernel(
 
         for m in range(k + BLOCK_K, N, BLOCK_M):
             rows_m = m + m_offsets
-            L_tile = tl.load(
-                L_ptr + L_base + rows_m[:, None] * stride_L + rows_k[None, :],
-                mask=(rows_m[:, None] < N) & (rows_k[None, :] < N),
-                other=0.0,
-            )
             if k == 0:
                 tail = tl.load(
                     B_ptr + B_base + rows_m * stride_B,
@@ -500,7 +495,16 @@ def cholesky_solve_single_rhs_blocked_lower_kernel(
                     mask=rows_m < N,
                     other=0.0,
                 )
-            tail = tail - tl.sum(L_tile * y_block[None, :], axis=1)
+            for i in range(BLOCK_K):
+                row_i = k + i
+                if row_i < N:
+                    L_col = tl.load(
+                        L_ptr + L_base + rows_m * stride_L + row_i,
+                        mask=rows_m < N,
+                        other=0.0,
+                    )
+                    y_val = tl.sum(tl.where(rows_k == row_i, y_block, 0.0), axis=0)
+                    tail = tail - L_col * y_val
             tl.store(X_ptr + B_base + rows_m * stride_B, tail, mask=rows_m < N)
 
     # Backward blocked TRSV: L^T * X = Y.
@@ -530,17 +534,21 @@ def cholesky_solve_single_rhs_blocked_lower_kernel(
 
         for m in range(0, k, BLOCK_M):
             rows_m = m + m_offsets
-            L_tile = tl.load(
-                L_ptr + L_base + rows_k[None, :] * stride_L + rows_m[:, None],
-                mask=(rows_m[:, None] < N) & (rows_k[None, :] < N),
-                other=0.0,
-            )
             head = tl.load(
                 X_ptr + B_base + rows_m * stride_B,
                 mask=rows_m < N,
                 other=0.0,
             )
-            head = head - tl.sum(L_tile * x_block[None, :], axis=1)
+            for i in range(BLOCK_K):
+                row_i = k + i
+                if row_i < N:
+                    L_col = tl.load(
+                        L_ptr + L_base + row_i * stride_L + rows_m,
+                        mask=rows_m < N,
+                        other=0.0,
+                    )
+                    x_val = tl.sum(tl.where(rows_k == row_i, x_block, 0.0), axis=0)
+                    head = head - L_col * x_val
             tl.store(X_ptr + B_base + rows_m * stride_B, head, mask=rows_m < N)
 
 
@@ -600,11 +608,6 @@ def cholesky_solve_single_rhs_blocked_upper_kernel(
 
         for m in range(k + BLOCK_K, N, BLOCK_M):
             rows_m = m + m_offsets
-            U_tile = tl.load(
-                L_ptr + L_base + rows_k[:, None] * stride_L + rows_m[None, :],
-                mask=(rows_k[:, None] < N) & (rows_m[None, :] < N),
-                other=0.0,
-            )
             if k == 0:
                 tail = tl.load(
                     B_ptr + B_base + rows_m * stride_B,
@@ -617,7 +620,16 @@ def cholesky_solve_single_rhs_blocked_upper_kernel(
                     mask=rows_m < N,
                     other=0.0,
                 )
-            tail = tail - tl.sum(U_tile * y_block[:, None], axis=0)
+            for i in range(BLOCK_K):
+                row_i = k + i
+                if row_i < N:
+                    U_row = tl.load(
+                        L_ptr + L_base + row_i * stride_L + rows_m,
+                        mask=rows_m < N,
+                        other=0.0,
+                    )
+                    y_val = tl.sum(tl.where(rows_k == row_i, y_block, 0.0), axis=0)
+                    tail = tail - U_row * y_val
             tl.store(X_ptr + B_base + rows_m * stride_B, tail, mask=rows_m < N)
 
     # Backward blocked TRSV: U * X = Y.
@@ -647,18 +659,23 @@ def cholesky_solve_single_rhs_blocked_upper_kernel(
 
         for m in range(0, k, BLOCK_M):
             rows_m = m + m_offsets
-            U_tile = tl.load(
-                L_ptr + L_base + rows_m[:, None] * stride_L + rows_k[None, :],
-                mask=(rows_m[:, None] < N) & (rows_k[None, :] < N),
-                other=0.0,
-            )
             head = tl.load(
                 X_ptr + B_base + rows_m * stride_B,
                 mask=rows_m < N,
                 other=0.0,
             )
-            head = head - tl.sum(U_tile * x_block[None, :], axis=1)
+            for i in range(BLOCK_K):
+                row_i = k + i
+                if row_i < N:
+                    U_col = tl.load(
+                        L_ptr + L_base + rows_m * stride_L + row_i,
+                        mask=rows_m < N,
+                        other=0.0,
+                    )
+                    x_val = tl.sum(tl.where(rows_k == row_i, x_block, 0.0), axis=0)
+                    head = head - U_col * x_val
             tl.store(X_ptr + B_base + rows_m * stride_B, head, mask=rows_m < N)
+
 
 @libentry()
 @triton.jit
