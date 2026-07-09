@@ -104,6 +104,67 @@ def cholesky_solve_kernel(
 
 @libentry()
 @triton.jit
+def cholesky_solve_nomask_rhs_kernel(
+    L_ptr,
+    B_ptr,
+    X_ptr,
+    N: tl.constexpr,
+    batch_stride_L,
+    batch_stride_B,
+    stride_L,
+    stride_B,
+    BLOCK_RHS: tl.constexpr,
+    dtype_flag: tl.constexpr,
+    upper: tl.constexpr,
+):
+    """Cholesky solve kernel for RHS tiles that need no column mask.
+
+    The wrapper only dispatches here when nrhs is exactly divisible by
+    BLOCK_RHS, so every RHS tile is fully in bounds.
+    """
+    batch_pid = program_id(0)
+    rhs_tile_pid = program_id(1)
+
+    L_base = batch_pid * batch_stride_L
+    B_base = batch_pid * batch_stride_B
+    cols = rhs_tile_pid * BLOCK_RHS + tl.arange(0, BLOCK_RHS)
+
+    # Phase 1: solve L * Y = B or U^T * Y = B.
+    for i in range(N):
+        sum_val = tl.load(B_ptr + B_base + i * stride_B + cols)
+        for j in range(i):
+            if upper:
+                L_val = tl.load(L_ptr + L_base + j * stride_L + i)
+            else:
+                L_val = tl.load(L_ptr + L_base + i * stride_L + j)
+            Y_val = tl.load(X_ptr + B_base + j * stride_B + cols)
+            sum_val = sum_val - L_val * Y_val
+        diag = tl.load(L_ptr + L_base + i * stride_L + i)
+        tl.store(X_ptr + B_base + i * stride_B + cols, sum_val / diag)
+
+    # Phase 2: solve L^T * X = Y or U * X = Y.
+    for i in range(N - 1, -1, -1):
+        sum_val = tl.load(X_ptr + B_base + i * stride_B + cols)
+        for j in range(i + 1, N):
+            if upper:
+                L_val = tl.load(L_ptr + L_base + i * stride_L + j)
+            else:
+                L_val = tl.load(L_ptr + L_base + j * stride_L + i)
+            Xj_val = tl.load(X_ptr + B_base + j * stride_B + cols)
+            sum_val = sum_val - L_val * Xj_val
+        diag = tl.load(L_ptr + L_base + i * stride_L + i)
+        tl.store(X_ptr + B_base + i * stride_B + cols, sum_val / diag)
+
+
+def _rhs_nomask_block_size(nrhs):
+    for block_rhs in (32, 16, 8, 4, 2):
+        if nrhs >= block_rhs and nrhs % block_rhs == 0:
+            return block_rhs
+    return None
+
+
+@libentry()
+@triton.jit
 def cholesky_solve_single_rhs_kernel(
     L_ptr,
     B_ptr,
@@ -229,6 +290,8 @@ def cholesky_solve(B, L, upper=False):
 
     dtype_flag = 0 if B.dtype == torch.float32 else 1
 
+    nomask_block_rhs = _rhs_nomask_block_size(nrhs)
+
     with torch.no_grad():
         if nrhs == 1:
             cholesky_solve_single_rhs_kernel[(batch_size,)](
@@ -240,6 +303,21 @@ def cholesky_solve(B, L, upper=False):
                 batch_stride_B,
                 stride_L,
                 stride_B,
+                dtype_flag=dtype_flag,
+                upper=upper,
+            )
+        elif nomask_block_rhs is not None:
+            grid = (batch_size, nrhs // nomask_block_rhs)
+            cholesky_solve_nomask_rhs_kernel[grid](
+                L_kernel,
+                B_kernel,
+                X_kernel,
+                N,
+                batch_stride_L,
+                batch_stride_B,
+                stride_L,
+                stride_B,
+                BLOCK_RHS=nomask_block_rhs,
                 dtype_flag=dtype_flag,
                 upper=upper,
             )
