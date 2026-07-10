@@ -29,6 +29,35 @@ CHOLESKY_SOLVE_AUTOTUNE_CONFIGS = [
     for block_rhs in (1, 2, 4, 8, 16, 32)
 ]
 
+# Single-RHS kernels are dependency-bound and commonly launch one program per
+# system. Keep their tuning space deliberately small and include the existing
+# four-warp blocked configuration as a baseline.
+SMALL_SINGLE_RHS_AUTOTUNE_CONFIGS = [
+    triton.Config({}, num_warps=1, num_stages=1),
+    triton.Config({}, num_warps=2, num_stages=1),
+    # Baseline used by the previous launch defaults.
+    triton.Config({}, num_warps=4, num_stages=3),
+]
+
+SINGLE_RHS_BLOCKED_AUTOTUNE_CONFIGS = [
+    triton.Config(
+        {"BLOCK_K": block_k, "BLOCK_M": block_m},
+        num_warps=num_warps,
+        num_stages=num_stages,
+    )
+    for block_k, block_m, num_warps, num_stages in (
+        (16, 16, 1, 1),
+        (16, 16, 2, 1),
+        (16, 32, 2, 1),
+        (32, 16, 2, 1),
+        (32, 32, 1, 1),
+        (32, 32, 2, 1),
+        # Baselines used by the previous fp64 and fp32 dispatch respectively.
+        (16, 16, 4, 2),
+        (32, 32, 4, 3),
+    )
+]
+
 # Curated autotune configs for blocked Cholesky solve kernels.
 # Following the group_gemm.py pattern: a hand-picked list rather than
 # a Cartesian explosion. All configs use BLOCK_RHS >= 16 to satisfy
@@ -697,6 +726,10 @@ def _can_use_blocked_single_rhs_path(N, nrhs):
 
 
 @libentry()
+@triton.autotune(
+    configs=SINGLE_RHS_BLOCKED_AUTOTUNE_CONFIGS,
+    key=["N", "dtype_flag"],
+)
 @triton.jit
 def cholesky_solve_single_rhs_blocked_lower_kernel(
     L_ptr,
@@ -814,21 +847,26 @@ def cholesky_solve_single_rhs_blocked_lower_kernel(
 
         for m in range(0, k, BLOCK_M):
             rows_m = m + m_offsets
+            rows_m_mask = rows_m < k
             L_tile = tl.load(
                 L_ptr + L_base + rows_k[None, :] * stride_L + rows_m[:, None],
-                mask=(rows_m[:, None] < N) & (rows_k[None, :] < N),
+                mask=rows_m_mask[:, None] & (rows_k[None, :] < N),
                 other=0.0,
             )
             head = tl.load(
                 X_ptr + B_base + rows_m * stride_B,
-                mask=rows_m < N,
+                mask=rows_m_mask,
                 other=0.0,
             )
             head = head - tl.sum(L_tile * x_block[None, :], axis=1)
-            tl.store(X_ptr + B_base + rows_m * stride_B, head, mask=rows_m < N)
+            tl.store(X_ptr + B_base + rows_m * stride_B, head, mask=rows_m_mask)
 
 
 @libentry()
+@triton.autotune(
+    configs=SINGLE_RHS_BLOCKED_AUTOTUNE_CONFIGS,
+    key=["N", "dtype_flag"],
+)
 @triton.jit
 def cholesky_solve_single_rhs_blocked_upper_kernel(
     L_ptr,
@@ -946,21 +984,26 @@ def cholesky_solve_single_rhs_blocked_upper_kernel(
 
         for m in range(0, k, BLOCK_M):
             rows_m = m + m_offsets
+            rows_m_mask = rows_m < k
             U_tile = tl.load(
                 L_ptr + L_base + rows_m[:, None] * stride_L + rows_k[None, :],
-                mask=(rows_m[:, None] < N) & (rows_k[None, :] < N),
+                mask=rows_m_mask[:, None] & (rows_k[None, :] < N),
                 other=0.0,
             )
             head = tl.load(
                 X_ptr + B_base + rows_m * stride_B,
-                mask=rows_m < N,
+                mask=rows_m_mask,
                 other=0.0,
             )
             head = head - tl.sum(U_tile * x_block[None, :], axis=1)
-            tl.store(X_ptr + B_base + rows_m * stride_B, head, mask=rows_m < N)
+            tl.store(X_ptr + B_base + rows_m * stride_B, head, mask=rows_m_mask)
 
 
 @libentry()
+@triton.autotune(
+    configs=SMALL_SINGLE_RHS_AUTOTUNE_CONFIGS,
+    key=["N", "dtype_flag", "upper"],
+)
 @triton.jit
 def cholesky_solve_small_single_rhs_kernel(
     L_ptr,
@@ -1029,7 +1072,10 @@ def cholesky_solve_small_single_rhs_kernel(
                 mask=active, other=0.0,
             )
         dot = tl.sum(L_vals * x_vec, axis=0)
-        y_i = tl.sum(tl.where(offsets == i, y_vec, 0.0), axis=0)
+        # Rows <= i have not been overwritten yet, so x_vec[i] is still Y[i].
+        # Reading it from x_vec lets y_vec die before the backward phase instead
+        # of keeping both full vectors live in registers.
+        y_i = tl.sum(tl.where(offsets == i, x_vec, 0.0), axis=0)
         diag = tl.load(L_ptr + L_base + i * stride_L + i)
         inv_diag = 1.0 / diag
         inv_diag = inv_diag * (2.0 - diag * inv_diag)
@@ -1127,7 +1173,9 @@ def cholesky_solve_small_nrhs_kernel(
                 other=0.0,
             )
         dot = tl.sum(L_vals[:, None] * x_tile, axis=0)
-        y_vals = tl.sum(tl.where(rows[:, None] == i, y_tile, 0.0), axis=0)
+        # Rows <= i still contain Y while rows > i already contain X. Reuse the
+        # mixed x_tile so the original y_tile need not stay live in registers.
+        y_vals = tl.sum(tl.where(rows[:, None] == i, x_tile, 0.0), axis=0)
         diag = tl.load(L_ptr + L_base + i * stride_L + i)
         inv_diag = 1.0 / diag
         inv_diag = inv_diag * (2.0 - diag * inv_diag)
@@ -1380,21 +1428,17 @@ def cholesky_solve(B, L, upper=False):
                     BLOCK_RHS=tile["BLOCK_RHS"], dtype_flag=dtype_flag, **warp,
                 )
         elif _can_use_blocked_single_rhs_path(N, nrhs):
-            tile = _get_blocked_tile_configs(B.dtype, nrhs, N)
-            warp = _get_blocked_warp_config(B.dtype)
             if upper:
                 cholesky_solve_single_rhs_blocked_upper_kernel[(batch_size,)](
                     L_kernel, B_kernel, X_kernel, N,
                     batch_stride_L, batch_stride_B, stride_L, stride_B,
-                    BLOCK_K=tile["BLOCK_K"], BLOCK_M=tile["BLOCK_M"],
-                    dtype_flag=dtype_flag, **warp,
+                    dtype_flag=dtype_flag,
                 )
             else:
                 cholesky_solve_single_rhs_blocked_lower_kernel[(batch_size,)](
                     L_kernel, B_kernel, X_kernel, N,
                     batch_stride_L, batch_stride_B, stride_L, stride_B,
-                    BLOCK_K=tile["BLOCK_K"], BLOCK_M=tile["BLOCK_M"],
-                    dtype_flag=dtype_flag, **warp,
+                    dtype_flag=dtype_flag,
                 )
         elif nrhs == 1 and N <= 64:
             block_n = triton.next_power_of_2(N)

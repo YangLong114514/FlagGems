@@ -17,6 +17,11 @@ CHOLESKY_SOLVE_BASIC_SHAPES = [
     (32, 16),
 ]
 CHOLESKY_SOLVE_LARGE_SHAPES = [(64, 8), (128, 4)]
+CHOLESKY_SOLVE_BLOCKED_SINGLE_RHS_SHAPES = [
+    (128, 1),
+    (256, 1),
+    (2, 128, 1),
+]
 CHOLESKY_SOLVE_BATCH_SHAPES = [(2, 4, 1), (3, 8, 2), (2, 3, 16, 4)]
 CHOLESKY_SOLVE_RHS_BOUNDARY_SHAPES = [
     (64, 15),
@@ -165,6 +170,17 @@ def test_cholesky_solve_upper(shape, dtype):
 
     utils.gems_assert_close(res_out, ref_out, dtype)
     _assert_backward_error(A, res_out, rhs, dtype)
+
+
+@pytest.mark.cholesky_solve
+@pytest.mark.parametrize("shape", CHOLESKY_SOLVE_BLOCKED_SINGLE_RHS_SHAPES)
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
+@pytest.mark.parametrize("upper", [False, True])
+def test_cholesky_solve_blocked_single_rhs(shape, dtype, upper):
+    A, L, rhs = _make_cholesky_solve_inputs(shape, dtype)
+    factor = L.mT.contiguous() if upper else L
+
+    _assert_cholesky_solve_matches(A, factor, rhs, dtype, upper=upper)
 
 
 @pytest.mark.cholesky_solve
