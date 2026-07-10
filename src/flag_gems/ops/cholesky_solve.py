@@ -196,15 +196,10 @@ def cholesky_solve_blocked_lower_kernel(
             )
 
         # Inner TRSM: solve the diagonal block L_kk * Y_k = B_k.
+        # Use pivot broadcast / incremental update, mirroring rocSOLVER TRSM.
         for i in range(BLOCK_K):
             row_i = k + i
             if row_i < N:
-                L_vals = tl.load(
-                    L_ptr + L_base + row_i * stride_L + rows_k,
-                    mask=rows_k < row_i,
-                    other=0.0,
-                )
-                dot = tl.sum(L_vals[:, None] * y_block, axis=0)
                 row_mask = rows_k[:, None] == row_i
                 y_cur = tl.sum(tl.where(row_mask, y_block, 0.0), axis=0)
                 diag = tl.load(L_ptr + L_base + row_i * stride_L + row_i)
@@ -213,7 +208,13 @@ def cholesky_solve_blocked_lower_kernel(
                 inv_diag = inv_diag * (2.0 - diag * inv_diag)
                 if dtype_flag == 1:
                     inv_diag = inv_diag * (2.0 - diag * inv_diag)
-                y_new = (y_cur - dot) * inv_diag
+                y_new = y_cur * inv_diag
+                L_col = tl.load(
+                    L_ptr + L_base + rows_k * stride_L + row_i,
+                    mask=(rows_k > row_i) & (rows_k < N),
+                    other=0.0,
+                )
+                y_block = y_block - L_col[:, None] * y_new[None, :]
                 y_block = tl.where(row_mask, y_new[None, :], y_block)
 
         tl.store(
@@ -264,12 +265,6 @@ def cholesky_solve_blocked_lower_kernel(
         for ii in range(BLOCK_K - 1, -1, -1):
             row_i = k + ii
             if row_i < N:
-                L_vals = tl.load(
-                    L_ptr + L_base + rows_k * stride_L + row_i,
-                    mask=(rows_k > row_i) & (rows_k < N),
-                    other=0.0,
-                )
-                dot = tl.sum(L_vals[:, None] * x_block, axis=0)
                 row_mask = rows_k[:, None] == row_i
                 y_cur = tl.sum(tl.where(row_mask, x_block, 0.0), axis=0)
                 diag = tl.load(L_ptr + L_base + row_i * stride_L + row_i)
@@ -277,7 +272,13 @@ def cholesky_solve_blocked_lower_kernel(
                 inv_diag = inv_diag * (2.0 - diag * inv_diag)
                 if dtype_flag == 1:
                     inv_diag = inv_diag * (2.0 - diag * inv_diag)
-                x_new = (y_cur - dot) * inv_diag
+                x_new = y_cur * inv_diag
+                L_row = tl.load(
+                    L_ptr + L_base + row_i * stride_L + rows_k,
+                    mask=rows_k < row_i,
+                    other=0.0,
+                )
+                x_block = x_block - L_row[:, None] * x_new[None, :]
                 x_block = tl.where(row_mask, x_new[None, :], x_block)
 
         tl.store(
@@ -360,12 +361,6 @@ def cholesky_solve_blocked_upper_kernel(
         for i in range(BLOCK_K):
             row_i = k + i
             if row_i < N:
-                U_vals = tl.load(
-                    L_ptr + L_base + rows_k * stride_L + row_i,
-                    mask=rows_k < row_i,
-                    other=0.0,
-                )
-                dot = tl.sum(U_vals[:, None] * y_block, axis=0)
                 row_mask = rows_k[:, None] == row_i
                 y_cur = tl.sum(tl.where(row_mask, y_block, 0.0), axis=0)
                 diag = tl.load(L_ptr + L_base + row_i * stride_L + row_i)
@@ -373,7 +368,13 @@ def cholesky_solve_blocked_upper_kernel(
                 inv_diag = inv_diag * (2.0 - diag * inv_diag)
                 if dtype_flag == 1:
                     inv_diag = inv_diag * (2.0 - diag * inv_diag)
-                y_new = (y_cur - dot) * inv_diag
+                y_new = y_cur * inv_diag
+                U_row = tl.load(
+                    L_ptr + L_base + row_i * stride_L + rows_k,
+                    mask=(rows_k > row_i) & (rows_k < N),
+                    other=0.0,
+                )
+                y_block = y_block - U_row[:, None] * y_new[None, :]
                 y_block = tl.where(row_mask, y_new[None, :], y_block)
 
         tl.store(
@@ -424,12 +425,6 @@ def cholesky_solve_blocked_upper_kernel(
         for ii in range(BLOCK_K - 1, -1, -1):
             row_i = k + ii
             if row_i < N:
-                U_vals = tl.load(
-                    L_ptr + L_base + row_i * stride_L + rows_k,
-                    mask=(rows_k > row_i) & (rows_k < N),
-                    other=0.0,
-                )
-                dot = tl.sum(U_vals[:, None] * x_block, axis=0)
                 row_mask = rows_k[:, None] == row_i
                 y_cur = tl.sum(tl.where(row_mask, x_block, 0.0), axis=0)
                 diag = tl.load(L_ptr + L_base + row_i * stride_L + row_i)
@@ -437,7 +432,13 @@ def cholesky_solve_blocked_upper_kernel(
                 inv_diag = inv_diag * (2.0 - diag * inv_diag)
                 if dtype_flag == 1:
                     inv_diag = inv_diag * (2.0 - diag * inv_diag)
-                x_new = (y_cur - dot) * inv_diag
+                x_new = y_cur * inv_diag
+                U_col = tl.load(
+                    L_ptr + L_base + rows_k * stride_L + row_i,
+                    mask=rows_k < row_i,
+                    other=0.0,
+                )
+                x_block = x_block - U_col[:, None] * x_new[None, :]
                 x_block = tl.where(row_mask, x_new[None, :], x_block)
 
         tl.store(
@@ -534,12 +535,6 @@ def cholesky_solve_single_rhs_blocked_lower_kernel(
         for i in range(BLOCK_K):
             row_i = k + i
             if row_i < N:
-                L_vals = tl.load(
-                    L_ptr + L_base + row_i * stride_L + rows_k,
-                    mask=rows_k < row_i,
-                    other=0.0,
-                )
-                dot = tl.sum(L_vals * y_block, axis=0)
                 row_mask = rows_k == row_i
                 y_cur = tl.sum(tl.where(row_mask, y_block, 0.0), axis=0)
                 diag = tl.load(L_ptr + L_base + row_i * stride_L + row_i)
@@ -547,7 +542,13 @@ def cholesky_solve_single_rhs_blocked_lower_kernel(
                 inv_diag = inv_diag * (2.0 - diag * inv_diag)
                 if dtype_flag == 1:
                     inv_diag = inv_diag * (2.0 - diag * inv_diag)
-                y_new = (y_cur - dot) * inv_diag
+                y_new = y_cur * inv_diag
+                L_col = tl.load(
+                    L_ptr + L_base + rows_k * stride_L + row_i,
+                    mask=(rows_k > row_i) & (rows_k < N),
+                    other=0.0,
+                )
+                y_block = y_block - L_col * y_new
                 y_block = tl.where(row_mask, y_new, y_block)
 
         tl.store(X_ptr + B_base + rows_k * stride_B, y_block, mask=rows_k < N)
@@ -586,12 +587,6 @@ def cholesky_solve_single_rhs_blocked_lower_kernel(
         for ii in range(BLOCK_K - 1, -1, -1):
             row_i = k + ii
             if row_i < N:
-                L_vals = tl.load(
-                    L_ptr + L_base + rows_k * stride_L + row_i,
-                    mask=(rows_k > row_i) & (rows_k < N),
-                    other=0.0,
-                )
-                dot = tl.sum(L_vals * x_block, axis=0)
                 row_mask = rows_k == row_i
                 y_cur = tl.sum(tl.where(row_mask, x_block, 0.0), axis=0)
                 diag = tl.load(L_ptr + L_base + row_i * stride_L + row_i)
@@ -599,7 +594,13 @@ def cholesky_solve_single_rhs_blocked_lower_kernel(
                 inv_diag = inv_diag * (2.0 - diag * inv_diag)
                 if dtype_flag == 1:
                     inv_diag = inv_diag * (2.0 - diag * inv_diag)
-                x_new = (y_cur - dot) * inv_diag
+                x_new = y_cur * inv_diag
+                L_row = tl.load(
+                    L_ptr + L_base + row_i * stride_L + rows_k,
+                    mask=rows_k < row_i,
+                    other=0.0,
+                )
+                x_block = x_block - L_row * x_new
                 x_block = tl.where(row_mask, x_new, x_block)
 
         tl.store(X_ptr + B_base + rows_k * stride_B, x_block, mask=rows_k < N)
@@ -666,12 +667,6 @@ def cholesky_solve_single_rhs_blocked_upper_kernel(
         for i in range(BLOCK_K):
             row_i = k + i
             if row_i < N:
-                U_vals = tl.load(
-                    L_ptr + L_base + rows_k * stride_L + row_i,
-                    mask=rows_k < row_i,
-                    other=0.0,
-                )
-                dot = tl.sum(U_vals * y_block, axis=0)
                 row_mask = rows_k == row_i
                 y_cur = tl.sum(tl.where(row_mask, y_block, 0.0), axis=0)
                 diag = tl.load(L_ptr + L_base + row_i * stride_L + row_i)
@@ -679,7 +674,13 @@ def cholesky_solve_single_rhs_blocked_upper_kernel(
                 inv_diag = inv_diag * (2.0 - diag * inv_diag)
                 if dtype_flag == 1:
                     inv_diag = inv_diag * (2.0 - diag * inv_diag)
-                y_new = (y_cur - dot) * inv_diag
+                y_new = y_cur * inv_diag
+                U_row = tl.load(
+                    L_ptr + L_base + row_i * stride_L + rows_k,
+                    mask=(rows_k > row_i) & (rows_k < N),
+                    other=0.0,
+                )
+                y_block = y_block - U_row * y_new
                 y_block = tl.where(row_mask, y_new, y_block)
 
         tl.store(X_ptr + B_base + rows_k * stride_B, y_block, mask=rows_k < N)
@@ -718,12 +719,6 @@ def cholesky_solve_single_rhs_blocked_upper_kernel(
         for ii in range(BLOCK_K - 1, -1, -1):
             row_i = k + ii
             if row_i < N:
-                U_vals = tl.load(
-                    L_ptr + L_base + row_i * stride_L + rows_k,
-                    mask=(rows_k > row_i) & (rows_k < N),
-                    other=0.0,
-                )
-                dot = tl.sum(U_vals * x_block, axis=0)
                 row_mask = rows_k == row_i
                 y_cur = tl.sum(tl.where(row_mask, x_block, 0.0), axis=0)
                 diag = tl.load(L_ptr + L_base + row_i * stride_L + row_i)
@@ -731,7 +726,13 @@ def cholesky_solve_single_rhs_blocked_upper_kernel(
                 inv_diag = inv_diag * (2.0 - diag * inv_diag)
                 if dtype_flag == 1:
                     inv_diag = inv_diag * (2.0 - diag * inv_diag)
-                x_new = (y_cur - dot) * inv_diag
+                x_new = y_cur * inv_diag
+                U_col = tl.load(
+                    L_ptr + L_base + rows_k * stride_L + row_i,
+                    mask=rows_k < row_i,
+                    other=0.0,
+                )
+                x_block = x_block - U_col * x_new
                 x_block = tl.where(row_mask, x_new, x_block)
 
         tl.store(X_ptr + B_base + rows_k * stride_B, x_block, mask=rows_k < N)
