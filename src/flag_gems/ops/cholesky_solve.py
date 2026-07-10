@@ -1295,10 +1295,8 @@ def cholesky_solve(B, L, upper=False):
     L = L.expand(batch_shape + L_shape[-2:])
     B = B.expand(batch_shape + B_shape[-2:])
 
-    if not L.is_contiguous():
-        L = L.contiguous()
-    if not B.is_contiguous():
-        B = B.contiguous()
+    L = L.contiguous()
+    B = B.contiguous()
     X = torch.empty_like(B)
 
     batch_size = 1
@@ -1384,12 +1382,20 @@ def cholesky_solve(B, L, upper=False):
         elif _can_use_blocked_single_rhs_path(N, nrhs):
             tile = _get_blocked_tile_configs(B.dtype, nrhs, N)
             warp = _get_blocked_warp_config(B.dtype)
-            cholesky_solve_single_rhs_blocked_lower_kernel[(batch_size,)](
-                L_kernel, B_kernel, X_kernel, N,
-                batch_stride_L, batch_stride_B, stride_L, stride_B,
-                BLOCK_K=tile["BLOCK_K"], BLOCK_M=tile["BLOCK_M"],
-                dtype_flag=dtype_flag, **warp,
-            )
+            if upper:
+                cholesky_solve_single_rhs_blocked_upper_kernel[(batch_size,)](
+                    L_kernel, B_kernel, X_kernel, N,
+                    batch_stride_L, batch_stride_B, stride_L, stride_B,
+                    BLOCK_K=tile["BLOCK_K"], BLOCK_M=tile["BLOCK_M"],
+                    dtype_flag=dtype_flag, **warp,
+                )
+            else:
+                cholesky_solve_single_rhs_blocked_lower_kernel[(batch_size,)](
+                    L_kernel, B_kernel, X_kernel, N,
+                    batch_stride_L, batch_stride_B, stride_L, stride_B,
+                    BLOCK_K=tile["BLOCK_K"], BLOCK_M=tile["BLOCK_M"],
+                    dtype_flag=dtype_flag, **warp,
+                )
         elif nrhs == 1 and N <= 64:
             block_n = triton.next_power_of_2(N)
             cholesky_solve_small_single_rhs_kernel[(batch_size,)](
