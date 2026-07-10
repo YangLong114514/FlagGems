@@ -155,6 +155,7 @@ def cholesky_solve_blocked_lower_kernel(
     batch_stride_B,
     stride_L,
     stride_B,
+    stride_L_col: tl.constexpr,
     BLOCK_K: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_RHS: tl.constexpr,
@@ -162,12 +163,9 @@ def cholesky_solve_blocked_lower_kernel(
 ):
     """Blocked lower-factor Cholesky solve.
 
-    Solves L L^T X = B for one batch and one RHS tile. X is used as workspace:
-    forward TRSM writes Y into X, then backward TRSM overwrites it with X.
-    Trailing block updates use tl.dot.
-
-    Includes fast reciprocal (Newton refinement) for diagonal division,
-    matching the algorithm used by cuSOLVER's potrs kernel.
+    Solves L L^T X = B for one batch and one RHS tile. Accepts both
+    standard row-major lower (stride_L_col=1) and transposed upper
+    factor as L' = U^T via swapped strides (stride_L_col=N, stride_L=1).
     """
     batch_pid = program_id(0)
     rhs_tile_pid = program_id(1)
@@ -185,126 +183,91 @@ def cholesky_solve_blocked_lower_kernel(
         if k == 0:
             y_block = tl.load(
                 B_ptr + B_base + rows_k[:, None] * stride_B + rhs_cols[None, :],
-                mask=(rows_k[:, None] < N) & rhs_mask[None, :],
-                other=0.0,
-            )
+                mask=(rows_k[:, None] < N) & rhs_mask[None, :], other=0.0)
         else:
             y_block = tl.load(
                 X_ptr + B_base + rows_k[:, None] * stride_B + rhs_cols[None, :],
-                mask=(rows_k[:, None] < N) & rhs_mask[None, :],
-                other=0.0,
-            )
+                mask=(rows_k[:, None] < N) & rhs_mask[None, :], other=0.0)
 
-        # Inner TRSM: solve the diagonal block L_kk * Y_k = B_k.
-        # Use pivot broadcast / incremental update, mirroring rocSOLVER TRSM.
         for i in range(BLOCK_K):
             row_i = k + i
             if row_i < N:
                 row_mask = rows_k[:, None] == row_i
                 y_cur = tl.sum(tl.where(row_mask, y_block, 0.0), axis=0)
-                diag = tl.load(L_ptr + L_base + row_i * stride_L + row_i)
-                # Fast reciprocal: hardware rcp + Newton refinement
+                diag = tl.load(L_ptr + L_base + row_i * stride_L + row_i * stride_L_col)
                 inv_diag = 1.0 / diag
                 inv_diag = inv_diag * (2.0 - diag * inv_diag)
                 if dtype_flag == 1:
                     inv_diag = inv_diag * (2.0 - diag * inv_diag)
                 y_new = y_cur * inv_diag
                 L_col = tl.load(
-                    L_ptr + L_base + rows_k * stride_L + row_i,
-                    mask=(rows_k > row_i) & (rows_k < N),
-                    other=0.0,
-                )
+                    L_ptr + L_base + rows_k * stride_L + row_i * stride_L_col,
+                    mask=(rows_k > row_i) & (rows_k < N), other=0.0)
                 y_block = y_block - L_col[:, None] * y_new[None, :]
                 y_block = tl.where(row_mask, y_new[None, :], y_block)
 
         tl.store(
             X_ptr + B_base + rows_k[:, None] * stride_B + rhs_cols[None, :],
-            y_block,
-            mask=(rows_k[:, None] < N) & rhs_mask[None, :],
-        )
+            y_block, mask=(rows_k[:, None] < N) & rhs_mask[None, :])
 
-        # Trailing update: B_m = B_m - L_mk * Y_k.
         for m in range(k + BLOCK_K, N, BLOCK_M):
             rows_m = m + m_offsets
             L_tile = tl.load(
-                L_ptr + L_base + rows_m[:, None] * stride_L + rows_k[None, :],
-                mask=(rows_m[:, None] < N) & (rows_k[None, :] < N),
-                other=0.0,
-            )
+                L_ptr + L_base + rows_m[:, None] * stride_L + rows_k[None, :] * stride_L_col,
+                mask=(rows_m[:, None] < N) & (rows_k[None, :] < N), other=0.0)
             if k == 0:
                 tail = tl.load(
                     B_ptr + B_base + rows_m[:, None] * stride_B + rhs_cols[None, :],
-                    mask=(rows_m[:, None] < N) & rhs_mask[None, :],
-                    other=0.0,
-                )
+                    mask=(rows_m[:, None] < N) & rhs_mask[None, :], other=0.0)
             else:
                 tail = tl.load(
-                    X_ptr
-                    + B_base
-                    + rows_m[:, None] * stride_B
-                    + rhs_cols[None, :],
-                    mask=(rows_m[:, None] < N) & rhs_mask[None, :],
-                    other=0.0,
-                )
+                    X_ptr + B_base + rows_m[:, None] * stride_B + rhs_cols[None, :],
+                    mask=(rows_m[:, None] < N) & rhs_mask[None, :], other=0.0)
             tail = tail - tl.dot(L_tile, y_block)
             tl.store(
                 X_ptr + B_base + rows_m[:, None] * stride_B + rhs_cols[None, :],
-                tail,
-                mask=(rows_m[:, None] < N) & rhs_mask[None, :],
-            )
+                tail, mask=(rows_m[:, None] < N) & rhs_mask[None, :])
 
     # Backward blocked TRSM: L^T * X = Y.
     for k in range(N - BLOCK_K, -1, -BLOCK_K):
         rows_k = k + k_offsets
         x_block = tl.load(
             X_ptr + B_base + rows_k[:, None] * stride_B + rhs_cols[None, :],
-            mask=(rows_k[:, None] < N) & rhs_mask[None, :],
-            other=0.0,
-        )
+            mask=(rows_k[:, None] < N) & rhs_mask[None, :], other=0.0)
 
         for ii in range(BLOCK_K - 1, -1, -1):
             row_i = k + ii
             if row_i < N:
                 row_mask = rows_k[:, None] == row_i
                 y_cur = tl.sum(tl.where(row_mask, x_block, 0.0), axis=0)
-                diag = tl.load(L_ptr + L_base + row_i * stride_L + row_i)
+                diag = tl.load(L_ptr + L_base + row_i * stride_L + row_i * stride_L_col)
                 inv_diag = 1.0 / diag
                 inv_diag = inv_diag * (2.0 - diag * inv_diag)
                 if dtype_flag == 1:
                     inv_diag = inv_diag * (2.0 - diag * inv_diag)
                 x_new = y_cur * inv_diag
                 L_row = tl.load(
-                    L_ptr + L_base + row_i * stride_L + rows_k,
-                    mask=rows_k < row_i,
-                    other=0.0,
-                )
+                    L_ptr + L_base + row_i * stride_L + rows_k * stride_L_col,
+                    mask=rows_k < row_i, other=0.0)
                 x_block = x_block - L_row[:, None] * x_new[None, :]
                 x_block = tl.where(row_mask, x_new[None, :], x_block)
 
         tl.store(
             X_ptr + B_base + rows_k[:, None] * stride_B + rhs_cols[None, :],
-            x_block,
-            mask=(rows_k[:, None] < N) & rhs_mask[None, :],
-        )
+            x_block, mask=(rows_k[:, None] < N) & rhs_mask[None, :])
 
         for m in range(0, k, BLOCK_M):
             rows_m = m + m_offsets
             L_tile = tl.load(
-                L_ptr + L_base + rows_k[None, :] * stride_L + rows_m[:, None],
-                mask=(rows_m[:, None] < N) & (rows_k[None, :] < N),
-                other=0.0,
-            )
+                L_ptr + L_base + rows_k[None, :] * stride_L + rows_m[:, None] * stride_L_col,
+                mask=(rows_m[:, None] < N) & (rows_k[None, :] < N), other=0.0)
             head = tl.load(
                 X_ptr + B_base + rows_m[:, None] * stride_B + rhs_cols[None, :],
-                mask=(rows_m[:, None] < N) & rhs_mask[None, :],
-                other=0.0,
-            )
+                mask=(rows_m[:, None] < N) & rhs_mask[None, :], other=0.0)
             head = head - tl.dot(L_tile, x_block)
             tl.store(
                 X_ptr + B_base + rows_m[:, None] * stride_B + rhs_cols[None, :],
-                head,
-                mask=(rows_m[:, None] < N) & rhs_mask[None, :],
-            )
+                head, mask=(rows_m[:, None] < N) & rhs_mask[None, :])
 
 
 @libentry()
@@ -485,8 +448,8 @@ def cholesky_solve_blocked_lower_fp64_kernel(
 ):
     """fp64-dedicated blocked lower-factor Cholesky solve.
 
-    Removes dtype_flag branch and fp32 logic to help the compiler generate
-    tighter fp64 code with fewer spills.
+    Removes dtype_flag branch and fp32 logic. Uses standard row-major
+    lower factor layout (diag access via row*stride_L+row).
     """
     batch_pid = program_id(0)
     rhs_tile_pid = program_id(1)
@@ -516,7 +479,6 @@ def cholesky_solve_blocked_lower_fp64_kernel(
                 row_mask = rows_k[:, None] == row_i
                 y_cur = tl.sum(tl.where(row_mask, y_block, 0.0), axis=0)
                 diag = tl.load(L_ptr + L_base + row_i * stride_L + row_i)
-                # fp64: always 2 Newton rounds
                 inv_diag = 1.0 / diag
                 inv_diag = inv_diag * (2.0 - diag * inv_diag)
                 inv_diag = inv_diag * (2.0 - diag * inv_diag)
@@ -1333,8 +1295,10 @@ def cholesky_solve(B, L, upper=False):
     L = L.expand(batch_shape + L_shape[-2:])
     B = B.expand(batch_shape + B_shape[-2:])
 
-    L = L.contiguous()
-    B = B.contiguous()
+    if not L.is_contiguous():
+        L = L.contiguous()
+    if not B.is_contiguous():
+        B = B.contiguous()
     X = torch.empty_like(B)
 
     batch_size = 1
@@ -1346,32 +1310,60 @@ def cholesky_solve(B, L, upper=False):
     X_kernel = X.reshape(-1, N, nrhs)
 
     stride_L = L_kernel.stride(1)
+    stride_L_col = L_kernel.stride(2)
     stride_B = B_kernel.stride(1)
     batch_stride_L = L_kernel.stride(0)
     batch_stride_B = B_kernel.stride(0)
 
     dtype_flag = 0 if B.dtype == torch.float32 else 1
 
+    # For fp32 upper factor U stored row-major, treat it as L' = U^T by
+    # swapping strides and routing through the blocked lower kernel.
+    # Only applies to shapes that enter the blocked path.
+    use_lower_for_upper = (
+        upper and dtype_flag == 0 and N >= 128 and N % 32 == 0 and nrhs >= 4
+    )
+    if use_lower_for_upper:
+        stride_L, stride_L_col = stride_L_col, stride_L
+
     with torch.no_grad():
-        if _can_use_blocked_lower_path(upper, N, nrhs):
+        effective_upper = upper and not use_lower_for_upper
+        if _can_use_blocked_lower_path(effective_upper, N, nrhs):
             tile = _get_blocked_tile_configs(B.dtype, nrhs, N)
             warp = _get_blocked_warp_config(B.dtype)
             grid = (batch_size, triton.cdiv(nrhs, tile["BLOCK_RHS"]))
-            if dtype_flag == 1:
-                cholesky_solve_blocked_lower_fp64_kernel[grid](
+            if use_lower_for_upper:
+                cholesky_solve_blocked_lower_kernel[grid](
                     L_kernel, B_kernel, X_kernel, N, nrhs,
                     batch_stride_L, batch_stride_B, stride_L, stride_B,
+                    stride_L_col=stride_L_col,
                     BLOCK_K=tile["BLOCK_K"], BLOCK_M=tile["BLOCK_M"],
-                    BLOCK_RHS=tile["BLOCK_RHS"], **warp,
+                    BLOCK_RHS=tile["BLOCK_RHS"], dtype_flag=dtype_flag, **warp,
                 )
+            elif dtype_flag == 1:
+                if effective_upper:
+                    cholesky_solve_blocked_upper_fp64_kernel[grid](
+                        L_kernel, B_kernel, X_kernel, N, nrhs,
+                        batch_stride_L, batch_stride_B, stride_L, stride_B,
+                        BLOCK_K=tile["BLOCK_K"], BLOCK_M=tile["BLOCK_M"],
+                        BLOCK_RHS=tile["BLOCK_RHS"], **warp,
+                    )
+                else:
+                    cholesky_solve_blocked_lower_fp64_kernel[grid](
+                        L_kernel, B_kernel, X_kernel, N, nrhs,
+                        batch_stride_L, batch_stride_B, stride_L, stride_B,
+                        BLOCK_K=tile["BLOCK_K"], BLOCK_M=tile["BLOCK_M"],
+                        BLOCK_RHS=tile["BLOCK_RHS"], **warp,
+                    )
             else:
                 cholesky_solve_blocked_lower_kernel[grid](
                     L_kernel, B_kernel, X_kernel, N, nrhs,
                     batch_stride_L, batch_stride_B, stride_L, stride_B,
+                    stride_L_col=stride_L_col,
                     BLOCK_K=tile["BLOCK_K"], BLOCK_M=tile["BLOCK_M"],
                     BLOCK_RHS=tile["BLOCK_RHS"], dtype_flag=dtype_flag, **warp,
                 )
-        elif _can_use_blocked_upper_path(upper, N, nrhs):
+        elif _can_use_blocked_upper_path(effective_upper, N, nrhs):
             tile = _get_blocked_tile_configs(B.dtype, nrhs, N)
             warp = _get_blocked_warp_config(B.dtype)
             grid = (batch_size, triton.cdiv(nrhs, tile["BLOCK_RHS"]))
@@ -1392,20 +1384,12 @@ def cholesky_solve(B, L, upper=False):
         elif _can_use_blocked_single_rhs_path(N, nrhs):
             tile = _get_blocked_tile_configs(B.dtype, nrhs, N)
             warp = _get_blocked_warp_config(B.dtype)
-            if upper:
-                cholesky_solve_single_rhs_blocked_upper_kernel[(batch_size,)](
-                    L_kernel, B_kernel, X_kernel, N,
-                    batch_stride_L, batch_stride_B, stride_L, stride_B,
-                    BLOCK_K=tile["BLOCK_K"], BLOCK_M=tile["BLOCK_M"],
-                    dtype_flag=dtype_flag, **warp,
-                )
-            else:
-                cholesky_solve_single_rhs_blocked_lower_kernel[(batch_size,)](
-                    L_kernel, B_kernel, X_kernel, N,
-                    batch_stride_L, batch_stride_B, stride_L, stride_B,
-                    BLOCK_K=tile["BLOCK_K"], BLOCK_M=tile["BLOCK_M"],
-                    dtype_flag=dtype_flag, **warp,
-                )
+            cholesky_solve_single_rhs_blocked_lower_kernel[(batch_size,)](
+                L_kernel, B_kernel, X_kernel, N,
+                batch_stride_L, batch_stride_B, stride_L, stride_B,
+                BLOCK_K=tile["BLOCK_K"], BLOCK_M=tile["BLOCK_M"],
+                dtype_flag=dtype_flag, **warp,
+            )
         elif nrhs == 1 and N <= 64:
             block_n = triton.next_power_of_2(N)
             cholesky_solve_small_single_rhs_kernel[(batch_size,)](
