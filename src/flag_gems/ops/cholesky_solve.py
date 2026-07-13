@@ -232,7 +232,9 @@ def cholesky_solve_blocked_lower_kernel(
                 tail = tl.load(
                     X_ptr + B_base + rows_m[:, None] * stride_B + rhs_cols[None, :],
                     mask=(rows_m[:, None] < N) & rhs_mask[None, :], other=0.0)
-            tail = tail - tl.dot(L_tile, y_block)
+            tail = tail - tl.dot(
+                L_tile, y_block, input_precision="tf32x3"
+            )
             tl.store(
                 X_ptr + B_base + rows_m[:, None] * stride_B + rhs_cols[None, :],
                 tail, mask=(rows_m[:, None] < N) & rhs_mask[None, :])
@@ -273,7 +275,9 @@ def cholesky_solve_blocked_lower_kernel(
             head = tl.load(
                 X_ptr + B_base + rows_m[:, None] * stride_B + rhs_cols[None, :],
                 mask=(rows_m[:, None] < N) & rhs_mask[None, :], other=0.0)
-            head = head - tl.dot(L_tile, x_block)
+            head = head - tl.dot(
+                L_tile, x_block, input_precision="tf32x3"
+            )
             tl.store(
                 X_ptr + B_base + rows_m[:, None] * stride_B + rhs_cols[None, :],
                 head, mask=(rows_m[:, None] < N) & rhs_mask[None, :])
@@ -378,7 +382,9 @@ def cholesky_solve_blocked_upper_kernel(
                     mask=(rows_m[:, None] < N) & rhs_mask[None, :],
                     other=0.0,
                 )
-            tail = tail - tl.dot(U_tile, y_block)
+            tail = tail - tl.dot(
+                U_tile, y_block, input_precision="tf32x3"
+            )
             tl.store(
                 X_ptr + B_base + rows_m[:, None] * stride_B + rhs_cols[None, :],
                 tail,
@@ -431,7 +437,9 @@ def cholesky_solve_blocked_upper_kernel(
                 mask=(rows_m[:, None] < N) & rhs_mask[None, :],
                 other=0.0,
             )
-            head = head - tl.dot(U_tile, x_block)
+            head = head - tl.dot(
+                U_tile, x_block, input_precision="tf32x3"
+            )
             tl.store(
                 X_ptr + B_base + rows_m[:, None] * stride_B + rhs_cols[None, :],
                 head,
