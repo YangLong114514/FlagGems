@@ -1436,11 +1436,19 @@ def cholesky_solve(B, L, upper=False):
     use_copied_lower_for_upper = upper and (
         copy_fp32_upper or copy_fp64_upper
     )
-    # At N=64 the direct upper blocked kernel is about twice as fast as the
-    # lower kernel on H20 for both dtypes, including layout-conversion cost.
-    # Solve the equivalent U^T U system with U=L^T in this narrow regime.
-    use_transposed_upper_for_lower = (
-        not upper and N == 64 and nrhs >= 4
+    # A column-major lower factor becomes a row-major upper factor through a
+    # zero-copy transpose. H20 measurements favor the upper kernels for N=64
+    # multi-RHS and for the N=16/128 single-RHS cases below.
+    factor_is_f_contiguous = (
+        L.stride(-2) == 1 and L.stride(-1) == N
+    )
+    use_transposed_upper_for_lower = not upper and (
+        (N == 64 and nrhs >= 4)
+        or (
+            factor_is_f_contiguous
+            and nrhs == 1
+            and N in (16, 128)
+        )
     )
     if use_copied_lower_for_upper or use_transposed_upper_for_lower:
         L = L.mT.contiguous()
@@ -1544,7 +1552,8 @@ def cholesky_solve(B, L, upper=False):
             cholesky_solve_small_single_rhs_kernel[(batch_size,)](
                 L_kernel, B_kernel, X_kernel, N,
                 batch_stride_L, batch_stride_B, stride_L, stride_B,
-                BLOCK_N=block_n, dtype_flag=dtype_flag, upper=upper,
+                BLOCK_N=block_n, dtype_flag=dtype_flag,
+                upper=effective_upper,
             )
         elif nrhs == 1:
             cholesky_solve_single_rhs_kernel[(batch_size,)](
@@ -1557,7 +1566,7 @@ def cholesky_solve(B, L, upper=False):
                 stride_L,
                 stride_B,
                 dtype_flag=dtype_flag,
-                upper=upper,
+                upper=effective_upper,
             )
         elif _can_use_small_nrhs_path(N, nrhs):
             block_n = triton.next_power_of_2(N)
@@ -1566,7 +1575,7 @@ def cholesky_solve(B, L, upper=False):
                 L_kernel, B_kernel, X_kernel, N, nrhs,
                 batch_stride_L, batch_stride_B, stride_L, stride_B,
                 BLOCK_N=block_n, BLOCK_RHS=block_rhs,
-                dtype_flag=dtype_flag, upper=upper,
+                dtype_flag=dtype_flag, upper=effective_upper,
             )
         else:
             grid = lambda meta: (batch_size, triton.cdiv(nrhs, meta["BLOCK_RHS"]))
@@ -1581,7 +1590,7 @@ def cholesky_solve(B, L, upper=False):
                 stride_L,
                 stride_B,
                 dtype_flag=dtype_flag,
-                upper=upper,
+                upper=effective_upper,
             )
 
     return X
