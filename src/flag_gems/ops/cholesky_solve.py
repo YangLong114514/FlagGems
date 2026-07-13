@@ -734,8 +734,12 @@ def _can_use_blocked_upper_path(upper, N, nrhs):
     )
 
 
-def _can_use_blocked_single_rhs_path(N, nrhs):
-    return nrhs == 1 and N >= 128 and N % 32 == 0
+def _can_use_blocked_single_rhs_path(dtype, N, nrhs):
+    return (
+        nrhs == 1
+        and N % 32 == 0
+        and (N >= 128 or (dtype == torch.float64 and N == 64))
+    )
 
 
 @libentry()
@@ -1539,7 +1543,7 @@ def cholesky_solve(B, L, upper=False):
                     BLOCK_K=tile["BLOCK_K"], BLOCK_M=tile["BLOCK_M"],
                     BLOCK_RHS=tile["BLOCK_RHS"], dtype_flag=dtype_flag, **warp,
                 )
-        elif _can_use_blocked_single_rhs_path(N, nrhs):
+        elif _can_use_blocked_single_rhs_path(B.dtype, N, nrhs):
             if effective_upper:
                 upper_single_rhs_config = _get_upper_single_rhs_launch_config(
                     B.dtype
