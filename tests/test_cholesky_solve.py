@@ -22,6 +22,11 @@ CHOLESKY_SOLVE_BLOCKED_SINGLE_RHS_SHAPES = [
     (256, 1),
     (2, 128, 1),
 ]
+CHOLESKY_SOLVE_FP64_BLOCKED_UPDATE_SHAPES = [
+    (64, 4),
+    (128, 16),
+    (256, 16),
+]
 CHOLESKY_SOLVE_BATCH_SHAPES = [(2, 4, 1), (3, 8, 2), (2, 3, 16, 4)]
 CHOLESKY_SOLVE_RHS_BOUNDARY_SHAPES = [
     (64, 15),
@@ -177,6 +182,17 @@ def test_cholesky_solve_upper(shape, dtype):
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
 @pytest.mark.parametrize("upper", [False, True])
 def test_cholesky_solve_blocked_single_rhs(shape, dtype, upper):
+    A, L, rhs = _make_cholesky_solve_inputs(shape, dtype)
+    factor = L.mT.contiguous() if upper else L
+
+    _assert_cholesky_solve_matches(A, factor, rhs, dtype, upper=upper)
+
+
+@pytest.mark.cholesky_solve
+@pytest.mark.parametrize("shape", CHOLESKY_SOLVE_FP64_BLOCKED_UPDATE_SHAPES)
+@pytest.mark.parametrize("upper", [False, True])
+def test_cholesky_solve_fp64_blocked_update(shape, upper):
+    dtype = torch.float64
     A, L, rhs = _make_cholesky_solve_inputs(shape, dtype)
     factor = L.mT.contiguous() if upper else L
 
