@@ -30,6 +30,7 @@ CHOLESKY_SOLVE_CASES = [
     # Throughput-oriented larger systems.
     ((128, 16), False),
     ((128, 64), False),
+    ((256, 16), False),
     ((256, 128), False),
     # Batched systems: important for occupancy with one batch per program tile.
     ((16, 16, 1), False),
@@ -40,13 +41,16 @@ CHOLESKY_SOLVE_CASES = [
     ((16, 32, 8), False),
     ((32, 64, 16), False),
     ((8, 128, 16), False),
-    # Upper-factor cases exercise the no-transpose upper=True path.
+    # Upper-factor cases exercise direct, stride-swapped, and copied dispatch.
     ((16, 1), True),
+    ((128, 1), True),
+    ((256, 1), True),
     ((64, 8), True),
     ((64, 31), True),
     ((64, 32), True),
     ((64, 33), True),
     ((128, 16), True),
+    ((256, 16), True),
     ((256, 128), True),
     ((8, 128, 16), True),
 ]
