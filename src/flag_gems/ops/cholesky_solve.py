@@ -1461,7 +1461,13 @@ def cholesky_solve(B, L, upper=False):
     use_copied_lower_for_upper = upper and (
         copy_fp32_upper or copy_fp64_upper
     )
-    if use_copied_lower_for_upper:
+    # At N=64 the direct upper blocked kernel is about twice as fast as the
+    # lower kernel on H20 for both dtypes, including layout-conversion cost.
+    # Solve the equivalent U^T U system with U=L^T in this narrow regime.
+    use_transposed_upper_for_lower = (
+        not upper and N == 64 and nrhs >= 4
+    )
+    if use_copied_lower_for_upper or use_transposed_upper_for_lower:
         L = L.mT.contiguous()
     else:
         L = L.contiguous()
@@ -1496,8 +1502,9 @@ def cholesky_solve(B, L, upper=False):
     )
     if use_lower_for_upper:
         stride_L, stride_L_col = stride_L_col, stride_L
-    effective_upper = upper and not (
-        use_lower_for_upper or use_copied_lower_for_upper
+    effective_upper = use_transposed_upper_for_lower or (
+        upper
+        and not (use_lower_for_upper or use_copied_lower_for_upper)
     )
 
     with torch.no_grad():
