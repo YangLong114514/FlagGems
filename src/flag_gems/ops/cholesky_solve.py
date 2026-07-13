@@ -1442,8 +1442,9 @@ def cholesky_solve(B, L, upper=False):
         copy_fp32_upper or copy_fp64_upper
     )
     # A column-major lower factor becomes a row-major upper factor through a
-    # zero-copy transpose. H20 measurements favor the upper kernels for N=64
-    # multi-RHS and for the dtype-specific single-RHS orders below.
+    # zero-copy transpose. H20 measurements favor the upper kernels for small
+    # systems with up to eight RHS, for N=64 multi-RHS, and for the
+    # dtype-specific single-RHS orders below.
     factor_is_f_contiguous = (
         L.stride(-2) == 1 and L.stride(-1) == N
     )
@@ -1454,8 +1455,10 @@ def cholesky_solve(B, L, upper=False):
         (N == 64 and nrhs >= 4)
         or (
             factor_is_f_contiguous
-            and nrhs == 1
-            and upper_single_rhs_is_faster
+            and (
+                (N <= 32 and nrhs <= 8)
+                or (nrhs == 1 and upper_single_rhs_is_faster)
+            )
         )
     )
     if use_copied_lower_for_upper or use_transposed_upper_for_lower:

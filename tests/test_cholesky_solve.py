@@ -14,6 +14,7 @@ CHOLESKY_SOLVE_BASIC_SHAPES = [
     (4, 2),
     (8, 4),
     (16, 8),
+    (32, 8),
     (32, 16),
 ]
 CHOLESKY_SOLVE_LARGE_SHAPES = [(64, 8), (128, 4)]
