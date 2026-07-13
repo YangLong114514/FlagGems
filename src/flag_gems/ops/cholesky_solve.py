@@ -1469,15 +1469,25 @@ def cholesky_solve(B, L, upper=False):
     L = L.expand(batch_shape + L_shape[-2:])
     B = B.expand(batch_shape + B_shape[-2:])
 
-    # For large fp32 upper solves, materialize U^T as a row-major lower factor
-    # before entering the lower kernel. The copy is small relative to the
-    # strided/tl.trans penalty observed by both logical upper implementations.
-    use_copied_lower_for_upper = (
-        upper
-        and B.dtype == torch.float32
+    # Materialize U^T as a row-major lower factor when the lower kernel's
+    # locality advantage outweighs the copy. H20 measurements show this for
+    # large fp32 multi-RHS solves and, after fp64 panel tuning, for fp64 at
+    # N >= 128 with multiple RHS. The fp64 N=256 single-RHS upper kernel is
+    # also sufficiently slower than its lower counterpart to amortize a copy.
+    copy_fp32_upper = (
+        B.dtype == torch.float32
         and N >= 256
         and N % 32 == 0
         and nrhs >= 4
+    )
+    copy_fp64_upper = (
+        B.dtype == torch.float64
+        and N >= 128
+        and N % 32 == 0
+        and (nrhs >= 4 or (N >= 256 and nrhs == 1))
+    )
+    use_copied_lower_for_upper = upper and (
+        copy_fp32_upper or copy_fp64_upper
     )
     if use_copied_lower_for_upper:
         L = L.mT.contiguous()
