@@ -29,44 +29,13 @@ CHOLESKY_SOLVE_AUTOTUNE_CONFIGS = [
     for block_rhs in (1, 2, 4, 8, 16, 32)
 ]
 
-# Single-RHS kernels are dependency-bound and commonly launch one program per
-# system. The lower blocked path is pinned from H20 measurements; retain this
-# tuning space for the upper blocked path until its winners are measured.
+# Small single-RHS kernels are dependency-bound and commonly launch one
+# program per system. Their winners still vary across dtype and matrix order.
 SMALL_SINGLE_RHS_AUTOTUNE_CONFIGS = [
     triton.Config({}, num_warps=1, num_stages=1),
     triton.Config({}, num_warps=2, num_stages=1),
     # Baseline used by the previous launch defaults.
     triton.Config({}, num_warps=4, num_stages=3),
-]
-
-UPPER_SINGLE_RHS_BLOCKED_AUTOTUNE_CONFIGS = [
-    triton.Config(
-        {"BLOCK_K": block_k, "BLOCK_M": block_m},
-        num_warps=num_warps,
-        num_stages=num_stages,
-    )
-    for block_k, block_m, num_warps, num_stages in (
-        (16, 16, 1, 1),
-        (16, 16, 2, 1),
-        (16, 32, 2, 1),
-        (32, 16, 2, 1),
-        (32, 32, 1, 1),
-        (32, 32, 2, 1),
-        # Baselines used by the previous fp64 and fp32 dispatch respectively.
-        (16, 16, 4, 2),
-        (32, 32, 4, 3),
-    )
-]
-
-# Temporary tuning space for the fp64 blocked panel dimensions. BLOCK_RHS=8
-# and the tl.dot update path are already pinned from H20 measurements.
-FP64_BLOCKED_TILE_AUTOTUNE_CONFIGS = [
-    triton.Config(
-        {"BLOCK_K": block_k, "BLOCK_M": block_m},
-        num_warps=4,
-        num_stages=2,
-    )
-    for block_k, block_m in ((16, 16), (16, 32), (32, 16), (32, 32))
 ]
 
 # Curated autotune configs for blocked Cholesky solve kernels.
@@ -471,10 +440,6 @@ def cholesky_solve_blocked_upper_kernel(
 
 
 @libentry()
-@triton.autotune(
-    configs=FP64_BLOCKED_TILE_AUTOTUNE_CONFIGS,
-    key=["N", "nrhs", "batch_size"],
-)
 @triton.jit
 def cholesky_solve_blocked_lower_fp64_kernel(
     L_ptr,
@@ -482,7 +447,6 @@ def cholesky_solve_blocked_lower_fp64_kernel(
     X_ptr,
     N: tl.constexpr,
     nrhs: tl.constexpr,
-    batch_size: tl.constexpr,
     batch_stride_L,
     batch_stride_B,
     stride_L,
@@ -635,10 +599,6 @@ def cholesky_solve_blocked_lower_fp64_kernel(
 
 
 @libentry()
-@triton.autotune(
-    configs=FP64_BLOCKED_TILE_AUTOTUNE_CONFIGS,
-    key=["N", "nrhs", "batch_size"],
-)
 @triton.jit
 def cholesky_solve_blocked_upper_fp64_kernel(
     L_ptr,
@@ -646,7 +606,6 @@ def cholesky_solve_blocked_upper_fp64_kernel(
     X_ptr,
     N: tl.constexpr,
     nrhs: tl.constexpr,
-    batch_size: tl.constexpr,
     batch_stride_L,
     batch_stride_B,
     stride_L,
@@ -965,10 +924,6 @@ def cholesky_solve_single_rhs_blocked_lower_kernel(
 
 
 @libentry()
-@triton.autotune(
-    configs=UPPER_SINGLE_RHS_BLOCKED_AUTOTUNE_CONFIGS,
-    key=["N", "dtype_flag"],
-)
 @triton.jit
 def cholesky_solve_single_rhs_blocked_upper_kernel(
     L_ptr,
@@ -1378,11 +1333,11 @@ def _get_blocked_tile_configs(dtype, nrhs, N):
     """Return tile sizes for blocked kernels based on dtype, nrhs, and N.
 
     fp32 uses 32x32 panels with BLOCK_RHS=16 for the tl.dot MMA path.
-    fp64 uses 16x16 panels with BLOCK_RHS=8, which consistently won over
-    BLOCK_RHS=4 in H20 tuning across N, nrhs, batch, and upper/lower cases.
+    fp64 uses 16x32 panels with BLOCK_RHS=8. This configuration won every
+    tested H20 lower/upper case across N, nrhs, and batch size.
     """
     if dtype == torch.float64:
-        blk_k, blk_m, blk_rhs = 16, 16, 8
+        blk_k, blk_m, blk_rhs = 16, 32, 8
     else:
         blk_k, blk_m, blk_rhs = 32, 32, 16
     return {"BLOCK_K": blk_k, "BLOCK_M": blk_m, "BLOCK_RHS": blk_rhs}
@@ -1408,6 +1363,23 @@ def _get_lower_single_rhs_launch_config(dtype):
         "BLOCK_K": 32,
         "BLOCK_M": 32,
         "num_warps": 1,
+        "num_stages": 1,
+    }
+
+
+def _get_upper_single_rhs_launch_config(dtype):
+    """Return H20 winners for the upper blocked single-RHS path."""
+    if dtype == torch.float64:
+        return {
+            "BLOCK_K": 32,
+            "BLOCK_M": 32,
+            "num_warps": 4,
+            "num_stages": 3,
+        }
+    return {
+        "BLOCK_K": 16,
+        "BLOCK_M": 32,
+        "num_warps": 2,
         "num_stages": 1,
     }
 
@@ -1535,9 +1507,10 @@ def cholesky_solve(B, L, upper=False):
             grid = (batch_size, triton.cdiv(nrhs, tile["BLOCK_RHS"]))
             if dtype_flag == 1:
                 cholesky_solve_blocked_lower_fp64_kernel[grid](
-                    L_kernel, B_kernel, X_kernel, N, nrhs, batch_size,
+                    L_kernel, B_kernel, X_kernel, N, nrhs,
                     batch_stride_L, batch_stride_B, stride_L, stride_B,
-                    BLOCK_RHS=tile["BLOCK_RHS"],
+                    BLOCK_K=tile["BLOCK_K"], BLOCK_M=tile["BLOCK_M"],
+                    BLOCK_RHS=tile["BLOCK_RHS"], **warp,
                 )
             else:
                 cholesky_solve_blocked_lower_kernel[grid](
@@ -1553,9 +1526,10 @@ def cholesky_solve(B, L, upper=False):
             grid = (batch_size, triton.cdiv(nrhs, tile["BLOCK_RHS"]))
             if dtype_flag == 1:
                 cholesky_solve_blocked_upper_fp64_kernel[grid](
-                    L_kernel, B_kernel, X_kernel, N, nrhs, batch_size,
+                    L_kernel, B_kernel, X_kernel, N, nrhs,
                     batch_stride_L, batch_stride_B, stride_L, stride_B,
-                    BLOCK_RHS=tile["BLOCK_RHS"],
+                    BLOCK_K=tile["BLOCK_K"], BLOCK_M=tile["BLOCK_M"],
+                    BLOCK_RHS=tile["BLOCK_RHS"], **warp,
                 )
             else:
                 cholesky_solve_blocked_upper_kernel[grid](
@@ -1565,11 +1539,14 @@ def cholesky_solve(B, L, upper=False):
                     BLOCK_RHS=tile["BLOCK_RHS"], dtype_flag=dtype_flag, **warp,
                 )
         elif _can_use_blocked_single_rhs_path(N, nrhs):
-            if upper:
+            if effective_upper:
+                upper_single_rhs_config = _get_upper_single_rhs_launch_config(
+                    B.dtype
+                )
                 cholesky_solve_single_rhs_blocked_upper_kernel[(batch_size,)](
                     L_kernel, B_kernel, X_kernel, N,
                     batch_stride_L, batch_stride_B, stride_L, stride_B,
-                    dtype_flag=dtype_flag,
+                    dtype_flag=dtype_flag, **upper_single_rhs_config,
                 )
             else:
                 lower_single_rhs_config = _get_lower_single_rhs_launch_config(
