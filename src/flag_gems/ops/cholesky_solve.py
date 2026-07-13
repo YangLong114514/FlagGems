@@ -38,6 +38,15 @@ SMALL_SINGLE_RHS_AUTOTUNE_CONFIGS = [
     triton.Config({}, num_warps=4, num_stages=3),
 ]
 
+# Small-N, few-RHS solves are also dependency-bound, but their register tile
+# is wider than the single-RHS case. Tune only launch geometry so the
+# numerical reduction order and BLOCK_N/BLOCK_RHS shapes stay unchanged.
+SMALL_NRHS_AUTOTUNE_CONFIGS = [
+    triton.Config({}, num_warps=1, num_stages=1),
+    triton.Config({}, num_warps=2, num_stages=1),
+    triton.Config({}, num_warps=4, num_stages=3),
+]
+
 @libentry()
 @triton.autotune(
     configs=CHOLESKY_SOLVE_AUTOTUNE_CONFIGS, key=["N", "nrhs", "dtype_flag", "upper"]
@@ -1142,6 +1151,10 @@ def cholesky_solve_small_single_rhs_kernel(
 
 
 @libentry()
+@triton.autotune(
+    configs=SMALL_NRHS_AUTOTUNE_CONFIGS,
+    key=["N", "nrhs", "dtype_flag", "upper"],
+)
 @triton.jit
 def cholesky_solve_small_nrhs_kernel(
     L_ptr,
