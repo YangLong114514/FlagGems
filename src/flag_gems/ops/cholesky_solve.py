@@ -29,24 +29,6 @@ CHOLESKY_SOLVE_AUTOTUNE_CONFIGS = [
     for block_rhs in (1, 2, 4, 8, 16, 32)
 ]
 
-# Small single-RHS kernels are dependency-bound and commonly launch one
-# program per system. Their winners still vary across dtype and matrix order.
-SMALL_SINGLE_RHS_AUTOTUNE_CONFIGS = [
-    triton.Config({}, num_warps=1, num_stages=1),
-    triton.Config({}, num_warps=2, num_stages=1),
-    # Baseline used by the previous launch defaults.
-    triton.Config({}, num_warps=4, num_stages=3),
-]
-
-# Small-N, few-RHS solves are also dependency-bound, but their register tile
-# is wider than the single-RHS case. Tune only launch geometry so the
-# numerical reduction order and BLOCK_N/BLOCK_RHS shapes stay unchanged.
-SMALL_NRHS_AUTOTUNE_CONFIGS = [
-    triton.Config({}, num_warps=1, num_stages=1),
-    triton.Config({}, num_warps=2, num_stages=1),
-    triton.Config({}, num_warps=4, num_stages=3),
-]
-
 @libentry()
 @triton.autotune(
     configs=CHOLESKY_SOLVE_AUTOTUNE_CONFIGS, key=["N", "nrhs", "dtype_flag", "upper"]
@@ -1059,10 +1041,6 @@ def cholesky_solve_single_rhs_blocked_upper_kernel(
 
 
 @libentry()
-@triton.autotune(
-    configs=SMALL_SINGLE_RHS_AUTOTUNE_CONFIGS,
-    key=["N", "dtype_flag", "upper"],
-)
 @triton.jit
 def cholesky_solve_small_single_rhs_kernel(
     L_ptr,
@@ -1151,10 +1129,6 @@ def cholesky_solve_small_single_rhs_kernel(
 
 
 @libentry()
-@triton.autotune(
-    configs=SMALL_NRHS_AUTOTUNE_CONFIGS,
-    key=["N", "nrhs", "dtype_flag", "upper"],
-)
 @triton.jit
 def cholesky_solve_small_nrhs_kernel(
     L_ptr,
@@ -1372,6 +1346,24 @@ def _get_upper_single_rhs_launch_config(dtype):
     }
 
 
+def _get_small_single_rhs_launch_config(dtype, N):
+    """Return pinned H20 winners for register-resident single-RHS solves."""
+    if dtype == torch.float32 or N >= 64:
+        return {"num_warps": 1, "num_stages": 1}
+    if N <= 16:
+        return {"num_warps": 2, "num_stages": 1}
+    return {"num_warps": 4, "num_stages": 3}
+
+
+def _get_small_nrhs_launch_config(dtype, N, nrhs, upper):
+    """Return pinned H20 winners for register-resident few-RHS solves."""
+    if dtype == torch.float32:
+        return {"num_warps": 1, "num_stages": 1}
+    if not upper and N == 16 and nrhs == 4:
+        return {"num_warps": 2, "num_stages": 1}
+    return {"num_warps": 4, "num_stages": 3}
+
+
 def cholesky_solve(B, L, upper=False):
     """Solves a system of linear equations with a symmetric positive-definite
     matrix using the Cholesky factorization.
@@ -1565,11 +1557,14 @@ def cholesky_solve(B, L, upper=False):
                 )
         elif nrhs == 1 and N <= 64:
             block_n = triton.next_power_of_2(N)
+            small_single_rhs_config = _get_small_single_rhs_launch_config(
+                B.dtype, N
+            )
             cholesky_solve_small_single_rhs_kernel[(batch_size,)](
                 L_kernel, B_kernel, X_kernel, N,
                 batch_stride_L, batch_stride_B, stride_L, stride_B,
                 BLOCK_N=block_n, dtype_flag=dtype_flag,
-                upper=effective_upper,
+                upper=effective_upper, **small_single_rhs_config,
             )
         elif nrhs == 1:
             cholesky_solve_single_rhs_kernel[(batch_size,)](
@@ -1587,11 +1582,15 @@ def cholesky_solve(B, L, upper=False):
         elif _can_use_small_nrhs_path(N, nrhs):
             block_n = triton.next_power_of_2(N)
             block_rhs = triton.next_power_of_2(nrhs)
+            small_nrhs_config = _get_small_nrhs_launch_config(
+                B.dtype, N, nrhs, effective_upper
+            )
             cholesky_solve_small_nrhs_kernel[(batch_size,)](
                 L_kernel, B_kernel, X_kernel, N, nrhs,
                 batch_stride_L, batch_stride_B, stride_L, stride_B,
                 BLOCK_N=block_n, BLOCK_RHS=block_rhs,
                 dtype_flag=dtype_flag, upper=effective_upper,
+                **small_nrhs_config,
             )
         else:
             grid = lambda meta: (batch_size, triton.cdiv(nrhs, meta["BLOCK_RHS"]))
