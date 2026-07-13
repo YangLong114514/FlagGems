@@ -3,59 +3,52 @@ import torch
 
 from . import base
 
-# Case format: ((*batch_dims, N, nrhs), upper). Two-dimensional shape entries
-# are single systems; longer entries benchmark batched solves. The cases cover
-# the main performance axes of potrs/cholesky_solve: matrix order N, number of
-# right-hand sides, batch occupancy, and lower/upper Cholesky factors.
-CHOLESKY_SOLVE_CASES = [
+# Two-dimensional entries are single systems; longer entries benchmark batched
+# solves. Keep one shape list and derive both factor orientations from it so
+# every lower/upper latency comparison has an exact counterpart.
+CHOLESKY_SOLVE_SHAPES = [
     # Single RHS: exposes the low-parallelism triangular-solve path.
-    ((8, 1), False),
-    ((16, 1), False),
-    ((32, 1), False),
-    ((64, 1), False),
-    ((128, 1), False),
-    ((256, 1), False),
+    (8, 1),
+    (16, 1),
+    (32, 1),
+    (64, 1),
+    (128, 1),
+    (256, 1),
     # Small-N small-RHS fused path coverage.
-    ((16, 2), False),
-    ((16, 4), False),
-    ((32, 4), False),
+    (16, 2),
+    (16, 4),
+    (32, 4),
     # RHS sweep around BLOCK_RHS boundaries and tail cases.
-    ((64, 4), False),
-    ((64, 16), False),
-    ((64, 31), False),
-    ((64, 32), False),
-    ((64, 33), False),
-    ((64, 64), False),
-    ((64, 128), False),
+    (64, 4),
+    (64, 8),
+    (64, 16),
+    (64, 31),
+    (64, 32),
+    (64, 33),
+    (64, 64),
+    (64, 128),
     # Throughput-oriented larger systems.
-    ((128, 16), False),
-    ((128, 64), False),
-    ((256, 16), False),
-    ((256, 128), False),
+    (128, 16),
+    (128, 64),
+    (256, 16),
+    (256, 128),
     # Batched systems: important for occupancy with one batch per program tile.
-    ((16, 16, 1), False),
-    ((64, 16, 1), False),
-    ((256, 16, 1), False),
-    ((16, 16, 4), False),
-    ((16, 32, 4), False),
-    ((16, 32, 8), False),
-    ((32, 64, 16), False),
-    ((8, 128, 16), False),
-    # Upper-factor cases exercise direct, stride-swapped, and copied dispatch.
-    ((8, 1), True),
-    ((16, 1), True),
-    ((32, 1), True),
-    ((64, 1), True),
-    ((128, 1), True),
-    ((256, 1), True),
-    ((64, 8), True),
-    ((64, 31), True),
-    ((64, 32), True),
-    ((64, 33), True),
-    ((128, 16), True),
-    ((256, 16), True),
-    ((256, 128), True),
-    ((8, 128, 16), True),
+    (16, 16, 1),
+    (64, 16, 1),
+    (256, 16, 1),
+    (16, 16, 4),
+    (16, 32, 4),
+    (16, 32, 8),
+    (32, 64, 16),
+    (8, 128, 16),
+]
+
+# Case format: ((*batch_dims, N, nrhs), upper). Group lower then upper while
+# preserving identical shape order to make benchmark tables easy to compare.
+CHOLESKY_SOLVE_CASES = [
+    (shape, upper)
+    for upper in (False, True)
+    for shape in CHOLESKY_SOLVE_SHAPES
 ]
 
 
