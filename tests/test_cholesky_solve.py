@@ -22,7 +22,7 @@ CHOLESKY_SOLVE_BLOCKED_SINGLE_RHS_SHAPES = [
     (256, 1),
     (2, 128, 1),
 ]
-CHOLESKY_SOLVE_FP64_BLOCKED_UPDATE_SHAPES = [
+CHOLESKY_SOLVE_FP64_BLOCKED_SHAPES = [
     (64, 4),
     (128, 16),
     (256, 16),
@@ -191,9 +191,9 @@ def test_cholesky_solve_blocked_single_rhs(shape, dtype, upper):
 
 
 @pytest.mark.cholesky_solve
-@pytest.mark.parametrize("shape", CHOLESKY_SOLVE_FP64_BLOCKED_UPDATE_SHAPES)
+@pytest.mark.parametrize("shape", CHOLESKY_SOLVE_FP64_BLOCKED_SHAPES)
 @pytest.mark.parametrize("upper", [False, True])
-def test_cholesky_solve_fp64_blocked_update(shape, upper):
+def test_cholesky_solve_fp64_blocked(shape, upper):
     dtype = torch.float64
     A, L, rhs = _make_cholesky_solve_inputs(shape, dtype)
     factor = L.mT.contiguous() if upper else L
