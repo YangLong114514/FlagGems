@@ -42,7 +42,10 @@ CHOLESKY_SOLVE_CASES = [
     ((32, 64, 16), False),
     ((8, 128, 16), False),
     # Upper-factor cases exercise direct, stride-swapped, and copied dispatch.
+    ((8, 1), True),
     ((16, 1), True),
+    ((32, 1), True),
+    ((64, 1), True),
     ((128, 1), True),
     ((256, 1), True),
     ((64, 8), True),

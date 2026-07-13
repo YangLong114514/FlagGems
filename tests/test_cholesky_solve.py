@@ -18,7 +18,10 @@ CHOLESKY_SOLVE_BASIC_SHAPES = [
 ]
 CHOLESKY_SOLVE_LARGE_SHAPES = [(64, 8), (128, 4)]
 CHOLESKY_SOLVE_BLOCKED_SINGLE_RHS_SHAPES = [
+    (8, 1),
     (16, 1),
+    (32, 1),
+    (64, 1),
     (128, 1),
     (256, 1),
     (2, 128, 1),
