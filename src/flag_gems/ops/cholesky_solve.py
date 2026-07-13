@@ -58,12 +58,16 @@ SINGLE_RHS_BLOCKED_AUTOTUNE_CONFIGS = [
     )
 ]
 
-FP64_BLOCKED_UPDATE_AUTOTUNE_CONFIGS = [
+FP64_BLOCKED_AUTOTUNE_CONFIGS = [
     triton.Config(
-        {"USE_STREAMED_UPDATE": use_streamed_update},
+        {
+            "BLOCK_RHS": block_rhs,
+            "USE_STREAMED_UPDATE": use_streamed_update,
+        },
         num_warps=4,
         num_stages=2,
     )
+    for block_rhs in (4, 8)
     for use_streamed_update in (False, True)
 ]
 
@@ -470,8 +474,8 @@ def cholesky_solve_blocked_upper_kernel(
 
 @libentry()
 @triton.autotune(
-    configs=FP64_BLOCKED_UPDATE_AUTOTUNE_CONFIGS,
-    key=["N", "nrhs"],
+    configs=FP64_BLOCKED_AUTOTUNE_CONFIGS,
+    key=["N", "nrhs", "batch_size"],
 )
 @triton.jit
 def cholesky_solve_blocked_lower_fp64_kernel(
@@ -480,6 +484,7 @@ def cholesky_solve_blocked_lower_fp64_kernel(
     X_ptr,
     N: tl.constexpr,
     nrhs: tl.constexpr,
+    batch_size: tl.constexpr,
     batch_stride_L,
     batch_stride_B,
     stride_L,
@@ -677,8 +682,8 @@ def cholesky_solve_blocked_lower_fp64_kernel(
 
 @libentry()
 @triton.autotune(
-    configs=FP64_BLOCKED_UPDATE_AUTOTUNE_CONFIGS,
-    key=["N", "nrhs"],
+    configs=FP64_BLOCKED_AUTOTUNE_CONFIGS,
+    key=["N", "nrhs", "batch_size"],
 )
 @triton.jit
 def cholesky_solve_blocked_upper_fp64_kernel(
@@ -687,6 +692,7 @@ def cholesky_solve_blocked_upper_fp64_kernel(
     X_ptr,
     N: tl.constexpr,
     nrhs: tl.constexpr,
+    batch_size: tl.constexpr,
     batch_stride_L,
     batch_stride_B,
     stride_L,
@@ -1564,44 +1570,21 @@ def cholesky_solve(B, L, upper=False):
 
     dtype_flag = 0 if B.dtype == torch.float32 else 1
 
-    # For fp32 upper factor U stored row-major, treat it as L' = U^T by
-    # swapping strides and routing through the blocked lower kernel.
-    # Only applies to shapes that enter the blocked path.
-    use_lower_for_upper = (
-        upper and dtype_flag == 0 and N >= 128 and N % 32 == 0 and nrhs >= 4
-    )
-    if use_lower_for_upper:
-        stride_L, stride_L_col = stride_L_col, stride_L
-
     with torch.no_grad():
-        effective_upper = upper and not use_lower_for_upper
-        if _can_use_blocked_lower_path(effective_upper, N, nrhs):
+        if _can_use_blocked_lower_path(upper, N, nrhs):
             tile = _get_blocked_tile_configs(B.dtype, nrhs, N)
             warp = _get_blocked_warp_config(B.dtype)
             grid = (batch_size, triton.cdiv(nrhs, tile["BLOCK_RHS"]))
-            if use_lower_for_upper:
-                cholesky_solve_blocked_lower_kernel[grid](
-                    L_kernel, B_kernel, X_kernel, N, nrhs,
-                    batch_stride_L, batch_stride_B, stride_L, stride_B,
-                    stride_L_col=stride_L_col,
-                    BLOCK_K=tile["BLOCK_K"], BLOCK_M=tile["BLOCK_M"],
-                    BLOCK_RHS=tile["BLOCK_RHS"], dtype_flag=dtype_flag, **warp,
+            if dtype_flag == 1:
+                fp64_grid = lambda meta: (
+                    batch_size,
+                    triton.cdiv(nrhs, meta["BLOCK_RHS"]),
                 )
-            elif dtype_flag == 1:
-                if effective_upper:
-                    cholesky_solve_blocked_upper_fp64_kernel[grid](
-                        L_kernel, B_kernel, X_kernel, N, nrhs,
-                        batch_stride_L, batch_stride_B, stride_L, stride_B,
-                        BLOCK_K=tile["BLOCK_K"], BLOCK_M=tile["BLOCK_M"],
-                        BLOCK_RHS=tile["BLOCK_RHS"],
-                    )
-                else:
-                    cholesky_solve_blocked_lower_fp64_kernel[grid](
-                        L_kernel, B_kernel, X_kernel, N, nrhs,
-                        batch_stride_L, batch_stride_B, stride_L, stride_B,
-                        BLOCK_K=tile["BLOCK_K"], BLOCK_M=tile["BLOCK_M"],
-                        BLOCK_RHS=tile["BLOCK_RHS"],
-                    )
+                cholesky_solve_blocked_lower_fp64_kernel[fp64_grid](
+                    L_kernel, B_kernel, X_kernel, N, nrhs, batch_size,
+                    batch_stride_L, batch_stride_B, stride_L, stride_B,
+                    BLOCK_K=tile["BLOCK_K"], BLOCK_M=tile["BLOCK_M"],
+                )
             else:
                 cholesky_solve_blocked_lower_kernel[grid](
                     L_kernel, B_kernel, X_kernel, N, nrhs,
@@ -1610,16 +1593,19 @@ def cholesky_solve(B, L, upper=False):
                     BLOCK_K=tile["BLOCK_K"], BLOCK_M=tile["BLOCK_M"],
                     BLOCK_RHS=tile["BLOCK_RHS"], dtype_flag=dtype_flag, **warp,
                 )
-        elif _can_use_blocked_upper_path(effective_upper, N, nrhs):
+        elif _can_use_blocked_upper_path(upper, N, nrhs):
             tile = _get_blocked_tile_configs(B.dtype, nrhs, N)
             warp = _get_blocked_warp_config(B.dtype)
             grid = (batch_size, triton.cdiv(nrhs, tile["BLOCK_RHS"]))
             if dtype_flag == 1:
-                cholesky_solve_blocked_upper_fp64_kernel[grid](
-                    L_kernel, B_kernel, X_kernel, N, nrhs,
+                fp64_grid = lambda meta: (
+                    batch_size,
+                    triton.cdiv(nrhs, meta["BLOCK_RHS"]),
+                )
+                cholesky_solve_blocked_upper_fp64_kernel[fp64_grid](
+                    L_kernel, B_kernel, X_kernel, N, nrhs, batch_size,
                     batch_stride_L, batch_stride_B, stride_L, stride_B,
                     BLOCK_K=tile["BLOCK_K"], BLOCK_M=tile["BLOCK_M"],
-                    BLOCK_RHS=tile["BLOCK_RHS"],
                 )
             else:
                 cholesky_solve_blocked_upper_kernel[grid](
