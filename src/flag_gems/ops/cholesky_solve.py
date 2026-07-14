@@ -290,7 +290,10 @@ def cholesky_solve_blocked_lower_kernel(
 
         for m in range(0, k, BLOCK_M):
             rows_m = m + m_offsets
-            rows_m_mask = rows_m < k
+            if BLOCK_M == BLOCK_K:
+                rows_m_mask = rows_m < N
+            else:
+                rows_m_mask = rows_m < k
             L_tile = tl.load(
                 L_ptr + L_base + rows_k[None, :] * stride_L + rows_m[:, None] * stride_L_col,
                 mask=rows_m_mask[:, None] & (rows_k[None, :] < N), other=0.0)
