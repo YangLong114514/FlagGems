@@ -1633,15 +1633,19 @@ def cholesky_solve(B, L, upper=False):
                     PRELOAD_DIAG=preload_blocked_diag, **warp,
                 )
         elif _can_use_blocked_upper_path(effective_upper, N, nrhs):
+            use_single_panel = (
+                dtype_flag == 0 and batch_size == 1 and N == 64
+            )
             tile = _get_blocked_tile_configs(
                 B.dtype,
                 nrhs,
                 N,
-                use_single_panel=(
-                    dtype_flag == 0 and batch_size == 1 and N == 64
-                ),
+                use_single_panel=use_single_panel,
             )
-            warp = _get_blocked_warp_config(B.dtype)
+            if use_single_panel:
+                warp = {"num_warps": 2, "num_stages": 1}
+            else:
+                warp = _get_blocked_warp_config(B.dtype)
             grid = (batch_size, triton.cdiv(nrhs, tile["BLOCK_RHS"]))
             if dtype_flag == 1:
                 cholesky_solve_blocked_upper_fp64_kernel[grid](
