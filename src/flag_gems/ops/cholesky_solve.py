@@ -18,7 +18,9 @@ import torch
 import triton
 import triton.language as tl
 
+from flag_gems.runtime import device as runtime_device
 from flag_gems.utils import libentry
+from flag_gems.utils.device_info import get_sm_count
 from flag_gems.utils.triton_lang_extension import program_id
 
 logger = logging.getLogger(__name__)
@@ -407,6 +409,206 @@ def cholesky_solve_blocked_upper_kernel(
 
 @libentry()
 @triton.jit
+def cholesky_solve_parallel_blocked_lower_kernel(
+    L_ptr,
+    B_ptr,
+    X_ptr,
+    sync_ptr,
+    N: tl.constexpr,
+    nrhs: tl.constexpr,
+    stride_L,
+    stride_B,
+    NUM_RHS_TILES: tl.constexpr,
+    NUM_PANELS: tl.constexpr,
+    NUM_WORKERS: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_RHS: tl.constexpr,
+):
+    """Three-CTA blocked lower solve for one fp32 N=128 system.
+
+    Worker zero solves each diagonal panel. All workers then update a distinct
+    trailing tile. Per-panel ready flags and completion counters preserve the
+    triangular dependency chain across both solve phases.
+    """
+    pid = program_id(0)
+    worker_id = pid % NUM_WORKERS
+    rhs_tile_pid = pid // NUM_WORKERS
+
+    rhs_cols = rhs_tile_pid * BLOCK_RHS + tl.arange(0, BLOCK_RHS)
+    rhs_mask = rhs_cols < nrhs
+    k_offsets = tl.arange(0, BLOCK_K)
+    m_offsets = tl.arange(0, BLOCK_M)
+
+    num_steps = 2 * NUM_PANELS
+    done_base = NUM_RHS_TILES * num_steps
+
+    # Forward blocked TRSM: L * Y = B.
+    for k in range(0, N, BLOCK_K):
+        rows_k = k + k_offsets
+        step = k // BLOCK_K
+        ready_ptr = sync_ptr + rhs_tile_pid * num_steps + step
+        done_ptr = sync_ptr + done_base + rhs_tile_pid * num_steps + step
+
+        if worker_id == 0:
+            if k == 0:
+                y_block = tl.load(
+                    B_ptr + rows_k[:, None] * stride_B + rhs_cols[None, :],
+                    mask=(rows_k[:, None] < N) & rhs_mask[None, :],
+                    other=0.0,
+                )
+            else:
+                y_block = tl.load(
+                    X_ptr + rows_k[:, None] * stride_B + rhs_cols[None, :],
+                    mask=(rows_k[:, None] < N) & rhs_mask[None, :],
+                    other=0.0,
+                )
+
+            for i in range(BLOCK_K):
+                row_i = k + i
+                row_mask = rows_k[:, None] == row_i
+                y_cur = tl.sum(tl.where(row_mask, y_block, 0.0), axis=0)
+                diag = tl.load(L_ptr + row_i * stride_L + row_i)
+                inv_diag = 1.0 / diag
+                inv_diag = inv_diag * (2.0 - diag * inv_diag)
+                y_new = y_cur * inv_diag
+                L_col = tl.load(
+                    L_ptr + rows_k * stride_L + row_i,
+                    mask=(rows_k > row_i) & (rows_k < N),
+                    other=0.0,
+                )
+                y_block = y_block - L_col[:, None] * y_new[None, :]
+                y_block = tl.where(row_mask, y_new[None, :], y_block)
+
+            tl.store(
+                X_ptr + rows_k[:, None] * stride_B + rhs_cols[None, :],
+                y_block,
+                mask=(rows_k[:, None] < N) & rhs_mask[None, :],
+            )
+            tl.debug_barrier()
+            tl.atomic_xchg(ready_ptr, 1)
+        else:
+            while tl.atomic_cas(ready_ptr, 1, 1) != 1:
+                pass
+
+        m = k + BLOCK_K + worker_id * BLOCK_M
+        if m < N:
+            rows_m = m + m_offsets
+            solved_block = tl.load(
+                X_ptr + rows_k[:, None] * stride_B + rhs_cols[None, :],
+                mask=(rows_k[:, None] < N) & rhs_mask[None, :],
+                other=0.0,
+            )
+            L_tile = tl.load(
+                L_ptr + rows_m[:, None] * stride_L + rows_k[None, :],
+                mask=(rows_m[:, None] < N) & (rows_k[None, :] < N),
+                other=0.0,
+            )
+            if k == 0:
+                tail = tl.load(
+                    B_ptr + rows_m[:, None] * stride_B + rhs_cols[None, :],
+                    mask=(rows_m[:, None] < N) & rhs_mask[None, :],
+                    other=0.0,
+                )
+            else:
+                tail = tl.load(
+                    X_ptr + rows_m[:, None] * stride_B + rhs_cols[None, :],
+                    mask=(rows_m[:, None] < N) & rhs_mask[None, :],
+                    other=0.0,
+                )
+            tail = tail - tl.dot(
+                L_tile, solved_block, input_precision="tf32x3"
+            )
+            tl.store(
+                X_ptr + rows_m[:, None] * stride_B + rhs_cols[None, :],
+                tail,
+                mask=(rows_m[:, None] < N) & rhs_mask[None, :],
+            )
+
+        tl.debug_barrier()
+        tl.atomic_add(done_ptr, 1)
+        if worker_id == 0:
+            while tl.atomic_add(done_ptr, 0) < NUM_WORKERS:
+                pass
+
+    # Backward blocked TRSM: L^T * X = Y.
+    for k in range(N - BLOCK_K, -1, -BLOCK_K):
+        rows_k = k + k_offsets
+        backward_panel = (N - BLOCK_K - k) // BLOCK_K
+        step = NUM_PANELS + backward_panel
+        ready_ptr = sync_ptr + rhs_tile_pid * num_steps + step
+        done_ptr = sync_ptr + done_base + rhs_tile_pid * num_steps + step
+
+        if worker_id == 0:
+            x_block = tl.load(
+                X_ptr + rows_k[:, None] * stride_B + rhs_cols[None, :],
+                mask=(rows_k[:, None] < N) & rhs_mask[None, :],
+                other=0.0,
+            )
+
+            for ii in range(BLOCK_K - 1, -1, -1):
+                row_i = k + ii
+                row_mask = rows_k[:, None] == row_i
+                x_cur = tl.sum(tl.where(row_mask, x_block, 0.0), axis=0)
+                diag = tl.load(L_ptr + row_i * stride_L + row_i)
+                inv_diag = 1.0 / diag
+                inv_diag = inv_diag * (2.0 - diag * inv_diag)
+                x_new = x_cur * inv_diag
+                L_row = tl.load(
+                    L_ptr + row_i * stride_L + rows_k,
+                    mask=rows_k < row_i,
+                    other=0.0,
+                )
+                x_block = x_block - L_row[:, None] * x_new[None, :]
+                x_block = tl.where(row_mask, x_new[None, :], x_block)
+
+            tl.store(
+                X_ptr + rows_k[:, None] * stride_B + rhs_cols[None, :],
+                x_block,
+                mask=(rows_k[:, None] < N) & rhs_mask[None, :],
+            )
+            tl.debug_barrier()
+            tl.atomic_xchg(ready_ptr, 1)
+        else:
+            while tl.atomic_cas(ready_ptr, 1, 1) != 1:
+                pass
+
+        m = worker_id * BLOCK_M
+        if m < k:
+            rows_m = m + m_offsets
+            solved_block = tl.load(
+                X_ptr + rows_k[:, None] * stride_B + rhs_cols[None, :],
+                mask=(rows_k[:, None] < N) & rhs_mask[None, :],
+                other=0.0,
+            )
+            L_tile = tl.load(
+                L_ptr + rows_k[None, :] * stride_L + rows_m[:, None],
+                mask=(rows_m[:, None] < k) & (rows_k[None, :] < N),
+                other=0.0,
+            )
+            head = tl.load(
+                X_ptr + rows_m[:, None] * stride_B + rhs_cols[None, :],
+                mask=(rows_m[:, None] < k) & rhs_mask[None, :],
+                other=0.0,
+            )
+            head = head - tl.dot(
+                L_tile, solved_block, input_precision="tf32x3"
+            )
+            tl.store(
+                X_ptr + rows_m[:, None] * stride_B + rhs_cols[None, :],
+                head,
+                mask=(rows_m[:, None] < k) & rhs_mask[None, :],
+            )
+
+        tl.debug_barrier()
+        tl.atomic_add(done_ptr, 1)
+        if worker_id == 0:
+            while tl.atomic_add(done_ptr, 0) < NUM_WORKERS:
+                pass
+
+
+@libentry()
+@triton.jit
 def cholesky_solve_blocked_lower_fp64_kernel(
     L_ptr,
     B_ptr,
@@ -732,6 +934,22 @@ def _can_use_blocked_upper_path(upper, N, nrhs):
         and N % 32 == 0
         and nrhs >= 4
     )
+
+
+def _can_use_parallel_blocked_lower_path(upper, dtype, N, nrhs, batch_size):
+    """Use the cooperative kernel only when every CTA can be resident."""
+    if not (
+        runtime_device.vendor_name == "nvidia"
+        and not upper
+        and dtype == torch.float32
+        and batch_size == 1
+        and N == 128
+        and nrhs >= 16
+        and nrhs % 16 == 0
+    ):
+        return False
+    num_rhs_tiles = triton.cdiv(nrhs, 16)
+    return num_rhs_tiles * 3 <= get_sm_count()
 
 
 def _can_use_blocked_single_rhs_path(dtype, N, nrhs):
@@ -1506,7 +1724,34 @@ def cholesky_solve(B, L, upper=False):
     )
 
     with torch.no_grad():
-        if _can_use_blocked_lower_path(effective_upper, N, nrhs):
+        if _can_use_parallel_blocked_lower_path(
+            effective_upper, B.dtype, N, nrhs, batch_size
+        ):
+            block_k = 32
+            block_m = 32
+            block_rhs = 16
+            num_workers = 3
+            num_rhs_tiles = triton.cdiv(nrhs, block_rhs)
+            num_panels = N // block_k
+            sync = torch.zeros(
+                (2, num_rhs_tiles, 2 * num_panels),
+                dtype=torch.int32,
+                device=B.device,
+            )
+            grid = (num_rhs_tiles * num_workers,)
+            cholesky_solve_parallel_blocked_lower_kernel[grid](
+                L_kernel, B_kernel, X_kernel, sync, N, nrhs,
+                stride_L, stride_B,
+                NUM_RHS_TILES=num_rhs_tiles,
+                NUM_PANELS=num_panels,
+                NUM_WORKERS=num_workers,
+                BLOCK_K=block_k,
+                BLOCK_M=block_m,
+                BLOCK_RHS=block_rhs,
+                num_warps=4,
+                num_stages=3,
+            )
+        elif _can_use_blocked_lower_path(effective_upper, N, nrhs):
             tile = _get_blocked_tile_configs(B.dtype, nrhs, N)
             warp = _get_blocked_warp_config(B.dtype)
             grid = (batch_size, triton.cdiv(nrhs, tile["BLOCK_RHS"]))
