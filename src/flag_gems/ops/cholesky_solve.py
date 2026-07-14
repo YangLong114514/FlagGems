@@ -342,6 +342,9 @@ def cholesky_solve_blocked_upper_kernel(
     rhs_mask = rhs_cols < nrhs
     k_offsets = tl.arange(0, BLOCK_K)
     m_offsets = tl.arange(0, BLOCK_M)
+    # Seed the loop-carried SSA value so the single-panel backward phase can
+    # consume the final forward panel outside the static loop body.
+    y_block = tl.zeros([BLOCK_K, BLOCK_RHS], dtype=tl.float32)
 
     # Forward blocked TRSM: U^T * Y = B.
     for k in range(0, N, BLOCK_K):
