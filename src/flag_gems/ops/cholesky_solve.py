@@ -1452,6 +1452,18 @@ def cholesky_solve(B, L, upper=False):
     factor_is_f_contiguous = (
         L.stride(-2) == 1 and L.stride(-1) == N
     )
+    # The H20 N=128 multi-RHS cases benefit from keeping the column-major
+    # factor returned by torch.linalg.cholesky. Restrict this to the two
+    # measured winners: larger N makes the strided tl.dot loads more costly,
+    # while batched/other layouts retain the row-major fallback below.
+    use_f_contiguous_lower = (
+        not upper
+        and B.dtype == torch.float32
+        and len(batch_shape) == 0
+        and N == 128
+        and nrhs in (16, 64)
+        and factor_is_f_contiguous
+    )
     upper_single_rhs_is_faster = N in (8, 16, 32, 64, 128) or (
         B.dtype == torch.float32 and N == 256
     )
@@ -1467,7 +1479,7 @@ def cholesky_solve(B, L, upper=False):
     )
     if use_copied_lower_for_upper or use_transposed_upper_for_lower:
         L = L.mT.contiguous()
-    else:
+    elif not use_f_contiguous_lower:
         L = L.contiguous()
     B = B.contiguous()
     X = torch.empty_like(B)
