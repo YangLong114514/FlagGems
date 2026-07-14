@@ -1588,6 +1588,13 @@ def cholesky_solve(B, L, upper=False):
         upper
         and not (use_lower_for_upper or use_copied_lower_for_upper)
     )
+    preload_blocked_diag = use_strided_lower_panel_optimization or (
+        not effective_upper
+        and dtype_flag == 0
+        and batch_size == 1
+        and N == 256
+        and nrhs in (16, 128)
+    )
 
     with torch.no_grad():
         if _can_use_blocked_lower_path(effective_upper, N, nrhs):
@@ -1610,7 +1617,7 @@ def cholesky_solve(B, L, upper=False):
                     stride_L_col=stride_L_col,
                     BLOCK_K=tile["BLOCK_K"], BLOCK_M=tile["BLOCK_M"],
                     BLOCK_RHS=tile["BLOCK_RHS"], dtype_flag=dtype_flag,
-                    PRELOAD_DIAG=use_strided_lower_panel_optimization, **warp,
+                    PRELOAD_DIAG=preload_blocked_diag, **warp,
                 )
         elif _can_use_blocked_upper_path(effective_upper, N, nrhs):
             tile = _get_blocked_tile_configs(B.dtype, nrhs, N)

@@ -38,7 +38,12 @@ CHOLESKY_SOLVE_FP32_BLOCKED_UPPER_SHAPES = [
     (128, 64),
     (256, 128),
 ]
-CHOLESKY_SOLVE_FP32_F_LAYOUT_LOWER_SHAPES = [(128, 16), (128, 64)]
+CHOLESKY_SOLVE_FP32_BLOCKED_LOWER_SHAPES = [
+    (128, 16),
+    (128, 64),
+    (256, 16),
+    (256, 128),
+]
 CHOLESKY_SOLVE_BATCH_SHAPES = [(2, 4, 1), (3, 8, 2), (2, 3, 16, 4)]
 CHOLESKY_SOLVE_RHS_BOUNDARY_SHAPES = [
     (64, 15),
@@ -222,9 +227,9 @@ def test_cholesky_solve_fp32_blocked_upper(shape):
 
 
 @pytest.mark.cholesky_solve
-@pytest.mark.parametrize("shape", CHOLESKY_SOLVE_FP32_F_LAYOUT_LOWER_SHAPES)
+@pytest.mark.parametrize("shape", CHOLESKY_SOLVE_FP32_BLOCKED_LOWER_SHAPES)
 @pytest.mark.parametrize("contiguous_factor", [False, True])
-def test_cholesky_solve_fp32_f_layout_lower(shape, contiguous_factor):
+def test_cholesky_solve_fp32_blocked_lower(shape, contiguous_factor):
     dtype = torch.float32
     A, factor, rhs = _make_cholesky_solve_inputs(shape, dtype)
     if contiguous_factor:
