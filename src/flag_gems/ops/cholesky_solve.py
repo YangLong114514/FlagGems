@@ -290,18 +290,19 @@ def cholesky_solve_blocked_lower_kernel(
 
         for m in range(0, k, BLOCK_M):
             rows_m = m + m_offsets
+            rows_m_mask = rows_m < k
             L_tile = tl.load(
                 L_ptr + L_base + rows_k[None, :] * stride_L + rows_m[:, None] * stride_L_col,
-                mask=(rows_m[:, None] < N) & (rows_k[None, :] < N), other=0.0)
+                mask=rows_m_mask[:, None] & (rows_k[None, :] < N), other=0.0)
             head = tl.load(
                 X_ptr + B_base + rows_m[:, None] * stride_B + rhs_cols[None, :],
-                mask=(rows_m[:, None] < N) & rhs_mask[None, :], other=0.0)
+                mask=rows_m_mask[:, None] & rhs_mask[None, :], other=0.0)
             head = head - tl.dot(
                 L_tile, x_block, input_precision="tf32x3"
             )
             tl.store(
                 X_ptr + B_base + rows_m[:, None] * stride_B + rhs_cols[None, :],
-                head, mask=(rows_m[:, None] < N) & rhs_mask[None, :])
+                head, mask=rows_m_mask[:, None] & rhs_mask[None, :])
 
 
 @libentry()
