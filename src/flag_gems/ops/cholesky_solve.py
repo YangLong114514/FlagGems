@@ -1452,8 +1452,8 @@ def cholesky_solve(B, L, upper=False):
     factor_is_f_contiguous = (
         L.stride(-2) == 1 and L.stride(-1) == N
     )
-    upper_single_rhs_is_faster = N in (8, 16, 32, 128) or (
-        B.dtype == torch.float32 and N == 64
+    upper_single_rhs_is_faster = N in (8, 16, 32, 64, 128) or (
+        B.dtype == torch.float32 and N == 256
     )
     use_transposed_upper_for_lower = not upper and (
         (N == 64 and nrhs >= 4)
