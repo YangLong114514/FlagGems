@@ -1362,7 +1362,7 @@ def _get_blocked_tile_configs(dtype, nrhs, N, use_wide_update_panel=False):
     """Return tile sizes for blocked kernels based on dtype, nrhs, and N.
 
     fp32 uses 32x32 panels with BLOCK_RHS=16 for the tl.dot MMA path.
-    Selected N=128 column-strided lower views widen only BLOCK_M to 64.
+    Selected fp32 blocked targets widen only BLOCK_M to 64.
     fp64 uses 16x32 panels with BLOCK_RHS=8. This configuration won every
     tested H20 lower/upper case across N, nrhs, and batch size.
     """
@@ -1595,11 +1595,14 @@ def cholesky_solve(B, L, upper=False):
         and N == 256
         and nrhs in (16, 128)
     )
+    use_wide_update_panel = use_strided_lower_panel_optimization or (
+        preload_blocked_diag and N == 256
+    )
 
     with torch.no_grad():
         if _can_use_blocked_lower_path(effective_upper, N, nrhs):
             tile = _get_blocked_tile_configs(
-                B.dtype, nrhs, N, use_strided_lower_panel_optimization
+                B.dtype, nrhs, N, use_wide_update_panel
             )
             warp = _get_blocked_warp_config(B.dtype)
             grid = (batch_size, triton.cdiv(nrhs, tile["BLOCK_RHS"]))
