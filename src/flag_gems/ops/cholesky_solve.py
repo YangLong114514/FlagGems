@@ -321,7 +321,6 @@ def cholesky_solve_blocked_upper_kernel(
     BLOCK_M: tl.constexpr,
     BLOCK_RHS: tl.constexpr,
     dtype_flag: tl.constexpr,
-    PRELOAD_DIAG: tl.constexpr,
 ):
     """Blocked upper-factor Cholesky solve.
 
@@ -357,38 +356,17 @@ def cholesky_solve_blocked_upper_kernel(
                 other=0.0,
             )
 
-        if PRELOAD_DIAG:
-            diag_block = tl.load(
-                L_ptr + L_base + rows_k * stride_L + rows_k,
-                mask=rows_k < N,
-                other=1.0,
-            )
-            inv_diag_block = 1.0 / diag_block
-            inv_diag_block = inv_diag_block * (
-                2.0 - diag_block * inv_diag_block
-            )
-
         for i in range(BLOCK_K):
             row_i = k + i
             if row_i < N:
                 row_mask = rows_k[:, None] == row_i
-                if PRELOAD_DIAG:
-                    y_new = tl.sum(
-                        tl.where(
-                            row_mask,
-                            y_block * inv_diag_block[:, None],
-                            0.0,
-                        ),
-                        axis=0,
-                    )
-                else:
-                    y_cur = tl.sum(tl.where(row_mask, y_block, 0.0), axis=0)
-                    diag = tl.load(L_ptr + L_base + row_i * stride_L + row_i)
-                    inv_diag = 1.0 / diag
+                y_cur = tl.sum(tl.where(row_mask, y_block, 0.0), axis=0)
+                diag = tl.load(L_ptr + L_base + row_i * stride_L + row_i)
+                inv_diag = 1.0 / diag
+                inv_diag = inv_diag * (2.0 - diag * inv_diag)
+                if dtype_flag == 1:
                     inv_diag = inv_diag * (2.0 - diag * inv_diag)
-                    if dtype_flag == 1:
-                        inv_diag = inv_diag * (2.0 - diag * inv_diag)
-                    y_new = y_cur * inv_diag
+                y_new = y_cur * inv_diag
                 U_row = tl.load(
                     L_ptr + L_base + row_i * stride_L + rows_k,
                     mask=(rows_k > row_i) & (rows_k < N),
@@ -444,38 +422,17 @@ def cholesky_solve_blocked_upper_kernel(
             other=0.0,
         )
 
-        if PRELOAD_DIAG:
-            diag_block = tl.load(
-                L_ptr + L_base + rows_k * stride_L + rows_k,
-                mask=rows_k < N,
-                other=1.0,
-            )
-            inv_diag_block = 1.0 / diag_block
-            inv_diag_block = inv_diag_block * (
-                2.0 - diag_block * inv_diag_block
-            )
-
         for ii in range(BLOCK_K - 1, -1, -1):
             row_i = k + ii
             if row_i < N:
                 row_mask = rows_k[:, None] == row_i
-                if PRELOAD_DIAG:
-                    x_new = tl.sum(
-                        tl.where(
-                            row_mask,
-                            x_block * inv_diag_block[:, None],
-                            0.0,
-                        ),
-                        axis=0,
-                    )
-                else:
-                    y_cur = tl.sum(tl.where(row_mask, x_block, 0.0), axis=0)
-                    diag = tl.load(L_ptr + L_base + row_i * stride_L + row_i)
-                    inv_diag = 1.0 / diag
+                y_cur = tl.sum(tl.where(row_mask, x_block, 0.0), axis=0)
+                diag = tl.load(L_ptr + L_base + row_i * stride_L + row_i)
+                inv_diag = 1.0 / diag
+                inv_diag = inv_diag * (2.0 - diag * inv_diag)
+                if dtype_flag == 1:
                     inv_diag = inv_diag * (2.0 - diag * inv_diag)
-                    if dtype_flag == 1:
-                        inv_diag = inv_diag * (2.0 - diag * inv_diag)
-                    x_new = y_cur * inv_diag
+                x_new = y_cur * inv_diag
                 U_col = tl.load(
                     L_ptr + L_base + rows_k * stride_L + row_i,
                     mask=rows_k < row_i,
@@ -1639,13 +1596,6 @@ def cholesky_solve(B, L, upper=False):
         and N == 256
         and nrhs in (16, 128)
     )
-    preload_blocked_upper_diag = (
-        effective_upper
-        and dtype_flag == 0
-        and batch_size == 1
-        and N == 64
-        and nrhs >= 4
-    )
     with torch.no_grad():
         if _can_use_blocked_lower_path(effective_upper, N, nrhs):
             tile = _get_blocked_tile_configs(
@@ -1685,8 +1635,7 @@ def cholesky_solve(B, L, upper=False):
                     L_kernel, B_kernel, X_kernel, N, nrhs,
                     batch_stride_L, batch_stride_B, stride_L, stride_B,
                     BLOCK_K=tile["BLOCK_K"], BLOCK_M=tile["BLOCK_M"],
-                    BLOCK_RHS=tile["BLOCK_RHS"], dtype_flag=dtype_flag,
-                    PRELOAD_DIAG=preload_blocked_upper_diag, **warp,
+                    BLOCK_RHS=tile["BLOCK_RHS"], dtype_flag=dtype_flag, **warp,
                 )
         elif _can_use_blocked_single_rhs_path(B.dtype, N, nrhs):
             if effective_upper:

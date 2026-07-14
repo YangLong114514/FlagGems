@@ -34,9 +34,6 @@ CHOLESKY_SOLVE_FP64_BLOCKED_SHAPES = [
     (256, 128),
 ]
 CHOLESKY_SOLVE_FP32_BLOCKED_UPPER_SHAPES = [
-    (64, 4),
-    (64, 33),
-    (64, 128),
     (128, 16),
     (128, 64),
     (256, 128),
