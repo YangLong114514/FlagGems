@@ -1358,11 +1358,11 @@ def cholesky_solve_single_rhs_kernel(
         tl.store(X_ptr + B_base + i * stride_B, sum_val * inv_diag)
 
 
-def _get_blocked_tile_configs(dtype, nrhs, N, use_f_contiguous_lower=False):
+def _get_blocked_tile_configs(dtype, nrhs, N, use_wide_update_panel=False):
     """Return tile sizes for blocked kernels based on dtype, nrhs, and N.
 
     fp32 uses 32x32 panels with BLOCK_RHS=16 for the tl.dot MMA path.
-    The selected N=128 F-contiguous lower path widens only BLOCK_M to 64.
+    Selected N=128 column-strided lower views widen only BLOCK_M to 64.
     fp64 uses 16x32 panels with BLOCK_RHS=8. This configuration won every
     tested H20 lower/upper case across N, nrhs, and batch size.
     """
@@ -1370,7 +1370,7 @@ def _get_blocked_tile_configs(dtype, nrhs, N, use_f_contiguous_lower=False):
         blk_k, blk_m, blk_rhs = 16, 32, 8
     else:
         blk_k, blk_m, blk_rhs = 32, 32, 16
-        if use_f_contiguous_lower:
+        if use_wide_update_panel:
             blk_m = 64
     return {"BLOCK_K": blk_k, "BLOCK_M": blk_m, "BLOCK_RHS": blk_rhs}
 
@@ -1578,6 +1578,12 @@ def cholesky_solve(B, L, upper=False):
     )
     if use_lower_for_upper:
         stride_L, stride_L_col = stride_L_col, stride_L
+    use_strided_lower_panel_optimization = use_f_contiguous_lower or (
+        use_lower_for_upper
+        and batch_size == 1
+        and N == 128
+        and nrhs in (16, 64)
+    )
     effective_upper = use_transposed_upper_for_lower or (
         upper
         and not (use_lower_for_upper or use_copied_lower_for_upper)
@@ -1586,7 +1592,7 @@ def cholesky_solve(B, L, upper=False):
     with torch.no_grad():
         if _can_use_blocked_lower_path(effective_upper, N, nrhs):
             tile = _get_blocked_tile_configs(
-                B.dtype, nrhs, N, use_f_contiguous_lower
+                B.dtype, nrhs, N, use_strided_lower_panel_optimization
             )
             warp = _get_blocked_warp_config(B.dtype)
             grid = (batch_size, triton.cdiv(nrhs, tile["BLOCK_RHS"]))
@@ -1604,7 +1610,7 @@ def cholesky_solve(B, L, upper=False):
                     stride_L_col=stride_L_col,
                     BLOCK_K=tile["BLOCK_K"], BLOCK_M=tile["BLOCK_M"],
                     BLOCK_RHS=tile["BLOCK_RHS"], dtype_flag=dtype_flag,
-                    PRELOAD_DIAG=use_f_contiguous_lower, **warp,
+                    PRELOAD_DIAG=use_strided_lower_panel_optimization, **warp,
                 )
         elif _can_use_blocked_upper_path(effective_upper, N, nrhs):
             tile = _get_blocked_tile_configs(B.dtype, nrhs, N)
