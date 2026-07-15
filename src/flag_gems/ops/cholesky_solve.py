@@ -128,6 +128,7 @@ def cholesky_solve_blocked_lower_kernel(
     BLOCK_RHS: tl.constexpr,
     dtype_flag: tl.constexpr,
     PRELOAD_DIAG: tl.constexpr,
+    FAST_FAR_UPDATES: tl.constexpr,
 ):
     """Blocked lower-factor Cholesky solve.
 
@@ -222,9 +223,14 @@ def cholesky_solve_blocked_lower_kernel(
                 tail = tl.load(
                     X_ptr + B_base + rows_m[:, None] * stride_B + rhs_cols[None, :],
                     mask=(rows_m[:, None] < N) & rhs_mask[None, :], other=0.0)
-            tail = tail - tl.dot(
-                L_tile, y_block, input_precision="tf32x3"
-            )
+            if FAST_FAR_UPDATES and m >= k + 2 * BLOCK_K:
+                tail = tail - tl.dot(
+                    L_tile, y_block, input_precision="tf32"
+                )
+            else:
+                tail = tail - tl.dot(
+                    L_tile, y_block, input_precision="tf32x3"
+                )
             tl.store(
                 X_ptr + B_base + rows_m[:, None] * stride_B + rhs_cols[None, :],
                 tail, mask=(rows_m[:, None] < N) & rhs_mask[None, :])
@@ -300,9 +306,14 @@ def cholesky_solve_blocked_lower_kernel(
             head = tl.load(
                 X_ptr + B_base + rows_m[:, None] * stride_B + rhs_cols[None, :],
                 mask=rows_m_mask[:, None] & rhs_mask[None, :], other=0.0)
-            head = head - tl.dot(
-                L_tile, x_block, input_precision="tf32x3"
-            )
+            if FAST_FAR_UPDATES and m + BLOCK_M < k:
+                head = head - tl.dot(
+                    L_tile, x_block, input_precision="tf32"
+                )
+            else:
+                head = head - tl.dot(
+                    L_tile, x_block, input_precision="tf32x3"
+                )
             tl.store(
                 X_ptr + B_base + rows_m[:, None] * stride_B + rhs_cols[None, :],
                 head, mask=rows_m_mask[:, None] & rhs_mask[None, :])
@@ -1609,6 +1620,13 @@ def cholesky_solve(B, L, upper=False):
         and N == 256
         and nrhs in (16, 128)
     )
+    use_fast_far_updates = (
+        not effective_upper
+        and dtype_flag == 0
+        and batch_size == 1
+        and N == 256
+        and nrhs == 128
+    )
     with torch.no_grad():
         if _can_use_blocked_lower_path(effective_upper, N, nrhs):
             tile = _get_blocked_tile_configs(
@@ -1630,7 +1648,9 @@ def cholesky_solve(B, L, upper=False):
                     stride_L_col=stride_L_col,
                     BLOCK_K=tile["BLOCK_K"], BLOCK_M=tile["BLOCK_M"],
                     BLOCK_RHS=tile["BLOCK_RHS"], dtype_flag=dtype_flag,
-                    PRELOAD_DIAG=preload_blocked_diag, **warp,
+                    PRELOAD_DIAG=preload_blocked_diag,
+                    FAST_FAR_UPDATES=use_fast_far_updates,
+                    **warp,
                 )
         elif _can_use_blocked_upper_path(effective_upper, N, nrhs):
             use_single_panel = (
