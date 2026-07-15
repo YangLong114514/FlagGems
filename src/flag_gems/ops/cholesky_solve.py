@@ -1368,7 +1368,6 @@ def _get_blocked_tile_configs(
     N,
     use_wide_update_panel=False,
     use_single_panel=False,
-    use_wide_rhs_tile=False,
 ):
     """Return tile sizes for blocked kernels based on dtype, nrhs, and N.
 
@@ -1376,8 +1375,6 @@ def _get_blocked_tile_configs(
     Batch-one N=64 upper solves use one 64-row panel, avoiding both cross-panel
     updates and their intermediate global-memory traffic.
     Selected N=128 column-strided lower views widen only BLOCK_M to 64.
-    Selected N=256 wide-RHS solves use BLOCK_RHS=32 so each loaded factor tile
-    is shared across twice as many columns.
     fp64 uses 16x32 panels with BLOCK_RHS=8. This configuration won every
     tested H20 lower/upper case across N, nrhs, and batch size.
     """
@@ -1389,8 +1386,6 @@ def _get_blocked_tile_configs(
             blk_k = N
         if use_wide_update_panel:
             blk_m = 64
-        if use_wide_rhs_tile:
-            blk_rhs = 32
     return {"BLOCK_K": blk_k, "BLOCK_M": blk_m, "BLOCK_RHS": blk_rhs}
 
 
@@ -1614,26 +1609,12 @@ def cholesky_solve(B, L, upper=False):
         and N == 256
         and nrhs in (16, 128)
     )
-    use_wide_rhs_tile = (
-        not effective_upper
-        and dtype_flag == 0
-        and batch_size == 1
-        and N == 256
-        and nrhs == 128
-    )
     with torch.no_grad():
         if _can_use_blocked_lower_path(effective_upper, N, nrhs):
             tile = _get_blocked_tile_configs(
-                B.dtype,
-                nrhs,
-                N,
-                use_strided_lower_panel_optimization,
-                use_wide_rhs_tile=use_wide_rhs_tile,
+                B.dtype, nrhs, N, use_strided_lower_panel_optimization
             )
-            if use_wide_rhs_tile:
-                warp = {"num_warps": 8, "num_stages": 2}
-            else:
-                warp = _get_blocked_warp_config(B.dtype)
+            warp = _get_blocked_warp_config(B.dtype)
             grid = (batch_size, triton.cdiv(nrhs, tile["BLOCK_RHS"]))
             if dtype_flag == 1:
                 cholesky_solve_blocked_lower_fp64_kernel[grid](
