@@ -1113,86 +1113,6 @@ def cholesky_solve_single_rhs_blocked_upper_kernel(
 
 @libentry()
 @triton.jit
-def cholesky_solve_column_parallel_kernel(
-    L_ptr,
-    B_ptr,
-    X_ptr,
-    N: tl.constexpr,
-    nrhs: tl.constexpr,
-    batch_stride_L,
-    batch_stride_B,
-    stride_L,
-    stride_B,
-    stride_L_col: tl.constexpr,
-    BLOCK_N: tl.constexpr,
-):
-    """Solve one RHS column per warp with register-resident intermediates.
-
-    This path trades redundant factor reads for enough independent CTAs to
-    occupy the GPU. It also uses explicit reductions instead of ``tl.dot``,
-    avoiding the shared-memory staging generated for the blocked kernel.
-    """
-    batch_pid = program_id(0)
-    rhs_pid = program_id(1)
-
-    L_base = batch_pid * batch_stride_L
-    B_base = batch_pid * batch_stride_B
-    offsets = tl.arange(0, BLOCK_N)
-    y_vec = tl.zeros([BLOCK_N], dtype=tl.float32)
-
-    # Forward substitution: L * Y = B.
-    for i in range(N):
-        L_vals = tl.load(
-            L_ptr
-            + L_base
-            + i * stride_L
-            + offsets * stride_L_col,
-            mask=offsets < i,
-            other=0.0,
-        )
-        dot = tl.sum(L_vals * y_vec, axis=0)
-        rhs_val = tl.load(B_ptr + B_base + i * stride_B + rhs_pid)
-        diag = tl.load(
-            L_ptr + L_base + i * stride_L + i * stride_L_col
-        )
-        inv_diag = 1.0 / diag
-        inv_diag = inv_diag * (2.0 - diag * inv_diag)
-        y_i = (rhs_val - dot) * inv_diag
-        y_vec = tl.where(offsets == i, y_i, y_vec)
-
-    x_vec = y_vec
-
-    # Backward substitution: L^T * X = Y. Entries at and below i have not
-    # yet been overwritten, so x_vec[i] still contains Y[i].
-    for i in range(N - 1, -1, -1):
-        active = (offsets > i) & (offsets < N)
-        L_vals = tl.load(
-            L_ptr
-            + L_base
-            + offsets * stride_L
-            + i * stride_L_col,
-            mask=active,
-            other=0.0,
-        )
-        dot = tl.sum(L_vals * x_vec, axis=0)
-        y_i = tl.sum(tl.where(offsets == i, x_vec, 0.0), axis=0)
-        diag = tl.load(
-            L_ptr + L_base + i * stride_L + i * stride_L_col
-        )
-        inv_diag = 1.0 / diag
-        inv_diag = inv_diag * (2.0 - diag * inv_diag)
-        x_i = (y_i - dot) * inv_diag
-        x_vec = tl.where(offsets == i, x_i, x_vec)
-
-    tl.store(
-        X_ptr + B_base + offsets * stride_B + rhs_pid,
-        x_vec,
-        mask=offsets < N,
-    )
-
-
-@libentry()
-@triton.jit
 def cholesky_solve_small_single_rhs_kernel(
     L_ptr,
     B_ptr,
@@ -1689,33 +1609,8 @@ def cholesky_solve(B, L, upper=False):
         and N == 256
         and nrhs in (16, 128)
     )
-    use_column_parallel_rhs = (
-        not effective_upper
-        and dtype_flag == 0
-        and batch_size == 1
-        and N == 256
-        and nrhs == 128
-        and stride_L_col == 1
-    )
     with torch.no_grad():
-        if use_column_parallel_rhs:
-            grid = (batch_size, nrhs)
-            cholesky_solve_column_parallel_kernel[grid](
-                L_kernel,
-                B_kernel,
-                X_kernel,
-                N,
-                nrhs,
-                batch_stride_L,
-                batch_stride_B,
-                stride_L,
-                stride_B,
-                stride_L_col=stride_L_col,
-                BLOCK_N=256,
-                num_warps=1,
-                num_stages=1,
-            )
-        elif _can_use_blocked_lower_path(effective_upper, N, nrhs):
+        if _can_use_blocked_lower_path(effective_upper, N, nrhs):
             tile = _get_blocked_tile_configs(
                 B.dtype, nrhs, N, use_strided_lower_panel_optimization
             )
