@@ -1372,8 +1372,8 @@ def _get_blocked_tile_configs(
     """Return tile sizes for blocked kernels based on dtype, nrhs, and N.
 
     fp32 uses 32x32 panels with BLOCK_RHS=16 for the tl.dot MMA path.
-    Batch-one N=64 upper solves use one 64-row panel, avoiding both cross-panel
-    updates and their intermediate global-memory traffic.
+    Batch-one N=64 upper solves use one 64-row panel and four RHS columns per
+    CTA, avoiding cross-panel traffic while exposing more RHS parallelism.
     Selected N=128 column-strided lower views widen only BLOCK_M to 64.
     fp64 uses 16x32 panels with BLOCK_RHS=8. This configuration won every
     tested H20 lower/upper case across N, nrhs, and batch size.
@@ -1384,6 +1384,7 @@ def _get_blocked_tile_configs(
         blk_k, blk_m, blk_rhs = 32, 32, 16
         if use_single_panel:
             blk_k = N
+            blk_rhs = 4
         if use_wide_update_panel:
             blk_m = 64
     return {"BLOCK_K": blk_k, "BLOCK_M": blk_m, "BLOCK_RHS": blk_rhs}
