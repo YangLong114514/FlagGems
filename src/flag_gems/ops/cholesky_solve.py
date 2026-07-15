@@ -112,10 +112,79 @@ def cholesky_solve_kernel(
 
 @libentry()
 @triton.jit
+def cholesky_solve_invert_lower_diag_blocks_kernel(
+    L_ptr,
+    Inv_ptr,
+    N: tl.constexpr,
+    batch_stride_L,
+    stride_L,
+    stride_L_col: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    """Invert independent diagonal blocks of a lower-triangular factor."""
+    batch_pid = program_id(0)
+    block_pid = program_id(1)
+
+    offsets = tl.arange(0, BLOCK_K)
+    block_start = block_pid * BLOCK_K
+    rows = block_start + offsets
+    cols = offsets
+    row_mask = rows[:, None] < N
+
+    # Solve L_kk * Inv_kk = I one row at a time. The inverse is stored in a
+    # compact row-major workspace and reused by every RHS tile.
+    inv_block = tl.where(
+        offsets[:, None] == cols[None, :], 1.0, 0.0
+    )
+    L_base = batch_pid * batch_stride_L
+    for i in range(BLOCK_K):
+        row_i = block_start + i
+        current_row_mask = offsets[:, None] == i
+        current_row = tl.sum(
+            tl.where(current_row_mask, inv_block, 0.0), axis=0
+        )
+        diag = tl.load(
+            L_ptr
+            + L_base
+            + row_i * stride_L
+            + row_i * stride_L_col
+        )
+        inv_diag = 1.0 / diag
+        inv_diag = inv_diag * (2.0 - diag * inv_diag)
+        solved_row = current_row * inv_diag
+        L_col = tl.load(
+            L_ptr
+            + L_base
+            + rows * stride_L
+            + row_i * stride_L_col,
+            mask=(offsets > i) & (rows < N),
+            other=0.0,
+        )
+        inv_block = inv_block - L_col[:, None] * solved_row[None, :]
+        inv_block = tl.where(
+            current_row_mask, solved_row[None, :], inv_block
+        )
+
+    inv_base = (
+        batch_pid * (N // BLOCK_K) + block_pid
+    ) * BLOCK_K * BLOCK_K
+    tl.store(
+        Inv_ptr
+        + inv_base
+        + offsets[:, None] * BLOCK_K
+        + cols[None, :],
+        inv_block,
+        mask=row_mask,
+    )
+
+
+@libentry()
+@triton.jit
 def cholesky_solve_blocked_lower_kernel(
     L_ptr,
     B_ptr,
     X_ptr,
+    DiagInv_ptr,
     N: tl.constexpr,
     nrhs: tl.constexpr,
     batch_stride_L,
@@ -128,6 +197,7 @@ def cholesky_solve_blocked_lower_kernel(
     BLOCK_RHS: tl.constexpr,
     dtype_flag: tl.constexpr,
     PRELOAD_DIAG: tl.constexpr,
+    USE_DIAG_INV: tl.constexpr,
 ):
     """Blocked lower-factor Cholesky solve.
 
@@ -157,53 +227,74 @@ def cholesky_solve_blocked_lower_kernel(
                 X_ptr + B_base + rows_k[:, None] * stride_B + rhs_cols[None, :],
                 mask=(rows_k[:, None] < N) & rhs_mask[None, :], other=0.0)
 
-        if PRELOAD_DIAG:
-            diag_block = tl.load(
-                L_ptr
-                + L_base
-                + rows_k * stride_L
-                + rows_k * stride_L_col,
-                mask=rows_k < N,
-                other=1.0,
+        if USE_DIAG_INV:
+            inv_base = (
+                batch_pid * (N // BLOCK_K) + k // BLOCK_K
+            ) * BLOCK_K * BLOCK_K
+            inv_block = tl.load(
+                DiagInv_ptr
+                + inv_base
+                + k_offsets[:, None] * BLOCK_K
+                + k_offsets[None, :]
             )
-            inv_diag_block = 1.0 / diag_block
-            inv_diag_block = inv_diag_block * (
-                2.0 - diag_block * inv_diag_block
+            y_block = tl.dot(
+                inv_block, y_block, input_precision="tf32x3"
             )
+        else:
+            if PRELOAD_DIAG:
+                diag_block = tl.load(
+                    L_ptr
+                    + L_base
+                    + rows_k * stride_L
+                    + rows_k * stride_L_col,
+                    mask=rows_k < N,
+                    other=1.0,
+                )
+                inv_diag_block = 1.0 / diag_block
+                inv_diag_block = inv_diag_block * (
+                    2.0 - diag_block * inv_diag_block
+                )
 
-        for i in range(BLOCK_K):
-            row_i = k + i
-            if row_i < N:
-                row_mask = rows_k[:, None] == row_i
-                if PRELOAD_DIAG:
-                    y_new = tl.sum(
-                        tl.where(
-                            row_mask,
-                            y_block * inv_diag_block[:, None],
-                            0.0,
-                        ),
-                        axis=0,
-                    )
-                else:
-                    y_cur = tl.sum(
-                        tl.where(row_mask, y_block, 0.0), axis=0
-                    )
-                    diag = tl.load(
+            for i in range(BLOCK_K):
+                row_i = k + i
+                if row_i < N:
+                    row_mask = rows_k[:, None] == row_i
+                    if PRELOAD_DIAG:
+                        y_new = tl.sum(
+                            tl.where(
+                                row_mask,
+                                y_block * inv_diag_block[:, None],
+                                0.0,
+                            ),
+                            axis=0,
+                        )
+                    else:
+                        y_cur = tl.sum(
+                            tl.where(row_mask, y_block, 0.0), axis=0
+                        )
+                        diag = tl.load(
+                            L_ptr
+                            + L_base
+                            + row_i * stride_L
+                            + row_i * stride_L_col
+                        )
+                        inv_diag = 1.0 / diag
+                        inv_diag = inv_diag * (2.0 - diag * inv_diag)
+                        if dtype_flag == 1:
+                            inv_diag = inv_diag * (2.0 - diag * inv_diag)
+                        y_new = y_cur * inv_diag
+                    L_col = tl.load(
                         L_ptr
                         + L_base
-                        + row_i * stride_L
-                        + row_i * stride_L_col
+                        + rows_k * stride_L
+                        + row_i * stride_L_col,
+                        mask=(rows_k > row_i) & (rows_k < N),
+                        other=0.0,
                     )
-                    inv_diag = 1.0 / diag
-                    inv_diag = inv_diag * (2.0 - diag * inv_diag)
-                    if dtype_flag == 1:
-                        inv_diag = inv_diag * (2.0 - diag * inv_diag)
-                    y_new = y_cur * inv_diag
-                L_col = tl.load(
-                    L_ptr + L_base + rows_k * stride_L + row_i * stride_L_col,
-                    mask=(rows_k > row_i) & (rows_k < N), other=0.0)
-                y_block = y_block - L_col[:, None] * y_new[None, :]
-                y_block = tl.where(row_mask, y_new[None, :], y_block)
+                    y_block = y_block - L_col[:, None] * y_new[None, :]
+                    y_block = tl.where(
+                        row_mask, y_new[None, :], y_block
+                    )
 
         tl.store(
             X_ptr + B_base + rows_k[:, None] * stride_B + rhs_cols[None, :],
@@ -236,53 +327,74 @@ def cholesky_solve_blocked_lower_kernel(
             X_ptr + B_base + rows_k[:, None] * stride_B + rhs_cols[None, :],
             mask=(rows_k[:, None] < N) & rhs_mask[None, :], other=0.0)
 
-        if PRELOAD_DIAG:
-            diag_block = tl.load(
-                L_ptr
-                + L_base
-                + rows_k * stride_L
-                + rows_k * stride_L_col,
-                mask=rows_k < N,
-                other=1.0,
+        if USE_DIAG_INV:
+            inv_base = (
+                batch_pid * (N // BLOCK_K) + k // BLOCK_K
+            ) * BLOCK_K * BLOCK_K
+            inv_block = tl.load(
+                DiagInv_ptr
+                + inv_base
+                + k_offsets[:, None] * BLOCK_K
+                + k_offsets[None, :]
             )
-            inv_diag_block = 1.0 / diag_block
-            inv_diag_block = inv_diag_block * (
-                2.0 - diag_block * inv_diag_block
+            x_block = tl.dot(
+                tl.trans(inv_block), x_block, input_precision="tf32x3"
             )
+        else:
+            if PRELOAD_DIAG:
+                diag_block = tl.load(
+                    L_ptr
+                    + L_base
+                    + rows_k * stride_L
+                    + rows_k * stride_L_col,
+                    mask=rows_k < N,
+                    other=1.0,
+                )
+                inv_diag_block = 1.0 / diag_block
+                inv_diag_block = inv_diag_block * (
+                    2.0 - diag_block * inv_diag_block
+                )
 
-        for ii in range(BLOCK_K - 1, -1, -1):
-            row_i = k + ii
-            if row_i < N:
-                row_mask = rows_k[:, None] == row_i
-                if PRELOAD_DIAG:
-                    x_new = tl.sum(
-                        tl.where(
-                            row_mask,
-                            x_block * inv_diag_block[:, None],
-                            0.0,
-                        ),
-                        axis=0,
-                    )
-                else:
-                    y_cur = tl.sum(
-                        tl.where(row_mask, x_block, 0.0), axis=0
-                    )
-                    diag = tl.load(
+            for ii in range(BLOCK_K - 1, -1, -1):
+                row_i = k + ii
+                if row_i < N:
+                    row_mask = rows_k[:, None] == row_i
+                    if PRELOAD_DIAG:
+                        x_new = tl.sum(
+                            tl.where(
+                                row_mask,
+                                x_block * inv_diag_block[:, None],
+                                0.0,
+                            ),
+                            axis=0,
+                        )
+                    else:
+                        y_cur = tl.sum(
+                            tl.where(row_mask, x_block, 0.0), axis=0
+                        )
+                        diag = tl.load(
+                            L_ptr
+                            + L_base
+                            + row_i * stride_L
+                            + row_i * stride_L_col
+                        )
+                        inv_diag = 1.0 / diag
+                        inv_diag = inv_diag * (2.0 - diag * inv_diag)
+                        if dtype_flag == 1:
+                            inv_diag = inv_diag * (2.0 - diag * inv_diag)
+                        x_new = y_cur * inv_diag
+                    L_row = tl.load(
                         L_ptr
                         + L_base
                         + row_i * stride_L
-                        + row_i * stride_L_col
+                        + rows_k * stride_L_col,
+                        mask=rows_k < row_i,
+                        other=0.0,
                     )
-                    inv_diag = 1.0 / diag
-                    inv_diag = inv_diag * (2.0 - diag * inv_diag)
-                    if dtype_flag == 1:
-                        inv_diag = inv_diag * (2.0 - diag * inv_diag)
-                    x_new = y_cur * inv_diag
-                L_row = tl.load(
-                    L_ptr + L_base + row_i * stride_L + rows_k * stride_L_col,
-                    mask=rows_k < row_i, other=0.0)
-                x_block = x_block - L_row[:, None] * x_new[None, :]
-                x_block = tl.where(row_mask, x_new[None, :], x_block)
+                    x_block = x_block - L_row[:, None] * x_new[None, :]
+                    x_block = tl.where(
+                        row_mask, x_new[None, :], x_block
+                    )
 
         tl.store(
             X_ptr + B_base + rows_k[:, None] * stride_B + rhs_cols[None, :],
@@ -1609,6 +1721,14 @@ def cholesky_solve(B, L, upper=False):
         and N == 256
         and nrhs in (16, 128)
     )
+    use_block_diag_inverse = (
+        not effective_upper
+        and dtype_flag == 0
+        and batch_size == 1
+        and N == 256
+        and nrhs == 128
+        and stride_L_col == 1
+    )
     with torch.no_grad():
         if _can_use_blocked_lower_path(effective_upper, N, nrhs):
             tile = _get_blocked_tile_configs(
@@ -1624,13 +1744,47 @@ def cholesky_solve(B, L, upper=False):
                     BLOCK_RHS=tile["BLOCK_RHS"], **warp,
                 )
             else:
+                if use_block_diag_inverse:
+                    diag_inv = torch.empty(
+                        (
+                            batch_size,
+                            N // tile["BLOCK_K"],
+                            tile["BLOCK_K"],
+                            tile["BLOCK_K"],
+                        ),
+                        dtype=L_kernel.dtype,
+                        device=L_kernel.device,
+                    )
+                    inv_grid = (
+                        batch_size,
+                        N // tile["BLOCK_K"],
+                    )
+                    cholesky_solve_invert_lower_diag_blocks_kernel[
+                        inv_grid
+                    ](
+                        L_kernel,
+                        diag_inv,
+                        N,
+                        batch_stride_L,
+                        stride_L,
+                        stride_L_col=stride_L_col,
+                        BLOCK_K=tile["BLOCK_K"],
+                        num_warps=4,
+                        num_stages=1,
+                    )
+                else:
+                    diag_inv = L_kernel
                 cholesky_solve_blocked_lower_kernel[grid](
-                    L_kernel, B_kernel, X_kernel, N, nrhs,
+                    L_kernel, B_kernel, X_kernel, diag_inv, N, nrhs,
                     batch_stride_L, batch_stride_B, stride_L, stride_B,
                     stride_L_col=stride_L_col,
                     BLOCK_K=tile["BLOCK_K"], BLOCK_M=tile["BLOCK_M"],
                     BLOCK_RHS=tile["BLOCK_RHS"], dtype_flag=dtype_flag,
-                    PRELOAD_DIAG=preload_blocked_diag, **warp,
+                    PRELOAD_DIAG=(
+                        preload_blocked_diag and not use_block_diag_inverse
+                    ),
+                    USE_DIAG_INV=use_block_diag_inverse,
+                    **warp,
                 )
         elif _can_use_blocked_upper_path(effective_upper, N, nrhs):
             use_single_panel = (
