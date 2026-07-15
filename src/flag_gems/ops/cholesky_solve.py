@@ -208,6 +208,199 @@ def cholesky_solve_complex_kernel(
 
 @libentry()
 @triton.jit
+def cholesky_solve_complex_small_gather_kernel(
+    L_ptr,
+    B_ptr,
+    X_ptr,
+    N: tl.constexpr,
+    nrhs: tl.constexpr,
+    batch_stride_L,
+    batch_stride_B,
+    stride_L_row,
+    stride_L_col,
+    stride_B_row,
+    stride_B_col,
+    BLOCK_N: tl.constexpr,
+    BLOCK_RHS: tl.constexpr,
+    upper: tl.constexpr,
+):
+    """Register-resident complex solve for N <= 32 and nrhs <= 8."""
+    batch_pid = program_id(0)
+    L_base = batch_pid * batch_stride_L
+    B_base = batch_pid * batch_stride_B
+
+    rows = tl.arange(0, BLOCK_N)
+    cols = tl.arange(0, BLOCK_RHS)
+    rows_mask = rows < N
+    cols_mask = cols < nrhs
+    value_mask = rows_mask[:, None] & cols_mask[None, :]
+
+    b_offset = (
+        B_base
+        + rows[:, None] * stride_B_row
+        + cols[None, :] * stride_B_col
+    )
+    w_real = tl.load(B_ptr + b_offset, mask=value_mask, other=0.0)
+    w_imag = tl.load(B_ptr + b_offset + 1, mask=value_mask, other=0.0)
+
+    diag_offset = L_base + rows * stride_L_row + rows * stride_L_col
+    diag_real = tl.load(
+        L_ptr + diag_offset,
+        mask=rows_mask,
+        other=1.0,
+    )
+    diag_imag = tl.load(
+        L_ptr + diag_offset + 1,
+        mask=rows_mask,
+        other=0.0,
+    )
+
+    # Phase 1: solve L * Y = B, or U^H * Y = B.
+    forward_diag_imag = diag_imag
+    if upper:
+        forward_diag_imag = -forward_diag_imag
+    forward_denominator = (
+        diag_real * diag_real + forward_diag_imag * forward_diag_imag
+    )
+    forward_inv_real = diag_real / forward_denominator
+    forward_inv_imag = -forward_diag_imag / forward_denominator
+    scaled_real = (
+        w_real * forward_inv_real[:, None]
+        - w_imag * forward_inv_imag[:, None]
+    )
+    scaled_imag = (
+        w_real * forward_inv_imag[:, None]
+        + w_imag * forward_inv_real[:, None]
+    )
+
+    for i in range(N):
+        if upper:
+            factor_offset = (
+                L_base + i * stride_L_row + rows * stride_L_col
+            )
+        else:
+            factor_offset = (
+                L_base + rows * stride_L_row + i * stride_L_col
+            )
+        active = (rows > i) & rows_mask
+        factor_real = tl.load(
+            L_ptr + factor_offset,
+            mask=active,
+            other=0.0,
+        )
+        factor_imag = tl.load(
+            L_ptr + factor_offset + 1,
+            mask=active,
+            other=0.0,
+        )
+        if upper:
+            factor_imag = -factor_imag
+
+        normalized_real = (
+            factor_real * forward_inv_real
+            - factor_imag * forward_inv_imag
+        )
+        normalized_imag = (
+            factor_real * forward_inv_imag
+            + factor_imag * forward_inv_real
+        )
+        pivot_real = tl.gather(
+            scaled_real,
+            tl.full([1, BLOCK_RHS], i, tl.int32),
+            0,
+        )
+        pivot_imag = tl.gather(
+            scaled_imag,
+            tl.full([1, BLOCK_RHS], i, tl.int32),
+            0,
+        )
+        product_real = (
+            normalized_real[:, None] * pivot_real
+            - normalized_imag[:, None] * pivot_imag
+        )
+        product_imag = (
+            normalized_real[:, None] * pivot_imag
+            + normalized_imag[:, None] * pivot_real
+        )
+        scaled_real -= product_real
+        scaled_imag -= product_imag
+
+    # Phase 2: solve L^H * X = Y, or U * X = Y.
+    backward_diag_imag = diag_imag
+    if not upper:
+        backward_diag_imag = -backward_diag_imag
+    backward_denominator = (
+        diag_real * diag_real + backward_diag_imag * backward_diag_imag
+    )
+    backward_inv_real = diag_real / backward_denominator
+    backward_inv_imag = -backward_diag_imag / backward_denominator
+    out_real = (
+        scaled_real * backward_inv_real[:, None]
+        - scaled_imag * backward_inv_imag[:, None]
+    )
+    out_imag = (
+        scaled_real * backward_inv_imag[:, None]
+        + scaled_imag * backward_inv_real[:, None]
+    )
+
+    for i in range(N - 1, -1, -1):
+        if upper:
+            factor_offset = (
+                L_base + rows * stride_L_row + i * stride_L_col
+            )
+        else:
+            factor_offset = (
+                L_base + i * stride_L_row + rows * stride_L_col
+            )
+        active = (rows < i) & rows_mask
+        factor_real = tl.load(
+            L_ptr + factor_offset,
+            mask=active,
+            other=0.0,
+        )
+        factor_imag = tl.load(
+            L_ptr + factor_offset + 1,
+            mask=active,
+            other=0.0,
+        )
+        if not upper:
+            factor_imag = -factor_imag
+
+        normalized_real = (
+            factor_real * backward_inv_real
+            - factor_imag * backward_inv_imag
+        )
+        normalized_imag = (
+            factor_real * backward_inv_imag
+            + factor_imag * backward_inv_real
+        )
+        pivot_real = tl.gather(
+            out_real,
+            tl.full([1, BLOCK_RHS], i, tl.int32),
+            0,
+        )
+        pivot_imag = tl.gather(
+            out_imag,
+            tl.full([1, BLOCK_RHS], i, tl.int32),
+            0,
+        )
+        product_real = (
+            normalized_real[:, None] * pivot_real
+            - normalized_imag[:, None] * pivot_imag
+        )
+        product_imag = (
+            normalized_real[:, None] * pivot_imag
+            + normalized_imag[:, None] * pivot_real
+        )
+        out_real -= product_real
+        out_imag -= product_imag
+
+    tl.store(X_ptr + b_offset, out_real, mask=value_mask)
+    tl.store(X_ptr + b_offset + 1, out_imag, mask=value_mask)
+
+
+@libentry()
+@triton.jit
 def cholesky_solve_blocked_lower_kernel(
     L_ptr,
     B_ptr,
@@ -1471,26 +1664,51 @@ def _cholesky_solve_complex(B, L, upper, batch_shape, N, nrhs):
     B_real = torch.view_as_real(B).reshape(-1, N, nrhs, 2)
     X_real = torch.view_as_real(X).reshape(-1, N, nrhs, 2)
 
-    block_rhs = 4 if B.dtype == torch.complex64 else 2
-    grid = (batch_size, triton.cdiv(nrhs, block_rhs))
     with torch.no_grad():
-        cholesky_solve_complex_kernel[grid](
-            L_real,
-            B_real,
-            X_real,
-            N,
-            nrhs,
-            L_real.stride(0),
-            B_real.stride(0),
-            L_real.stride(1),
-            L_real.stride(2),
-            B_real.stride(1),
-            B_real.stride(2),
-            BLOCK_RHS=block_rhs,
-            upper=upper,
-            num_warps=1,
-            num_stages=1,
-        )
+        if N <= 32 and nrhs <= 8:
+            block_n = triton.next_power_of_2(N)
+            block_rhs = triton.next_power_of_2(nrhs)
+            num_warps = (
+                2 if B.dtype == torch.complex128 and N > 16 else 1
+            )
+            cholesky_solve_complex_small_gather_kernel[(batch_size,)](
+                L_real,
+                B_real,
+                X_real,
+                N,
+                nrhs,
+                L_real.stride(0),
+                B_real.stride(0),
+                L_real.stride(1),
+                L_real.stride(2),
+                B_real.stride(1),
+                B_real.stride(2),
+                BLOCK_N=block_n,
+                BLOCK_RHS=block_rhs,
+                upper=upper,
+                num_warps=num_warps,
+                num_stages=1,
+            )
+        else:
+            block_rhs = 4 if B.dtype == torch.complex64 else 2
+            grid = (batch_size, triton.cdiv(nrhs, block_rhs))
+            cholesky_solve_complex_kernel[grid](
+                L_real,
+                B_real,
+                X_real,
+                N,
+                nrhs,
+                L_real.stride(0),
+                B_real.stride(0),
+                L_real.stride(1),
+                L_real.stride(2),
+                B_real.stride(1),
+                B_real.stride(2),
+                BLOCK_RHS=block_rhs,
+                upper=upper,
+                num_warps=1,
+                num_stages=1,
+            )
     return X
 
 

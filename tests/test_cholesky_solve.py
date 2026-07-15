@@ -387,6 +387,16 @@ def test_cholesky_solve_complex_broadcast(dtype, upper):
 
 
 @pytest.mark.cholesky_solve
+@pytest.mark.parametrize("dtype", [torch.complex64, torch.complex128])
+@pytest.mark.parametrize("upper", [False, True])
+def test_cholesky_solve_complex_small_gather_conditioned(dtype, upper):
+    A, L, rhs = _make_conditioned_inputs((16, 5), dtype)
+    factor = L.mH.contiguous() if upper else L
+
+    _assert_cholesky_solve_matches(A, factor, rhs, dtype, upper=upper)
+
+
+@pytest.mark.cholesky_solve
 def test_cholesky_solve_empty_input():
     B = torch.empty(0, 0, dtype=torch.float32, device=flag_gems.device)
     L = torch.empty(0, 0, dtype=torch.float32, device=flag_gems.device)
