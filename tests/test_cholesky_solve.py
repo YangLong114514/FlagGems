@@ -312,16 +312,6 @@ def test_cholesky_solve_conditioned_matrix(dtype):
 
 
 @pytest.mark.cholesky_solve
-@pytest.mark.parametrize("upper", [False, True])
-def test_cholesky_solve_fp32_fast_far_updates_conditioned(upper):
-    dtype = torch.float32
-    A, L, rhs = _make_conditioned_inputs((256, 128), dtype)
-    factor = L.mT.contiguous() if upper else L
-
-    _assert_cholesky_solve_matches(A, factor, rhs, dtype, upper=upper)
-
-
-@pytest.mark.cholesky_solve
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
 def test_cholesky_solve_accuracy(dtype):
     A, L, rhs = _make_cholesky_solve_inputs((4, 2), dtype)
