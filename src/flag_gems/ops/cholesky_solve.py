@@ -122,17 +122,14 @@ def cholesky_solve_blocked_lower_kernel(
     batch_stride_B,
     stride_L,
     stride_B,
-    stride_L_col: tl.constexpr,
     BLOCK_K: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_RHS: tl.constexpr,
-    dtype_flag: tl.constexpr,
 ):
     """Blocked lower-factor Cholesky solve.
 
-    Solves L L^T X = B for one batch and one RHS tile. Accepts both
-    standard row-major lower (stride_L_col=1) and transposed upper
-    factor as L' = U^T via swapped strides (stride_L_col=N, stride_L=1).
+    Solves L L^T X = B for one batch and one RHS tile using a row-major
+    lower factor.
     """
     batch_pid = program_id(0)
     rhs_tile_pid = program_id(1)
@@ -164,18 +161,14 @@ def cholesky_solve_blocked_lower_kernel(
                 X_ptr + B_base + rows_k[:, None] * stride_B + rhs_cols[None, :],
                 mask=rhs_mask[None, :], other=0.0)
 
-        diag_block = tl.load(
-            L_ptr + L_base + rows_k * stride_L + rows_k * stride_L_col
-        )
+        diag_block = tl.load(L_ptr + L_base + rows_k * stride_L + rows_k)
         inv_diag = 1.0 / diag_block
         inv_diag = inv_diag * (2.0 - diag_block * inv_diag)
-        if dtype_flag == 1:
-            inv_diag = inv_diag * (2.0 - diag_block * inv_diag)
 
         y_block = y_block * inv_diag[:, None]
         for i in range(BLOCK_K):
             L_col = tl.load(
-                L_ptr + L_base + rows_k * stride_L + (k + i) * stride_L_col,
+                L_ptr + L_base + rows_k * stride_L + (k + i),
                 mask=k_offsets > i, other=0.0)
             w_i = tl.gather(y_block, tl.full([1, BLOCK_RHS], i, tl.int32), 0)
             y_block = y_block - (L_col * inv_diag)[:, None] * w_i
@@ -187,22 +180,22 @@ def cholesky_solve_blocked_lower_kernel(
         for m in range(k + BLOCK_K, N, BLOCK_M):
             rows_m = m + m_offsets
             L_tile = tl.load(
-                L_ptr + L_base + rows_m[:, None] * stride_L + rows_k[None, :] * stride_L_col,
-                mask=(rows_m[:, None] < N) & (rows_k[None, :] < N), other=0.0)
+                L_ptr + L_base + rows_m[:, None] * stride_L + rows_k[None, :]
+            )
             if k == 0:
                 tail = tl.load(
                     B_ptr + B_base + rows_m[:, None] * stride_B + rhs_cols[None, :],
-                    mask=(rows_m[:, None] < N) & rhs_mask[None, :], other=0.0)
+                    mask=rhs_mask[None, :], other=0.0)
             else:
                 tail = tl.load(
                     X_ptr + B_base + rows_m[:, None] * stride_B + rhs_cols[None, :],
-                    mask=(rows_m[:, None] < N) & rhs_mask[None, :], other=0.0)
+                    mask=rhs_mask[None, :], other=0.0)
             tail = tail - tl.dot(
                 L_tile, y_block, input_precision="tf32x3"
             )
             tl.store(
                 X_ptr + B_base + rows_m[:, None] * stride_B + rhs_cols[None, :],
-                tail, mask=(rows_m[:, None] < N) & rhs_mask[None, :])
+                tail, mask=rhs_mask[None, :])
 
     # Backward blocked TRSM: L^T * X = Y.
     for k in range(N - BLOCK_K, -1, -BLOCK_K):
@@ -212,18 +205,14 @@ def cholesky_solve_blocked_lower_kernel(
             X_ptr + B_base + rows_k[:, None] * stride_B + rhs_cols[None, :],
             mask=rhs_mask[None, :], other=0.0)
 
-        diag_block = tl.load(
-            L_ptr + L_base + rows_k * stride_L + rows_k * stride_L_col
-        )
+        diag_block = tl.load(L_ptr + L_base + rows_k * stride_L + rows_k)
         inv_diag = 1.0 / diag_block
         inv_diag = inv_diag * (2.0 - diag_block * inv_diag)
-        if dtype_flag == 1:
-            inv_diag = inv_diag * (2.0 - diag_block * inv_diag)
 
         x_block = x_block * inv_diag[:, None]
         for ii in range(BLOCK_K - 1, -1, -1):
             L_row = tl.load(
-                L_ptr + L_base + (k + ii) * stride_L + rows_k * stride_L_col,
+                L_ptr + L_base + (k + ii) * stride_L + rows_k,
                 mask=k_offsets < ii, other=0.0)
             w_i = tl.gather(x_block, tl.full([1, BLOCK_RHS], ii, tl.int32), 0)
             x_block = x_block - (L_row * inv_diag)[:, None] * w_i
@@ -235,17 +224,17 @@ def cholesky_solve_blocked_lower_kernel(
         for m in range(0, k, BLOCK_M):
             rows_m = m + m_offsets
             L_tile = tl.load(
-                L_ptr + L_base + rows_k[None, :] * stride_L + rows_m[:, None] * stride_L_col,
-                mask=(rows_m[:, None] < N) & (rows_k[None, :] < N), other=0.0)
+                L_ptr + L_base + rows_k[None, :] * stride_L + rows_m[:, None]
+            )
             head = tl.load(
                 X_ptr + B_base + rows_m[:, None] * stride_B + rhs_cols[None, :],
-                mask=(rows_m[:, None] < N) & rhs_mask[None, :], other=0.0)
+                mask=rhs_mask[None, :], other=0.0)
             head = head - tl.dot(
                 L_tile, x_block, input_precision="tf32x3"
             )
             tl.store(
                 X_ptr + B_base + rows_m[:, None] * stride_B + rhs_cols[None, :],
-                head, mask=(rows_m[:, None] < N) & rhs_mask[None, :])
+                head, mask=rhs_mask[None, :])
 
 
 @libentry()
@@ -263,7 +252,6 @@ def cholesky_solve_blocked_upper_kernel(
     BLOCK_K: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_RHS: tl.constexpr,
-    dtype_flag: tl.constexpr,
 ):
     """Blocked upper-factor Cholesky solve.
 
@@ -294,21 +282,19 @@ def cholesky_solve_blocked_upper_kernel(
         if k == 0:
             y_block = tl.load(
                 B_ptr + B_base + rows_k[:, None] * stride_B + rhs_cols[None, :],
-                mask=(rows_k[:, None] < N) & rhs_mask[None, :],
+                mask=rhs_mask[None, :],
                 other=0.0,
             )
         else:
             y_block = tl.load(
                 X_ptr + B_base + rows_k[:, None] * stride_B + rhs_cols[None, :],
-                mask=(rows_k[:, None] < N) & rhs_mask[None, :],
+                mask=rhs_mask[None, :],
                 other=0.0,
             )
 
         diag_block = tl.load(L_ptr + L_base + rows_k * stride_L + rows_k)
         inv_diag = 1.0 / diag_block
         inv_diag = inv_diag * (2.0 - diag_block * inv_diag)
-        if dtype_flag == 1:
-            inv_diag = inv_diag * (2.0 - diag_block * inv_diag)
 
         y_block = y_block * inv_diag[:, None]
         for i in range(BLOCK_K):
@@ -329,15 +315,13 @@ def cholesky_solve_blocked_upper_kernel(
         for m in range(k + BLOCK_K, N, BLOCK_M):
             rows_m = m + m_offsets
             U_tile_km = tl.load(
-                L_ptr + L_base + rows_k[:, None] * stride_L + rows_m[None, :],
-                mask=(rows_k[:, None] < N) & (rows_m[None, :] < N),
-                other=0.0,
+                L_ptr + L_base + rows_k[:, None] * stride_L + rows_m[None, :]
             )
             U_tile = tl.trans(U_tile_km)
             if k == 0:
                 tail = tl.load(
                     B_ptr + B_base + rows_m[:, None] * stride_B + rhs_cols[None, :],
-                    mask=(rows_m[:, None] < N) & rhs_mask[None, :],
+                    mask=rhs_mask[None, :],
                     other=0.0,
                 )
             else:
@@ -346,7 +330,7 @@ def cholesky_solve_blocked_upper_kernel(
                     + B_base
                     + rows_m[:, None] * stride_B
                     + rhs_cols[None, :],
-                    mask=(rows_m[:, None] < N) & rhs_mask[None, :],
+                    mask=rhs_mask[None, :],
                     other=0.0,
                 )
             tail = tail - tl.dot(
@@ -355,7 +339,7 @@ def cholesky_solve_blocked_upper_kernel(
             tl.store(
                 X_ptr + B_base + rows_m[:, None] * stride_B + rhs_cols[None, :],
                 tail,
-                mask=(rows_m[:, None] < N) & rhs_mask[None, :],
+                mask=rhs_mask[None, :],
             )
 
     # Backward blocked TRSM: U * X = Y.
@@ -364,15 +348,13 @@ def cholesky_solve_blocked_upper_kernel(
         tl.debug_barrier()
         x_block = tl.load(
             X_ptr + B_base + rows_k[:, None] * stride_B + rhs_cols[None, :],
-            mask=(rows_k[:, None] < N) & rhs_mask[None, :],
+            mask=rhs_mask[None, :],
             other=0.0,
         )
 
         diag_block = tl.load(L_ptr + L_base + rows_k * stride_L + rows_k)
         inv_diag = 1.0 / diag_block
         inv_diag = inv_diag * (2.0 - diag_block * inv_diag)
-        if dtype_flag == 1:
-            inv_diag = inv_diag * (2.0 - diag_block * inv_diag)
 
         x_block = x_block * inv_diag[:, None]
         for ii in range(BLOCK_K - 1, -1, -1):
@@ -393,13 +375,11 @@ def cholesky_solve_blocked_upper_kernel(
         for m in range(0, k, BLOCK_M):
             rows_m = m + m_offsets
             U_tile = tl.load(
-                L_ptr + L_base + rows_m[:, None] * stride_L + rows_k[None, :],
-                mask=(rows_m[:, None] < N) & (rows_k[None, :] < N),
-                other=0.0,
+                L_ptr + L_base + rows_m[:, None] * stride_L + rows_k[None, :]
             )
             head = tl.load(
                 X_ptr + B_base + rows_m[:, None] * stride_B + rhs_cols[None, :],
-                mask=(rows_m[:, None] < N) & rhs_mask[None, :],
+                mask=rhs_mask[None, :],
                 other=0.0,
             )
             head = head - tl.dot(
@@ -408,7 +388,7 @@ def cholesky_solve_blocked_upper_kernel(
             tl.store(
                 X_ptr + B_base + rows_m[:, None] * stride_B + rhs_cols[None, :],
                 head,
-                mask=(rows_m[:, None] < N) & rhs_mask[None, :],
+                mask=rhs_mask[None, :],
             )
 
 
@@ -695,22 +675,8 @@ def cholesky_solve_blocked_upper_fp64_kernel(
             )
 
 
-def _can_use_blocked_lower_path(upper, N, nrhs):
-    return (
-        not upper
-        and N >= 64
-        and N % 32 == 0
-        and nrhs >= 4
-    )
-
-
-def _can_use_blocked_upper_path(upper, N, nrhs):
-    return (
-        upper
-        and N >= 64
-        and N % 32 == 0
-        and nrhs >= 4
-    )
+def _can_use_blocked_path(N, nrhs):
+    return N >= 64 and N % 32 == 0 and nrhs >= 4
 
 
 def _can_use_blocked_single_rhs_path(N, nrhs):
@@ -1301,8 +1267,8 @@ def cholesky_solve_single_rhs_kernel(
         tl.store(X_ptr + B_base + i * stride_B, sum_val * inv_diag)
 
 
-def _get_blocked_tile_configs(dtype, nrhs, N):
-    """Return tile sizes for blocked kernels based on dtype, nrhs, and N.
+def _get_blocked_tile_config(dtype):
+    """Return dtype-specific tile sizes for blocked kernels.
 
     fp32 uses 32x32 panels with BLOCK_RHS=4. A narrow RHS tile launches more
     CTAs (grid = batch x ceil(nrhs/BLOCK_RHS)), which matters because the
@@ -1370,12 +1336,10 @@ def _get_single_rhs_blocked_launch_config(dtype, N):
     }
 
 
-def _get_small_single_rhs_launch_config(dtype, N):
-    """Return pinned H20 winners for register-resident single-RHS solves."""
-    if dtype == torch.float32 or N >= 64:
+def _get_small_single_rhs_launch_config(dtype):
+    """Return H20 winners for register-resident N=33..63 solves."""
+    if dtype == torch.float32:
         return {"num_warps": 1, "num_stages": 1}
-    if N <= 16:
-        return {"num_warps": 2, "num_stages": 1}
     return {"num_warps": 4, "num_stages": 3}
 
 
@@ -1486,7 +1450,6 @@ def cholesky_solve(B, L, upper=False):
     X_kernel = X.reshape(-1, N, nrhs)
 
     stride_L = L_kernel.stride(1)
-    stride_L_col = L_kernel.stride(2)
     stride_B = B_kernel.stride(1)
     batch_stride_L = L_kernel.stride(0)
     batch_stride_B = B_kernel.stride(0)
@@ -1494,43 +1457,40 @@ def cholesky_solve(B, L, upper=False):
     dtype_flag = 0 if B.dtype == torch.float32 else 1
 
     with torch.no_grad():
-        if _can_use_blocked_lower_path(effective_upper, N, nrhs):
-            tile = _get_blocked_tile_configs(B.dtype, nrhs, N)
+        if _can_use_blocked_path(N, nrhs):
+            tile = _get_blocked_tile_config(B.dtype)
             warp = _get_blocked_warp_config(B.dtype)
             grid = (batch_size, triton.cdiv(nrhs, tile["BLOCK_RHS"]))
-            if dtype_flag == 1:
-                cholesky_solve_blocked_lower_fp64_kernel[grid](
-                    L_kernel, B_kernel, X_kernel, N, nrhs,
-                    batch_stride_L, batch_stride_B, stride_L, stride_B,
-                    BLOCK_K=tile["BLOCK_K"], BLOCK_M=tile["BLOCK_M"],
-                    BLOCK_RHS=tile["BLOCK_RHS"], **warp,
-                )
+            if effective_upper:
+                if dtype_flag == 1:
+                    cholesky_solve_blocked_upper_fp64_kernel[grid](
+                        L_kernel, B_kernel, X_kernel, N, nrhs,
+                        batch_stride_L, batch_stride_B, stride_L, stride_B,
+                        BLOCK_K=tile["BLOCK_K"], BLOCK_M=tile["BLOCK_M"],
+                        BLOCK_RHS=tile["BLOCK_RHS"], **warp,
+                    )
+                else:
+                    cholesky_solve_blocked_upper_kernel[grid](
+                        L_kernel, B_kernel, X_kernel, N, nrhs,
+                        batch_stride_L, batch_stride_B, stride_L, stride_B,
+                        BLOCK_K=tile["BLOCK_K"], BLOCK_M=tile["BLOCK_M"],
+                        BLOCK_RHS=tile["BLOCK_RHS"], **warp,
+                    )
             else:
-                cholesky_solve_blocked_lower_kernel[grid](
-                    L_kernel, B_kernel, X_kernel, N, nrhs,
-                    batch_stride_L, batch_stride_B, stride_L, stride_B,
-                    stride_L_col=stride_L_col,
-                    BLOCK_K=tile["BLOCK_K"], BLOCK_M=tile["BLOCK_M"],
-                    BLOCK_RHS=tile["BLOCK_RHS"], dtype_flag=dtype_flag, **warp,
-                )
-        elif _can_use_blocked_upper_path(effective_upper, N, nrhs):
-            tile = _get_blocked_tile_configs(B.dtype, nrhs, N)
-            warp = _get_blocked_warp_config(B.dtype)
-            grid = (batch_size, triton.cdiv(nrhs, tile["BLOCK_RHS"]))
-            if dtype_flag == 1:
-                cholesky_solve_blocked_upper_fp64_kernel[grid](
-                    L_kernel, B_kernel, X_kernel, N, nrhs,
-                    batch_stride_L, batch_stride_B, stride_L, stride_B,
-                    BLOCK_K=tile["BLOCK_K"], BLOCK_M=tile["BLOCK_M"],
-                    BLOCK_RHS=tile["BLOCK_RHS"], **warp,
-                )
-            else:
-                cholesky_solve_blocked_upper_kernel[grid](
-                    L_kernel, B_kernel, X_kernel, N, nrhs,
-                    batch_stride_L, batch_stride_B, stride_L, stride_B,
-                    BLOCK_K=tile["BLOCK_K"], BLOCK_M=tile["BLOCK_M"],
-                    BLOCK_RHS=tile["BLOCK_RHS"], dtype_flag=dtype_flag, **warp,
-                )
+                if dtype_flag == 1:
+                    cholesky_solve_blocked_lower_fp64_kernel[grid](
+                        L_kernel, B_kernel, X_kernel, N, nrhs,
+                        batch_stride_L, batch_stride_B, stride_L, stride_B,
+                        BLOCK_K=tile["BLOCK_K"], BLOCK_M=tile["BLOCK_M"],
+                        BLOCK_RHS=tile["BLOCK_RHS"], **warp,
+                    )
+                else:
+                    cholesky_solve_blocked_lower_kernel[grid](
+                        L_kernel, B_kernel, X_kernel, N, nrhs,
+                        batch_stride_L, batch_stride_B, stride_L, stride_B,
+                        BLOCK_K=tile["BLOCK_K"], BLOCK_M=tile["BLOCK_M"],
+                        BLOCK_RHS=tile["BLOCK_RHS"], **warp,
+                    )
         elif _can_use_blocked_single_rhs_path(N, nrhs):
             single_rhs_config = _get_single_rhs_blocked_launch_config(
                 B.dtype, N
@@ -1560,9 +1520,7 @@ def cholesky_solve(B, L, upper=False):
             )
         elif nrhs == 1 and N <= 64:
             block_n = triton.next_power_of_2(N)
-            small_single_rhs_config = _get_small_single_rhs_launch_config(
-                B.dtype, N
-            )
+            small_single_rhs_config = _get_small_single_rhs_launch_config(B.dtype)
             cholesky_solve_small_single_rhs_kernel[(batch_size,)](
                 L_kernel, B_kernel, X_kernel, N,
                 batch_stride_L, batch_stride_B, stride_L, stride_B,
