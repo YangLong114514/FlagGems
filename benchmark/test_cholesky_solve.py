@@ -66,9 +66,9 @@ class CholeskySolveBenchmark(base.Benchmark):
             eye = torch.eye(n, dtype=cur_dtype, device=self.device)
             for _ in batch_dims:
                 eye = eye.unsqueeze(0)
-            A = B_mat @ B_mat.transpose(-2, -1) + eye * 0.1
+            A = B_mat @ B_mat.mH + eye * 0.1
             L = torch.linalg.cholesky(A)
-            factor = L.mT.contiguous() if upper else L
+            factor = L.mH.contiguous() if upper else L
             rhs = torch.randn(
                 *batch_dims, n, nrhs, dtype=cur_dtype, device=self.device
             )
@@ -80,6 +80,11 @@ def test_cholesky_solve():
     bench = CholeskySolveBenchmark(
         op_name="cholesky_solve",
         torch_op=torch.ops.aten.cholesky_solve,
-        dtypes=[torch.float32, torch.float64],
+        dtypes=[
+            torch.float32,
+            torch.float64,
+            torch.complex64,
+            torch.complex128,
+        ],
     )
     bench.run()

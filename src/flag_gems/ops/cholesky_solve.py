@@ -112,6 +112,102 @@ def cholesky_solve_kernel(
 
 @libentry()
 @triton.jit
+def cholesky_solve_complex_kernel(
+    L_ptr,
+    B_ptr,
+    X_ptr,
+    N: tl.constexpr,
+    nrhs: tl.constexpr,
+    batch_stride_L,
+    batch_stride_B,
+    stride_L_row,
+    stride_L_col,
+    stride_B_row,
+    stride_B_col,
+    BLOCK_RHS: tl.constexpr,
+    upper: tl.constexpr,
+):
+    """Complex Cholesky solve over interleaved real/imaginary storage.
+
+    torch.view_as_real exposes each complex scalar as two adjacent real
+    values. Keeping the arithmetic split avoids relying on native complex
+    support in Triton and works for both complex64 and complex128 pointers.
+    """
+    batch_pid = program_id(0)
+    rhs_tile_pid = program_id(1)
+
+    L_base = batch_pid * batch_stride_L
+    B_base = batch_pid * batch_stride_B
+    cols = rhs_tile_pid * BLOCK_RHS + tl.arange(0, BLOCK_RHS)
+    cols_mask = cols < nrhs
+
+    # Phase 1: solve L * Y = B, or U^H * Y = B for an upper factor.
+    for i in range(N):
+        b_offset = B_base + i * stride_B_row + cols * stride_B_col
+        sum_real = tl.load(B_ptr + b_offset, mask=cols_mask, other=0.0)
+        sum_imag = tl.load(B_ptr + b_offset + 1, mask=cols_mask, other=0.0)
+        for j in range(i):
+            if upper:
+                l_offset = L_base + j * stride_L_row + i * stride_L_col
+            else:
+                l_offset = L_base + i * stride_L_row + j * stride_L_col
+            l_real = tl.load(L_ptr + l_offset)
+            l_imag = tl.load(L_ptr + l_offset + 1)
+            if upper:
+                l_imag = -l_imag
+
+            y_offset = B_base + j * stride_B_row + cols * stride_B_col
+            y_real = tl.load(X_ptr + y_offset, mask=cols_mask, other=0.0)
+            y_imag = tl.load(X_ptr + y_offset + 1, mask=cols_mask, other=0.0)
+            sum_real -= l_real * y_real - l_imag * y_imag
+            sum_imag -= l_real * y_imag + l_imag * y_real
+
+        diag_offset = L_base + i * stride_L_row + i * stride_L_col
+        diag_real = tl.load(L_ptr + diag_offset)
+        diag_imag = tl.load(L_ptr + diag_offset + 1)
+        if upper:
+            diag_imag = -diag_imag
+        denominator = diag_real * diag_real + diag_imag * diag_imag
+        y_real = (sum_real * diag_real + sum_imag * diag_imag) / denominator
+        y_imag = (sum_imag * diag_real - sum_real * diag_imag) / denominator
+        tl.store(X_ptr + b_offset, y_real, mask=cols_mask)
+        tl.store(X_ptr + b_offset + 1, y_imag, mask=cols_mask)
+
+    # Phase 2: solve L^H * X = Y, or U * X = Y for an upper factor.
+    for i in range(N - 1, -1, -1):
+        x_offset = B_base + i * stride_B_row + cols * stride_B_col
+        sum_real = tl.load(X_ptr + x_offset, mask=cols_mask, other=0.0)
+        sum_imag = tl.load(X_ptr + x_offset + 1, mask=cols_mask, other=0.0)
+        for j in range(i + 1, N):
+            if upper:
+                l_offset = L_base + i * stride_L_row + j * stride_L_col
+            else:
+                l_offset = L_base + j * stride_L_row + i * stride_L_col
+            l_real = tl.load(L_ptr + l_offset)
+            l_imag = tl.load(L_ptr + l_offset + 1)
+            if not upper:
+                l_imag = -l_imag
+
+            xj_offset = B_base + j * stride_B_row + cols * stride_B_col
+            xj_real = tl.load(X_ptr + xj_offset, mask=cols_mask, other=0.0)
+            xj_imag = tl.load(X_ptr + xj_offset + 1, mask=cols_mask, other=0.0)
+            sum_real -= l_real * xj_real - l_imag * xj_imag
+            sum_imag -= l_real * xj_imag + l_imag * xj_real
+
+        diag_offset = L_base + i * stride_L_row + i * stride_L_col
+        diag_real = tl.load(L_ptr + diag_offset)
+        diag_imag = tl.load(L_ptr + diag_offset + 1)
+        if not upper:
+            diag_imag = -diag_imag
+        denominator = diag_real * diag_real + diag_imag * diag_imag
+        out_real = (sum_real * diag_real + sum_imag * diag_imag) / denominator
+        out_imag = (sum_imag * diag_real - sum_real * diag_imag) / denominator
+        tl.store(X_ptr + x_offset, out_real, mask=cols_mask)
+        tl.store(X_ptr + x_offset + 1, out_imag, mask=cols_mask)
+
+
+@libentry()
+@triton.jit
 def cholesky_solve_blocked_lower_kernel(
     L_ptr,
     B_ptr,
@@ -1354,12 +1450,57 @@ def _get_small_gather_launch_config(dtype, N):
     return {"num_warps": 1, "num_stages": 1}
 
 
+def _cholesky_solve_complex(B, L, upper, batch_shape, N, nrhs):
+    """Launch the complex64/complex128 correctness-first implementation."""
+    # view_as_real rejects unresolved conjugate views. Materializing also
+    # gives the first implementation one predictable interleaved layout and
+    # handles expanded/non-contiguous batch inputs uniformly.
+    if L.is_conj():
+        L = L.resolve_conj()
+    if B.is_conj():
+        B = B.resolve_conj()
+    L = L.contiguous()
+    B = B.contiguous()
+    X = torch.empty_like(B)
+
+    batch_size = 1
+    for dim in batch_shape:
+        batch_size *= dim
+
+    L_real = torch.view_as_real(L).reshape(-1, N, N, 2)
+    B_real = torch.view_as_real(B).reshape(-1, N, nrhs, 2)
+    X_real = torch.view_as_real(X).reshape(-1, N, nrhs, 2)
+
+    block_rhs = 4 if B.dtype == torch.complex64 else 2
+    grid = (batch_size, triton.cdiv(nrhs, block_rhs))
+    with torch.no_grad():
+        cholesky_solve_complex_kernel[grid](
+            L_real,
+            B_real,
+            X_real,
+            N,
+            nrhs,
+            L_real.stride(0),
+            B_real.stride(0),
+            L_real.stride(1),
+            L_real.stride(2),
+            B_real.stride(1),
+            B_real.stride(2),
+            BLOCK_RHS=block_rhs,
+            upper=upper,
+            num_warps=1,
+            num_stages=1,
+        )
+    return X
+
+
 def cholesky_solve(B, L, upper=False):
-    """Solves a system of linear equations with a symmetric positive-definite
+    """Solves a system of linear equations with a positive-definite
     matrix using the Cholesky factorization.
 
-    Computes X such that A @ X = B, where A = L @ L^T (or A = U^T @ U if
-    upper=True) and L (or U) is the Cholesky factor of A.
+    Computes X such that A @ X = B, where A = L @ L^H (or A = U^H @ U if
+    upper=True) and L (or U) is the Cholesky factor of A. For real inputs,
+    the Hermitian transpose is the ordinary transpose.
 
     Args:
         B: right-hand side tensor of shape (*, N, nrhs)
@@ -1373,7 +1514,9 @@ def cholesky_solve(B, L, upper=False):
     assert L.dtype in (
         torch.float32,
         torch.float64,
-    ), "cholesky_solve only supports float32 and float64"
+        torch.complex64,
+        torch.complex128,
+    ), "cholesky_solve only supports float32, float64, complex64 and complex128"
     assert B.dtype == L.dtype, "B and L must have the same dtype"
     if B.device != L.device:
         raise ValueError("B and L must be on the same device")
@@ -1419,6 +1562,9 @@ def cholesky_solve(B, L, upper=False):
 
         L = L.expand(batch_shape + L_shape[-2:])
         B = B.expand(batch_shape + B_shape[-2:])
+
+    if B.is_complex():
+        return _cholesky_solve_complex(B, L, upper, batch_shape, N, nrhs)
 
     # Zero-copy layout normalization. Every kernel pair exists in both
     # orientations, and solving with a lower factor L is exactly solving with
