@@ -772,3 +772,15 @@ index_put:
   - 1024
   - 2048
   - 4096
+
+cholesky_solve:
+- META:
+    BLOCK_RHS: 1
+- META:
+    BLOCK_RHS: 2
+- META:
+    BLOCK_RHS: 4
+- META:
+    BLOCK_RHS: 8
+- META:
+    BLOCK_RHS: 16
