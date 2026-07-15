@@ -342,9 +342,6 @@ def cholesky_solve_blocked_upper_kernel(
     rhs_mask = rhs_cols < nrhs
     k_offsets = tl.arange(0, BLOCK_K)
     m_offsets = tl.arange(0, BLOCK_M)
-    # Seed the loop-carried SSA value so the single-panel backward phase can
-    # consume the final forward panel outside the static loop body.
-    y_block = tl.zeros([BLOCK_K, BLOCK_RHS], dtype=tl.float32)
 
     # Forward blocked TRSM: U^T * Y = B.
     for k in range(0, N, BLOCK_K):
@@ -381,17 +378,11 @@ def cholesky_solve_blocked_upper_kernel(
                 y_block = y_block - U_row[:, None] * y_new[None, :]
                 y_block = tl.where(row_mask, y_new[None, :], y_block)
 
-        # A single panel is consumed directly by the backward phase below.
-        # Keep it in registers instead of round-tripping through X.
-        if BLOCK_K != N:
-            tl.store(
-                X_ptr
-                + B_base
-                + rows_k[:, None] * stride_B
-                + rhs_cols[None, :],
-                y_block,
-                mask=(rows_k[:, None] < N) & rhs_mask[None, :],
-            )
+        tl.store(
+            X_ptr + B_base + rows_k[:, None] * stride_B + rhs_cols[None, :],
+            y_block,
+            mask=(rows_k[:, None] < N) & rhs_mask[None, :],
+        )
 
         for m in range(k + BLOCK_K, N, BLOCK_M):
             rows_m = m + m_offsets
@@ -428,17 +419,11 @@ def cholesky_solve_blocked_upper_kernel(
     # Backward blocked TRSM: U * X = Y.
     for k in range(N - BLOCK_K, -1, -BLOCK_K):
         rows_k = k + k_offsets
-        if BLOCK_K == N:
-            x_block = y_block
-        else:
-            x_block = tl.load(
-                X_ptr
-                + B_base
-                + rows_k[:, None] * stride_B
-                + rhs_cols[None, :],
-                mask=(rows_k[:, None] < N) & rhs_mask[None, :],
-                other=0.0,
-            )
+        x_block = tl.load(
+            X_ptr + B_base + rows_k[:, None] * stride_B + rhs_cols[None, :],
+            mask=(rows_k[:, None] < N) & rhs_mask[None, :],
+            other=0.0,
+        )
 
         for ii in range(BLOCK_K - 1, -1, -1):
             row_i = k + ii
