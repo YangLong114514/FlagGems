@@ -126,6 +126,7 @@ def cholesky_solve_complex_kernel(
     stride_B_col,
     BLOCK_RHS: tl.constexpr,
     upper: tl.constexpr,
+    storage_conj: tl.constexpr,
 ):
     """Complex Cholesky solve over interleaved real/imaginary storage.
 
@@ -153,6 +154,8 @@ def cholesky_solve_complex_kernel(
                 l_offset = L_base + i * stride_L_row + j * stride_L_col
             l_real = tl.load(L_ptr + l_offset)
             l_imag = tl.load(L_ptr + l_offset + 1)
+            if storage_conj:
+                l_imag = -l_imag
             if upper:
                 l_imag = -l_imag
 
@@ -165,6 +168,8 @@ def cholesky_solve_complex_kernel(
         diag_offset = L_base + i * stride_L_row + i * stride_L_col
         diag_real = tl.load(L_ptr + diag_offset)
         diag_imag = tl.load(L_ptr + diag_offset + 1)
+        if storage_conj:
+            diag_imag = -diag_imag
         if upper:
             diag_imag = -diag_imag
         denominator = diag_real * diag_real + diag_imag * diag_imag
@@ -185,6 +190,8 @@ def cholesky_solve_complex_kernel(
                 l_offset = L_base + j * stride_L_row + i * stride_L_col
             l_real = tl.load(L_ptr + l_offset)
             l_imag = tl.load(L_ptr + l_offset + 1)
+            if storage_conj:
+                l_imag = -l_imag
             if not upper:
                 l_imag = -l_imag
 
@@ -197,6 +204,8 @@ def cholesky_solve_complex_kernel(
         diag_offset = L_base + i * stride_L_row + i * stride_L_col
         diag_real = tl.load(L_ptr + diag_offset)
         diag_imag = tl.load(L_ptr + diag_offset + 1)
+        if storage_conj:
+            diag_imag = -diag_imag
         if not upper:
             diag_imag = -diag_imag
         denominator = diag_real * diag_real + diag_imag * diag_imag
@@ -223,8 +232,9 @@ def cholesky_solve_complex_small_gather_kernel(
     BLOCK_N: tl.constexpr,
     BLOCK_RHS: tl.constexpr,
     upper: tl.constexpr,
+    storage_conj: tl.constexpr,
 ):
-    """Register-resident complex solve for N <= 32 and nrhs <= 8."""
+    """Register-resident complex solve for small N/RHS cases."""
     batch_pid = program_id(0)
     L_base = batch_pid * batch_stride_L
     B_base = batch_pid * batch_stride_B
@@ -249,29 +259,13 @@ def cholesky_solve_complex_small_gather_kernel(
         mask=rows_mask,
         other=1.0,
     )
-    diag_imag = tl.load(
-        L_ptr + diag_offset + 1,
-        mask=rows_mask,
-        other=0.0,
-    )
+    # A valid complex Cholesky factor has a positive real diagonal. Exploit
+    # that contract instead of paying for a general complex division.
+    inv_diag = 1.0 / diag_real
 
     # Phase 1: solve L * Y = B, or U^H * Y = B.
-    forward_diag_imag = diag_imag
-    if upper:
-        forward_diag_imag = -forward_diag_imag
-    forward_denominator = (
-        diag_real * diag_real + forward_diag_imag * forward_diag_imag
-    )
-    forward_inv_real = diag_real / forward_denominator
-    forward_inv_imag = -forward_diag_imag / forward_denominator
-    scaled_real = (
-        w_real * forward_inv_real[:, None]
-        - w_imag * forward_inv_imag[:, None]
-    )
-    scaled_imag = (
-        w_real * forward_inv_imag[:, None]
-        + w_imag * forward_inv_real[:, None]
-    )
+    scaled_real = w_real * inv_diag[:, None]
+    scaled_imag = w_imag * inv_diag[:, None]
 
     for i in range(N):
         if upper:
@@ -293,17 +287,13 @@ def cholesky_solve_complex_small_gather_kernel(
             mask=active,
             other=0.0,
         )
+        if storage_conj:
+            factor_imag = -factor_imag
         if upper:
             factor_imag = -factor_imag
 
-        normalized_real = (
-            factor_real * forward_inv_real
-            - factor_imag * forward_inv_imag
-        )
-        normalized_imag = (
-            factor_real * forward_inv_imag
-            + factor_imag * forward_inv_real
-        )
+        normalized_real = factor_real * inv_diag
+        normalized_imag = factor_imag * inv_diag
         pivot_real = tl.gather(
             scaled_real,
             tl.full([1, BLOCK_RHS], i, tl.int32),
@@ -326,22 +316,8 @@ def cholesky_solve_complex_small_gather_kernel(
         scaled_imag -= product_imag
 
     # Phase 2: solve L^H * X = Y, or U * X = Y.
-    backward_diag_imag = diag_imag
-    if not upper:
-        backward_diag_imag = -backward_diag_imag
-    backward_denominator = (
-        diag_real * diag_real + backward_diag_imag * backward_diag_imag
-    )
-    backward_inv_real = diag_real / backward_denominator
-    backward_inv_imag = -backward_diag_imag / backward_denominator
-    out_real = (
-        scaled_real * backward_inv_real[:, None]
-        - scaled_imag * backward_inv_imag[:, None]
-    )
-    out_imag = (
-        scaled_real * backward_inv_imag[:, None]
-        + scaled_imag * backward_inv_real[:, None]
-    )
+    out_real = scaled_real * inv_diag[:, None]
+    out_imag = scaled_imag * inv_diag[:, None]
 
     for i in range(N - 1, -1, -1):
         if upper:
@@ -363,17 +339,13 @@ def cholesky_solve_complex_small_gather_kernel(
             mask=active,
             other=0.0,
         )
+        if storage_conj:
+            factor_imag = -factor_imag
         if not upper:
             factor_imag = -factor_imag
 
-        normalized_real = (
-            factor_real * backward_inv_real
-            - factor_imag * backward_inv_imag
-        )
-        normalized_imag = (
-            factor_real * backward_inv_imag
-            + factor_imag * backward_inv_real
-        )
+        normalized_real = factor_real * inv_diag
+        normalized_imag = factor_imag * inv_diag
         pivot_real = tl.gather(
             out_real,
             tl.full([1, BLOCK_RHS], i, tl.int32),
@@ -397,6 +369,696 @@ def cholesky_solve_complex_small_gather_kernel(
 
     tl.store(X_ptr + b_offset, out_real, mask=value_mask)
     tl.store(X_ptr + b_offset + 1, out_imag, mask=value_mask)
+
+
+@libentry()
+@triton.jit
+def cholesky_solve_complex_blocked_kernel(
+    L_ptr,
+    B_ptr,
+    X_ptr,
+    N: tl.constexpr,
+    nrhs: tl.constexpr,
+    batch_stride_L,
+    batch_stride_B,
+    stride_L_row,
+    stride_L_col,
+    stride_B_row,
+    stride_B_col,
+    BLOCK_K: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_RHS: tl.constexpr,
+    upper: tl.constexpr,
+    storage_conj: tl.constexpr,
+    IS_DOUBLE: tl.constexpr,
+):
+    """Blocked complex TRSM for N >= 64 and multiple right-hand sides.
+
+    The diagonal blocks use the pre-scaled gather formulation. Far-panel
+    updates are decomposed into four real matrix products, enabling tensor
+    cores for complex64 while retaining native FP64 dot products for
+    complex128. N must be divisible by BLOCK_K; panel edges are masked.
+    """
+    batch_pid = program_id(0)
+    rhs_tile_pid = program_id(1)
+    L_base = batch_pid * batch_stride_L
+    B_base = batch_pid * batch_stride_B
+
+    k_offsets = tl.arange(0, BLOCK_K)
+    m_offsets = tl.arange(0, BLOCK_M)
+    rhs_cols = rhs_tile_pid * BLOCK_RHS + tl.arange(0, BLOCK_RHS)
+    rhs_mask = rhs_cols < nrhs
+
+    # Forward blocked TRSM: L * Y = B, or U^H * Y = B.
+    for k in range(0, N, BLOCK_K):
+        rows_k = k + k_offsets
+        if k > 0:
+            tl.debug_barrier()
+
+        y_offset = (
+            B_base
+            + rows_k[:, None] * stride_B_row
+            + rhs_cols[None, :] * stride_B_col
+        )
+        if k == 0:
+            y_real = tl.load(
+                B_ptr + y_offset, mask=rhs_mask[None, :], other=0.0
+            )
+            y_imag = tl.load(
+                B_ptr + y_offset + 1, mask=rhs_mask[None, :], other=0.0
+            )
+        else:
+            y_real = tl.load(
+                X_ptr + y_offset, mask=rhs_mask[None, :], other=0.0
+            )
+            y_imag = tl.load(
+                X_ptr + y_offset + 1, mask=rhs_mask[None, :], other=0.0
+            )
+
+        diag_offset = (
+            L_base + rows_k * stride_L_row + rows_k * stride_L_col
+        )
+        diag_real = tl.load(L_ptr + diag_offset)
+        inv_diag = 1.0 / diag_real
+        w_real = y_real * inv_diag[:, None]
+        w_imag = y_imag * inv_diag[:, None]
+
+        for i in range(BLOCK_K):
+            if upper:
+                factor_offset = (
+                    L_base
+                    + (k + i) * stride_L_row
+                    + rows_k * stride_L_col
+                )
+            else:
+                factor_offset = (
+                    L_base
+                    + rows_k * stride_L_row
+                    + (k + i) * stride_L_col
+                )
+            factor_real = tl.load(
+                L_ptr + factor_offset,
+                mask=k_offsets > i,
+                other=0.0,
+            )
+            factor_imag = tl.load(
+                L_ptr + factor_offset + 1,
+                mask=k_offsets > i,
+                other=0.0,
+            )
+            if storage_conj:
+                factor_imag = -factor_imag
+            if upper:
+                factor_imag = -factor_imag
+            norm_real = factor_real * inv_diag
+            norm_imag = factor_imag * inv_diag
+            pivot_real = tl.gather(
+                w_real, tl.full([1, BLOCK_RHS], i, tl.int32), 0
+            )
+            pivot_imag = tl.gather(
+                w_imag, tl.full([1, BLOCK_RHS], i, tl.int32), 0
+            )
+            w_real -= (
+                norm_real[:, None] * pivot_real
+                - norm_imag[:, None] * pivot_imag
+            )
+            w_imag -= (
+                norm_real[:, None] * pivot_imag
+                + norm_imag[:, None] * pivot_real
+            )
+
+        tl.store(X_ptr + y_offset, w_real, mask=rhs_mask[None, :])
+        tl.store(X_ptr + y_offset + 1, w_imag, mask=rhs_mask[None, :])
+
+        for m in range(k + BLOCK_K, N, BLOCK_M):
+            rows_m = m + m_offsets
+            rows_m_mask = rows_m < N
+            if upper:
+                tile_offset = (
+                    L_base
+                    + rows_k[:, None] * stride_L_row
+                    + rows_m[None, :] * stride_L_col
+                )
+                tile_real = tl.trans(
+                    tl.load(
+                        L_ptr + tile_offset,
+                        mask=rows_m_mask[None, :],
+                        other=0.0,
+                    )
+                )
+                tile_imag = tl.trans(
+                    tl.load(
+                        L_ptr + tile_offset + 1,
+                        mask=rows_m_mask[None, :],
+                        other=0.0,
+                    )
+                )
+                if storage_conj:
+                    tile_imag = -tile_imag
+                tile_imag = -tile_imag
+            else:
+                tile_offset = (
+                    L_base
+                    + rows_m[:, None] * stride_L_row
+                    + rows_k[None, :] * stride_L_col
+                )
+                tile_real = tl.load(
+                    L_ptr + tile_offset,
+                    mask=rows_m_mask[:, None],
+                    other=0.0,
+                )
+                tile_imag = tl.load(
+                    L_ptr + tile_offset + 1,
+                    mask=rows_m_mask[:, None],
+                    other=0.0,
+                )
+                if storage_conj:
+                    tile_imag = -tile_imag
+
+            tail_offset = (
+                B_base
+                + rows_m[:, None] * stride_B_row
+                + rhs_cols[None, :] * stride_B_col
+            )
+            tail_mask = rows_m_mask[:, None] & rhs_mask[None, :]
+            if k == 0:
+                tail_real = tl.load(
+                    B_ptr + tail_offset,
+                    mask=tail_mask,
+                    other=0.0,
+                )
+                tail_imag = tl.load(
+                    B_ptr + tail_offset + 1,
+                    mask=tail_mask,
+                    other=0.0,
+                )
+            else:
+                tail_real = tl.load(
+                    X_ptr + tail_offset,
+                    mask=tail_mask,
+                    other=0.0,
+                )
+                tail_imag = tl.load(
+                    X_ptr + tail_offset + 1,
+                    mask=tail_mask,
+                    other=0.0,
+                )
+
+            if IS_DOUBLE:
+                update_real = tl.dot(tile_real, w_real)
+                update_real -= tl.dot(tile_imag, w_imag)
+                update_imag = tl.dot(tile_real, w_imag)
+                update_imag += tl.dot(tile_imag, w_real)
+            else:
+                update_real = tl.dot(
+                    tile_real, w_real, input_precision="tf32x3"
+                )
+                update_real -= tl.dot(
+                    tile_imag, w_imag, input_precision="tf32x3"
+                )
+                update_imag = tl.dot(
+                    tile_real, w_imag, input_precision="tf32x3"
+                )
+                update_imag += tl.dot(
+                    tile_imag, w_real, input_precision="tf32x3"
+                )
+            tail_real -= update_real
+            tail_imag -= update_imag
+            tl.store(
+                X_ptr + tail_offset, tail_real, mask=tail_mask
+            )
+            tl.store(
+                X_ptr + tail_offset + 1, tail_imag, mask=tail_mask
+            )
+
+    # Backward blocked TRSM: L^H * X = Y, or U * X = Y.
+    for k in range(N - BLOCK_K, -1, -BLOCK_K):
+        rows_k = k + k_offsets
+        tl.debug_barrier()
+        x_offset = (
+            B_base
+            + rows_k[:, None] * stride_B_row
+            + rhs_cols[None, :] * stride_B_col
+        )
+        x_real = tl.load(
+            X_ptr + x_offset, mask=rhs_mask[None, :], other=0.0
+        )
+        x_imag = tl.load(
+            X_ptr + x_offset + 1, mask=rhs_mask[None, :], other=0.0
+        )
+
+        diag_offset = (
+            L_base + rows_k * stride_L_row + rows_k * stride_L_col
+        )
+        diag_real = tl.load(L_ptr + diag_offset)
+        inv_diag = 1.0 / diag_real
+        w_real = x_real * inv_diag[:, None]
+        w_imag = x_imag * inv_diag[:, None]
+
+        for ii_idx in range(BLOCK_K - 1, -1, -1):
+            if upper:
+                factor_offset = (
+                    L_base
+                    + rows_k * stride_L_row
+                    + (k + ii_idx) * stride_L_col
+                )
+            else:
+                factor_offset = (
+                    L_base
+                    + (k + ii_idx) * stride_L_row
+                    + rows_k * stride_L_col
+                )
+            factor_real = tl.load(
+                L_ptr + factor_offset,
+                mask=k_offsets < ii_idx,
+                other=0.0,
+            )
+            factor_imag = tl.load(
+                L_ptr + factor_offset + 1,
+                mask=k_offsets < ii_idx,
+                other=0.0,
+            )
+            if storage_conj:
+                factor_imag = -factor_imag
+            if not upper:
+                factor_imag = -factor_imag
+            norm_real = factor_real * inv_diag
+            norm_imag = factor_imag * inv_diag
+            pivot_real = tl.gather(
+                w_real,
+                tl.full([1, BLOCK_RHS], ii_idx, tl.int32),
+                0,
+            )
+            pivot_imag = tl.gather(
+                w_imag,
+                tl.full([1, BLOCK_RHS], ii_idx, tl.int32),
+                0,
+            )
+            w_real -= (
+                norm_real[:, None] * pivot_real
+                - norm_imag[:, None] * pivot_imag
+            )
+            w_imag -= (
+                norm_real[:, None] * pivot_imag
+                + norm_imag[:, None] * pivot_real
+            )
+
+        tl.store(X_ptr + x_offset, w_real, mask=rhs_mask[None, :])
+        tl.store(X_ptr + x_offset + 1, w_imag, mask=rhs_mask[None, :])
+
+        for m in range(0, k, BLOCK_M):
+            rows_m = m + m_offsets
+            rows_m_mask = rows_m < k
+            if upper:
+                tile_offset = (
+                    L_base
+                    + rows_m[:, None] * stride_L_row
+                    + rows_k[None, :] * stride_L_col
+                )
+                tile_real = tl.load(
+                    L_ptr + tile_offset,
+                    mask=rows_m_mask[:, None],
+                    other=0.0,
+                )
+                tile_imag = tl.load(
+                    L_ptr + tile_offset + 1,
+                    mask=rows_m_mask[:, None],
+                    other=0.0,
+                )
+                if storage_conj:
+                    tile_imag = -tile_imag
+            else:
+                tile_offset = (
+                    L_base
+                    + rows_k[:, None] * stride_L_row
+                    + rows_m[None, :] * stride_L_col
+                )
+                tile_real = tl.trans(
+                    tl.load(
+                        L_ptr + tile_offset,
+                        mask=rows_m_mask[None, :],
+                        other=0.0,
+                    )
+                )
+                tile_imag = tl.trans(
+                    tl.load(
+                        L_ptr + tile_offset + 1,
+                        mask=rows_m_mask[None, :],
+                        other=0.0,
+                    )
+                )
+                if storage_conj:
+                    tile_imag = -tile_imag
+                tile_imag = -tile_imag
+
+            head_offset = (
+                B_base
+                + rows_m[:, None] * stride_B_row
+                + rhs_cols[None, :] * stride_B_col
+            )
+            head_mask = rows_m_mask[:, None] & rhs_mask[None, :]
+            head_real = tl.load(
+                X_ptr + head_offset,
+                mask=head_mask,
+                other=0.0,
+            )
+            head_imag = tl.load(
+                X_ptr + head_offset + 1,
+                mask=head_mask,
+                other=0.0,
+            )
+            if IS_DOUBLE:
+                update_real = tl.dot(tile_real, w_real)
+                update_real -= tl.dot(tile_imag, w_imag)
+                update_imag = tl.dot(tile_real, w_imag)
+                update_imag += tl.dot(tile_imag, w_real)
+            else:
+                update_real = tl.dot(
+                    tile_real, w_real, input_precision="tf32x3"
+                )
+                update_real -= tl.dot(
+                    tile_imag, w_imag, input_precision="tf32x3"
+                )
+                update_imag = tl.dot(
+                    tile_real, w_imag, input_precision="tf32x3"
+                )
+                update_imag += tl.dot(
+                    tile_imag, w_real, input_precision="tf32x3"
+                )
+            head_real -= update_real
+            head_imag -= update_imag
+            tl.store(
+                X_ptr + head_offset, head_real, mask=head_mask
+            )
+            tl.store(
+                X_ptr + head_offset + 1, head_imag, mask=head_mask
+            )
+
+
+@libentry()
+@triton.jit
+def cholesky_solve_complex_single_rhs_blocked_kernel(
+    L_ptr,
+    B_ptr,
+    X_ptr,
+    N: tl.constexpr,
+    batch_stride_L,
+    batch_stride_B,
+    stride_L_row,
+    stride_L_col,
+    stride_B_row,
+    BLOCK_K: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    upper: tl.constexpr,
+    storage_conj: tl.constexpr,
+):
+    """Blocked complex TRSV using vector reductions for panel updates."""
+    batch_pid = program_id(0)
+    L_base = batch_pid * batch_stride_L
+    B_base = batch_pid * batch_stride_B
+    k_offsets = tl.arange(0, BLOCK_K)
+    m_offsets = tl.arange(0, BLOCK_M)
+
+    for k in range(0, N, BLOCK_K):
+        rows_k = k + k_offsets
+        if k > 0:
+            tl.debug_barrier()
+        y_offset = B_base + rows_k * stride_B_row
+        if k == 0:
+            y_real = tl.load(B_ptr + y_offset)
+            y_imag = tl.load(B_ptr + y_offset + 1)
+        else:
+            y_real = tl.load(X_ptr + y_offset)
+            y_imag = tl.load(X_ptr + y_offset + 1)
+
+        diag_offset = (
+            L_base + rows_k * stride_L_row + rows_k * stride_L_col
+        )
+        diag_real = tl.load(L_ptr + diag_offset)
+        inv_diag = 1.0 / diag_real
+        w_real = y_real * inv_diag
+        w_imag = y_imag * inv_diag
+
+        for i in range(BLOCK_K):
+            if upper:
+                factor_offset = (
+                    L_base
+                    + (k + i) * stride_L_row
+                    + rows_k * stride_L_col
+                )
+            else:
+                factor_offset = (
+                    L_base
+                    + rows_k * stride_L_row
+                    + (k + i) * stride_L_col
+                )
+            factor_real = tl.load(
+                L_ptr + factor_offset,
+                mask=k_offsets > i,
+                other=0.0,
+            )
+            factor_imag = tl.load(
+                L_ptr + factor_offset + 1,
+                mask=k_offsets > i,
+                other=0.0,
+            )
+            if storage_conj:
+                factor_imag = -factor_imag
+            if upper:
+                factor_imag = -factor_imag
+            norm_real = factor_real * inv_diag
+            norm_imag = factor_imag * inv_diag
+            pivot_real = tl.gather(w_real, tl.full([1], i, tl.int32), 0)
+            pivot_imag = tl.gather(w_imag, tl.full([1], i, tl.int32), 0)
+            w_real -= norm_real * pivot_real - norm_imag * pivot_imag
+            w_imag -= norm_real * pivot_imag + norm_imag * pivot_real
+
+        tl.store(X_ptr + y_offset, w_real)
+        tl.store(X_ptr + y_offset + 1, w_imag)
+
+        for m in range(k + BLOCK_K, N, BLOCK_M):
+            rows_m = m + m_offsets
+            rows_m_mask = rows_m < N
+            if upper:
+                tile_offset = (
+                    L_base
+                    + rows_k[:, None] * stride_L_row
+                    + rows_m[None, :] * stride_L_col
+                )
+                tile_real = tl.load(
+                    L_ptr + tile_offset,
+                    mask=rows_m_mask[None, :],
+                    other=0.0,
+                )
+                tile_imag = tl.load(
+                    L_ptr + tile_offset + 1,
+                    mask=rows_m_mask[None, :],
+                    other=0.0,
+                )
+                if storage_conj:
+                    tile_imag = -tile_imag
+                tile_imag = -tile_imag
+                update_real = tl.sum(
+                    tile_real * w_real[:, None]
+                    - tile_imag * w_imag[:, None],
+                    axis=0,
+                )
+                update_imag = tl.sum(
+                    tile_real * w_imag[:, None]
+                    + tile_imag * w_real[:, None],
+                    axis=0,
+                )
+            else:
+                tile_offset = (
+                    L_base
+                    + rows_m[:, None] * stride_L_row
+                    + rows_k[None, :] * stride_L_col
+                )
+                tile_real = tl.load(
+                    L_ptr + tile_offset,
+                    mask=rows_m_mask[:, None],
+                    other=0.0,
+                )
+                tile_imag = tl.load(
+                    L_ptr + tile_offset + 1,
+                    mask=rows_m_mask[:, None],
+                    other=0.0,
+                )
+                if storage_conj:
+                    tile_imag = -tile_imag
+                update_real = tl.sum(
+                    tile_real * w_real[None, :]
+                    - tile_imag * w_imag[None, :],
+                    axis=1,
+                )
+                update_imag = tl.sum(
+                    tile_real * w_imag[None, :]
+                    + tile_imag * w_real[None, :],
+                    axis=1,
+                )
+            tail_offset = B_base + rows_m * stride_B_row
+            if k == 0:
+                tail_real = tl.load(
+                    B_ptr + tail_offset, mask=rows_m_mask, other=0.0
+                )
+                tail_imag = tl.load(
+                    B_ptr + tail_offset + 1,
+                    mask=rows_m_mask,
+                    other=0.0,
+                )
+            else:
+                tail_real = tl.load(
+                    X_ptr + tail_offset, mask=rows_m_mask, other=0.0
+                )
+                tail_imag = tl.load(
+                    X_ptr + tail_offset + 1,
+                    mask=rows_m_mask,
+                    other=0.0,
+                )
+            tl.store(
+                X_ptr + tail_offset,
+                tail_real - update_real,
+                mask=rows_m_mask,
+            )
+            tl.store(
+                X_ptr + tail_offset + 1,
+                tail_imag - update_imag,
+                mask=rows_m_mask,
+            )
+
+    for k in range(N - BLOCK_K, -1, -BLOCK_K):
+        rows_k = k + k_offsets
+        tl.debug_barrier()
+        x_offset = B_base + rows_k * stride_B_row
+        x_real = tl.load(X_ptr + x_offset)
+        x_imag = tl.load(X_ptr + x_offset + 1)
+
+        diag_offset = (
+            L_base + rows_k * stride_L_row + rows_k * stride_L_col
+        )
+        diag_real = tl.load(L_ptr + diag_offset)
+        inv_diag = 1.0 / diag_real
+        w_real = x_real * inv_diag
+        w_imag = x_imag * inv_diag
+
+        for ii_idx in range(BLOCK_K - 1, -1, -1):
+            if upper:
+                factor_offset = (
+                    L_base
+                    + rows_k * stride_L_row
+                    + (k + ii_idx) * stride_L_col
+                )
+            else:
+                factor_offset = (
+                    L_base
+                    + (k + ii_idx) * stride_L_row
+                    + rows_k * stride_L_col
+                )
+            factor_real = tl.load(
+                L_ptr + factor_offset,
+                mask=k_offsets < ii_idx,
+                other=0.0,
+            )
+            factor_imag = tl.load(
+                L_ptr + factor_offset + 1,
+                mask=k_offsets < ii_idx,
+                other=0.0,
+            )
+            if storage_conj:
+                factor_imag = -factor_imag
+            if not upper:
+                factor_imag = -factor_imag
+            norm_real = factor_real * inv_diag
+            norm_imag = factor_imag * inv_diag
+            pivot_real = tl.gather(
+                w_real, tl.full([1], ii_idx, tl.int32), 0
+            )
+            pivot_imag = tl.gather(
+                w_imag, tl.full([1], ii_idx, tl.int32), 0
+            )
+            w_real -= norm_real * pivot_real - norm_imag * pivot_imag
+            w_imag -= norm_real * pivot_imag + norm_imag * pivot_real
+
+        tl.store(X_ptr + x_offset, w_real)
+        tl.store(X_ptr + x_offset + 1, w_imag)
+
+        for m in range(0, k, BLOCK_M):
+            rows_m = m + m_offsets
+            rows_m_mask = rows_m < k
+            if upper:
+                tile_offset = (
+                    L_base
+                    + rows_m[:, None] * stride_L_row
+                    + rows_k[None, :] * stride_L_col
+                )
+                tile_real = tl.load(
+                    L_ptr + tile_offset,
+                    mask=rows_m_mask[:, None],
+                    other=0.0,
+                )
+                tile_imag = tl.load(
+                    L_ptr + tile_offset + 1,
+                    mask=rows_m_mask[:, None],
+                    other=0.0,
+                )
+                if storage_conj:
+                    tile_imag = -tile_imag
+                update_real = tl.sum(
+                    tile_real * w_real[None, :]
+                    - tile_imag * w_imag[None, :],
+                    axis=1,
+                )
+                update_imag = tl.sum(
+                    tile_real * w_imag[None, :]
+                    + tile_imag * w_real[None, :],
+                    axis=1,
+                )
+            else:
+                tile_offset = (
+                    L_base
+                    + rows_k[:, None] * stride_L_row
+                    + rows_m[None, :] * stride_L_col
+                )
+                tile_real = tl.load(
+                    L_ptr + tile_offset,
+                    mask=rows_m_mask[None, :],
+                    other=0.0,
+                )
+                tile_imag = tl.load(
+                    L_ptr + tile_offset + 1,
+                    mask=rows_m_mask[None, :],
+                    other=0.0,
+                )
+                if storage_conj:
+                    tile_imag = -tile_imag
+                tile_imag = -tile_imag
+                update_real = tl.sum(
+                    tile_real * w_real[:, None]
+                    - tile_imag * w_imag[:, None],
+                    axis=0,
+                )
+                update_imag = tl.sum(
+                    tile_real * w_imag[:, None]
+                    + tile_imag * w_real[:, None],
+                    axis=0,
+                )
+            head_offset = B_base + rows_m * stride_B_row
+            head_real = tl.load(
+                X_ptr + head_offset, mask=rows_m_mask, other=0.0
+            )
+            head_imag = tl.load(
+                X_ptr + head_offset + 1, mask=rows_m_mask, other=0.0
+            )
+            tl.store(
+                X_ptr + head_offset,
+                head_real - update_real,
+                mask=rows_m_mask,
+            )
+            tl.store(
+                X_ptr + head_offset + 1,
+                head_imag - update_imag,
+                mask=rows_m_mask,
+            )
 
 
 @libentry()
@@ -1644,16 +2306,34 @@ def _get_small_gather_launch_config(dtype, N):
 
 
 def _cholesky_solve_complex(B, L, upper, batch_shape, N, nrhs):
-    """Launch the complex64/complex128 correctness-first implementation."""
-    # view_as_real rejects unresolved conjugate views. Materializing also
-    # gives the first implementation one predictable interleaved layout and
-    # handles expanded/non-contiguous batch inputs uniformly.
+    """Launch layout-aware complex64/complex128 specialized kernels."""
+    # view_as_real rejects unresolved conjugate views. This materialization is
+    # only needed for explicit lazy-conjugate inputs; ordinary Cholesky output
+    # is handled without a copy below.
     if L.is_conj():
         L = L.resolve_conj()
     if B.is_conj():
         B = B.resolve_conj()
-    L = L.contiguous()
-    B = B.contiguous()
+
+    # Complex layout normalization mirrors the real path, with one additional
+    # bit of metadata. For a column-major lower factor L, L.mT is a row-major
+    # view containing L^T, whereas the corresponding upper factor is L^H.
+    # Kernels therefore flip the triangular orientation and conjugate factor
+    # loads on the fly. This avoids the F->C copy without sacrificing coalesced
+    # row-major panel loads.
+    if L.is_contiguous():
+        effective_upper = upper
+        storage_conj = False
+    elif L.mT.is_contiguous():
+        L = L.mT
+        effective_upper = not upper
+        storage_conj = True
+    else:
+        L = L.contiguous()
+        effective_upper = upper
+        storage_conj = False
+    if not B.is_contiguous():
+        B = B.contiguous()
     X = torch.empty_like(B)
 
     batch_size = 1
@@ -1665,11 +2345,15 @@ def _cholesky_solve_complex(B, L, upper, batch_shape, N, nrhs):
     X_real = torch.view_as_real(X).reshape(-1, N, nrhs, 2)
 
     with torch.no_grad():
-        if N <= 32 and nrhs <= 8:
+        if (N <= 32 and nrhs <= 8) or (N <= 64 and nrhs == 1):
             block_n = triton.next_power_of_2(N)
             block_rhs = triton.next_power_of_2(nrhs)
             num_warps = (
-                2 if B.dtype == torch.complex128 and N > 16 else 1
+                4
+                if B.dtype == torch.complex128 and N > 32
+                else 2
+                if B.dtype == torch.complex128 and N > 16
+                else 1
             )
             cholesky_solve_complex_small_gather_kernel[(batch_size,)](
                 L_real,
@@ -1685,8 +2369,54 @@ def _cholesky_solve_complex(B, L, upper, batch_shape, N, nrhs):
                 B_real.stride(2),
                 BLOCK_N=block_n,
                 BLOCK_RHS=block_rhs,
-                upper=upper,
+                upper=effective_upper,
+                storage_conj=storage_conj,
                 num_warps=num_warps,
+                num_stages=1,
+            )
+        elif N >= 64 and N % 32 == 0 and nrhs >= 4:
+            is_double = B.dtype == torch.complex128
+            block_k = 16 if is_double else 32
+            block_rhs = 8 if is_double else 4
+            grid = (batch_size, triton.cdiv(nrhs, block_rhs))
+            cholesky_solve_complex_blocked_kernel[grid](
+                L_real,
+                B_real,
+                X_real,
+                N,
+                nrhs,
+                L_real.stride(0),
+                B_real.stride(0),
+                L_real.stride(1),
+                L_real.stride(2),
+                B_real.stride(1),
+                B_real.stride(2),
+                BLOCK_K=block_k,
+                BLOCK_M=32,
+                BLOCK_RHS=block_rhs,
+                upper=effective_upper,
+                storage_conj=storage_conj,
+                IS_DOUBLE=is_double,
+                num_warps=4,
+                num_stages=1 if is_double else 2,
+            )
+        elif nrhs == 1 and N >= 64 and N % 32 == 0:
+            is_double = B.dtype == torch.complex128
+            cholesky_solve_complex_single_rhs_blocked_kernel[(batch_size,)](
+                L_real,
+                B_real,
+                X_real,
+                N,
+                L_real.stride(0),
+                B_real.stride(0),
+                L_real.stride(1),
+                L_real.stride(2),
+                B_real.stride(1),
+                BLOCK_K=16 if is_double else 32,
+                BLOCK_M=32,
+                upper=effective_upper,
+                storage_conj=storage_conj,
+                num_warps=4 if is_double else 2,
                 num_stages=1,
             )
         else:
@@ -1705,7 +2435,8 @@ def _cholesky_solve_complex(B, L, upper, batch_shape, N, nrhs):
                 B_real.stride(1),
                 B_real.stride(2),
                 BLOCK_RHS=block_rhs,
-                upper=upper,
+                upper=effective_upper,
+                storage_conj=storage_conj,
                 num_warps=1,
                 num_stages=1,
             )
