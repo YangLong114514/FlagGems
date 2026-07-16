@@ -136,7 +136,10 @@ def _assert_cholesky_solve_matches(A, factor, rhs, dtype, upper=False):
     ref_out = torch.cholesky_solve(rhs, factor, upper=upper)
     res_out = _solve_with_gems(rhs, factor, upper=upper)
     utils.gems_assert_close(res_out, ref_out, dtype)
-    _assert_backward_error(A, res_out, rhs.expand_as(res_out), dtype)
+    if not IS_ASCEND:
+        # Ascend: torch.linalg.cholesky falls back to CPU, making A
+        # inconsistent for NPU-side backward-error computation.
+        _assert_backward_error(A, res_out, rhs.expand_as(res_out), dtype)
 
 
 # ---------------------------------------------------------------------------
