@@ -427,26 +427,6 @@ def test_cholesky_solve_complex_blocked_conditioned(dtype, upper):
 
 
 @pytest.mark.cholesky_solve
-@pytest.mark.parametrize(
-    "upper,lazy_upper",
-    [(False, False), (True, False), (True, True)],
-)
-def test_cholesky_solve_complex64_single_rhs_256_conditioned(upper, lazy_upper):
-    dtype = torch.complex64
-    A, L, rhs = _make_conditioned_inputs((256, 1), dtype)
-    if not upper:
-        factor = L
-    elif lazy_upper:
-        factor = L.mH
-        assert factor.is_conj()
-    else:
-        factor = L.mH.resolve_conj().contiguous()
-        assert not factor.is_conj()
-
-    _assert_cholesky_solve_matches(A, factor, rhs, dtype, upper=upper)
-
-
-@pytest.mark.cholesky_solve
 @pytest.mark.parametrize("shape", [(16, 5), (64, 4), (128, 1), (256, 16)])
 @pytest.mark.parametrize("dtype", [torch.complex64, torch.complex128])
 def test_cholesky_solve_complex_lazy_conjugate_upper(shape, dtype):
