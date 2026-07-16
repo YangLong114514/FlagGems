@@ -7,11 +7,10 @@ from . import base
 
 IS_ASCEND = flag_gems.vendor_name == "ascend"
 
-# Import cholesky_solve from the correct backend
+# Ascend does not register cholesky_solve through aten yet, so its backend
+# implementation is passed to the benchmark explicitly through gems_op.
 if IS_ASCEND:
     from flag_gems.runtime.backend._ascend.ops.cholesky_solve import cholesky_solve
-else:
-    from flag_gems.ops.cholesky_solve import cholesky_solve
 
 
 # ---------------------------------------------------------------------------
@@ -41,7 +40,7 @@ CHOLESKY_SOLVE_CASES = [
 
 
 # ---------------------------------------------------------------------------
-# GPU benchmark (uses existing Benchmark framework)
+# Benchmark implementation
 # ---------------------------------------------------------------------------
 
 class CholeskySolveBenchmark(base.Benchmark):
@@ -63,84 +62,36 @@ class CholeskySolveBenchmark(base.Benchmark):
             yield (rhs, factor, upper)
 
 
+def _composed_cholesky_solve(rhs, factor, upper=False):
+    """Reference path composed from two native triangular solves."""
+    if upper:
+        y = torch.linalg.solve_triangular(
+            factor.transpose(-2, -1), rhs, upper=False
+        )
+        return torch.linalg.solve_triangular(factor, y, upper=True)
+
+    y = torch.linalg.solve_triangular(factor, rhs, upper=False)
+    return torch.linalg.solve_triangular(
+        factor.transpose(-2, -1), y, upper=True
+    )
+
+
 @pytest.mark.cholesky_solve
 def test_cholesky_solve():
-    """GPU backend: aten dispatch benchmark. Ascend: skipped (no aten registration)."""
+    """Benchmark Cholesky solve through the common reporting pipeline."""
     if IS_ASCEND:
-        pytest.skip("Ascend uses direct call, see test_cholesky_solve_ascend")
+        torch_op = _composed_cholesky_solve
+        gems_op = cholesky_solve
+        dtypes = [torch.float32]
+    else:
+        torch_op = torch.ops.aten.cholesky_solve
+        gems_op = None
+        dtypes = [torch.float32, torch.float64]
+
     bench = CholeskySolveBenchmark(
         op_name="cholesky_solve",
-        torch_op=torch.ops.aten.cholesky_solve,
-        dtypes=[torch.float32, torch.float64],
+        torch_op=torch_op,
+        gems_op=gems_op,
+        dtypes=dtypes,
     )
     bench.run()
-
-
-# ---------------------------------------------------------------------------
-# Ascend benchmark: direct kernel call vs composed solve_triangular×2
-# ---------------------------------------------------------------------------
-
-@pytest.mark.cholesky_solve
-def test_cholesky_solve_ascend():
-    """Ascend backend: bench kernel vs composed solve_triangular×2 (fp32 only)."""
-    if not IS_ASCEND:
-        pytest.skip("Ascend-only benchmark")
-
-    import time
-    from flag_gems.runtime import torch_device_fn
-
-    device = flag_gems.device
-    dtype = torch.float32
-    warmup, iters = 30, 100
-
-    def composed(rhs, L, upper):
-        if upper:
-            Y = torch.linalg.solve_triangular(L.transpose(-2, -1), rhs, upper=False)
-            return torch.linalg.solve_triangular(L, Y, upper=True)
-        else:
-            Y = torch.linalg.solve_triangular(L, rhs, upper=False)
-            return torch.linalg.solve_triangular(L.transpose(-2, -1), Y, upper=True)
-
-    def build(shape, upper):
-        *batch_dims, n, nrhs = shape
-        B_mat = torch.randn(*batch_dims, n, n, dtype=dtype, device=device)
-        eye = torch.eye(n, dtype=dtype, device=device)
-        for _ in batch_dims:
-            eye = eye.unsqueeze(0)
-        A = B_mat @ B_mat.transpose(-2, -1) + eye * 0.1
-        L_cpu = torch.linalg.cholesky(A)
-        L = L_cpu.mT.contiguous() if upper else L_cpu
-        L = L.to(device).contiguous()
-        rhs = torch.randn(*batch_dims, n, nrhs, dtype=dtype, device=device).contiguous()
-        return L, rhs
-
-    # Flatten to test lower+upper per shape
-    print(f"\n{'N':>6s} {'nrhs':>5s} {'upper':>6s} {'kernel(us)':>10s} {'compose(us)':>10s} {'ratio':>7s}")
-    print("-" * 53)
-
-    for shape, upper in CHOLESKY_SOLVE_CASES:
-        *batch_dims, n, nrhs = shape
-        L, rhs = build(shape, upper)
-
-        # warmup
-        for _ in range(warmup):
-            with torch.no_grad():
-                _ = cholesky_solve(rhs.clone(), L, upper=upper)
-                _ = composed(rhs.clone(), L, upper=upper)
-        torch_device_fn.synchronize()
-
-        t0 = time.perf_counter()
-        for _ in range(iters):
-            with torch.no_grad():
-                _ = cholesky_solve(rhs.clone(), L, upper=upper)
-        torch_device_fn.synchronize()
-        tk = (time.perf_counter() - t0) / iters * 1e6
-
-        t0 = time.perf_counter()
-        for _ in range(iters):
-            with torch.no_grad():
-                _ = composed(rhs.clone(), L, upper=upper)
-        torch_device_fn.synchronize()
-        tc = (time.perf_counter() - t0) / iters * 1e6
-
-        print(f"{n:6d} {nrhs:5d} {str(upper):>6s} {tk:9.0f}us {tc:9.0f}us {tk/tc:6.2f}x")
