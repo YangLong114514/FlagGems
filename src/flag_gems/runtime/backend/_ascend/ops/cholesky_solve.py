@@ -731,11 +731,28 @@ def cholesky_solve(B, L, upper=False):
             f"{B_shape[:-2]} vs {L_shape[:-2]}"
         ) from exc
 
+    # torch.linalg.cholesky commonly returns a transpose-contiguous factor.
+    # Reinterpret that storage through an mT view and flip the triangular
+    # orientation instead of materializing an F-to-C layout conversion.
+    effective_upper = upper
+    if L.is_contiguous():
+        pass
+    elif L.mT.is_contiguous():
+        L = L.mT
+        effective_upper = not upper
+    else:
+        L = L.contiguous()
+
     L = L.expand(batch_shape + L_shape[-2:])
     B = B.expand(batch_shape + B_shape[-2:])
 
-    L = L.contiguous()
-    B = B.contiguous()
+    # Broadcasted batch dimensions may introduce zero strides and still need
+    # materialization before batch flattening. The common non-broadcast path
+    # remains a zero-copy view after the layout normalization above.
+    if not L.is_contiguous():
+        L = L.contiguous()
+    if not B.is_contiguous():
+        B = B.contiguous()
     X = torch.empty_like(B)
 
     batch_size = 1
@@ -763,7 +780,7 @@ def cholesky_solve(B, L, upper=False):
                 L_kernel, B_kernel, X_kernel, N, nrhs,
                 batch_stride_L, batch_stride_B, stride_L, stride_B,
                 BLOCK_N=block_n, BLOCK_RHS=block_rhs,
-                dtype_flag=0, upper=upper,
+                dtype_flag=0, upper=effective_upper,
                 num_warps=2, num_stages=1,
             )
         # Path 2: single RHS → scalar kernel
@@ -771,10 +788,10 @@ def cholesky_solve(B, L, upper=False):
             cholesky_solve_single_rhs_kernel[(batch_size,)](
                 L_kernel, B_kernel, X_kernel, N,
                 batch_stride_L, batch_stride_B, stride_L, stride_B,
-                dtype_flag=dtype_flag, upper=upper,
+                dtype_flag=dtype_flag, upper=effective_upper,
             )
         # Path 2: blocked multi-RHS (tl.dot accelerated, nrhs>=4 required for alignment)
-        elif not upper and N >= 64 and N % 32 == 0 and nrhs >= 4:
+        elif not effective_upper and N >= 64 and N % 32 == 0 and nrhs >= 4:
             blk_k, blk_m, blk_rhs = _get_ascend_tile_config(B.dtype)
             warp = _get_ascend_warp_config(B.dtype)
             grid = (batch_size, triton.cdiv(nrhs, blk_rhs))
@@ -784,7 +801,7 @@ def cholesky_solve(B, L, upper=False):
                 BLOCK_K=blk_k, BLOCK_M=blk_m, BLOCK_RHS=blk_rhs,
                 dtype_flag=0, PRELOAD_DIAG=False, **warp,
             )
-        elif upper and N >= 64 and N % 32 == 0 and nrhs >= 4:
+        elif effective_upper and N >= 64 and N % 32 == 0 and nrhs >= 4:
             blk_k, blk_m, blk_rhs = _get_ascend_tile_config(B.dtype)
             warp = _get_ascend_warp_config(B.dtype)
             grid = (batch_size, triton.cdiv(nrhs, blk_rhs))
@@ -801,7 +818,9 @@ def cholesky_solve(B, L, upper=False):
             cholesky_solve_kernel[grid](
                 L_kernel, B_kernel, X_kernel, N, nrhs,
                 batch_stride_L, batch_stride_B, stride_L, stride_B,
-                BLOCK_RHS=blk_rhs, dtype_flag=dtype_flag, upper=upper,
+                BLOCK_RHS=blk_rhs,
+                dtype_flag=dtype_flag,
+                upper=effective_upper,
             )
 
     return X

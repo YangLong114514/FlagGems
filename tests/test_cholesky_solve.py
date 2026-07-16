@@ -203,6 +203,19 @@ def test_cholesky_solve_upper(shape, dtype):
 
 
 @pytest.mark.cholesky_solve
+@pytest.mark.parametrize("upper", [False, True])
+def test_cholesky_solve_transpose_contiguous_factor(upper):
+    dtype = torch.float32
+    A, L, rhs = _make_cholesky_solve_inputs((64, 16), dtype)
+    factor_c = L.mT.contiguous() if upper else L.contiguous()
+    factor = factor_c.mT.contiguous().mT
+
+    assert not factor.is_contiguous()
+    assert factor.mT.is_contiguous()
+    _assert_cholesky_solve_matches(A, factor, rhs, dtype, upper=upper)
+
+
+@pytest.mark.cholesky_solve
 @pytest.mark.parametrize("shape", CHOLESKY_SOLVE_BLOCKED_SINGLE_RHS_SHAPES)
 @pytest.mark.parametrize("dtype", _REAL_DTYPES)
 @pytest.mark.parametrize("upper", [False, True])
