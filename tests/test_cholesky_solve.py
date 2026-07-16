@@ -79,6 +79,7 @@ CHOLESKY_SOLVE_COMPLEX_SHAPES = [
     (2, 16, 4),
 ]
 CHOLESKY_SOLVE_COMPLEX_BLOCKED_SHAPES = [
+    (64, 1),
     (64, 4),
     (64, 33),
     (128, 1),
@@ -423,6 +424,17 @@ def test_cholesky_solve_complex_blocked_conditioned(dtype, upper):
     factor = L.mH.contiguous() if upper else L
 
     _assert_cholesky_solve_matches(A, factor, rhs, dtype, upper=upper)
+
+
+@pytest.mark.cholesky_solve
+@pytest.mark.parametrize("shape", [(16, 5), (64, 4), (128, 1), (256, 16)])
+@pytest.mark.parametrize("dtype", [torch.complex64, torch.complex128])
+def test_cholesky_solve_complex_lazy_conjugate_upper(shape, dtype):
+    A, L, rhs = _make_cholesky_solve_inputs(shape, dtype)
+    factor = L.mH
+    assert factor.is_conj()
+
+    _assert_cholesky_solve_matches(A, factor, rhs, dtype, upper=True)
 
 
 @pytest.mark.cholesky_solve

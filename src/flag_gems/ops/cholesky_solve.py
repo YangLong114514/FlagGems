@@ -154,9 +154,7 @@ def cholesky_solve_complex_kernel(
                 l_offset = L_base + i * stride_L_row + j * stride_L_col
             l_real = tl.load(L_ptr + l_offset)
             l_imag = tl.load(L_ptr + l_offset + 1)
-            if storage_conj:
-                l_imag = -l_imag
-            if upper:
+            if storage_conj != upper:
                 l_imag = -l_imag
 
             y_offset = B_base + j * stride_B_row + cols * stride_B_col
@@ -168,9 +166,7 @@ def cholesky_solve_complex_kernel(
         diag_offset = L_base + i * stride_L_row + i * stride_L_col
         diag_real = tl.load(L_ptr + diag_offset)
         diag_imag = tl.load(L_ptr + diag_offset + 1)
-        if storage_conj:
-            diag_imag = -diag_imag
-        if upper:
+        if storage_conj != upper:
             diag_imag = -diag_imag
         denominator = diag_real * diag_real + diag_imag * diag_imag
         y_real = (sum_real * diag_real + sum_imag * diag_imag) / denominator
@@ -190,9 +186,7 @@ def cholesky_solve_complex_kernel(
                 l_offset = L_base + j * stride_L_row + i * stride_L_col
             l_real = tl.load(L_ptr + l_offset)
             l_imag = tl.load(L_ptr + l_offset + 1)
-            if storage_conj:
-                l_imag = -l_imag
-            if not upper:
+            if storage_conj == upper:
                 l_imag = -l_imag
 
             xj_offset = B_base + j * stride_B_row + cols * stride_B_col
@@ -204,9 +198,7 @@ def cholesky_solve_complex_kernel(
         diag_offset = L_base + i * stride_L_row + i * stride_L_col
         diag_real = tl.load(L_ptr + diag_offset)
         diag_imag = tl.load(L_ptr + diag_offset + 1)
-        if storage_conj:
-            diag_imag = -diag_imag
-        if not upper:
+        if storage_conj == upper:
             diag_imag = -diag_imag
         denominator = diag_real * diag_real + diag_imag * diag_imag
         out_real = (sum_real * diag_real + sum_imag * diag_imag) / denominator
@@ -287,9 +279,7 @@ def cholesky_solve_complex_small_gather_kernel(
             mask=active,
             other=0.0,
         )
-        if storage_conj:
-            factor_imag = -factor_imag
-        if upper:
+        if storage_conj != upper:
             factor_imag = -factor_imag
 
         normalized_real = factor_real * inv_diag
@@ -339,9 +329,7 @@ def cholesky_solve_complex_small_gather_kernel(
             mask=active,
             other=0.0,
         )
-        if storage_conj:
-            factor_imag = -factor_imag
-        if not upper:
+        if storage_conj == upper:
             factor_imag = -factor_imag
 
         normalized_real = factor_real * inv_diag
@@ -466,9 +454,7 @@ def cholesky_solve_complex_blocked_kernel(
                 mask=k_offsets > i,
                 other=0.0,
             )
-            if storage_conj:
-                factor_imag = -factor_imag
-            if upper:
+            if storage_conj != upper:
                 factor_imag = -factor_imag
             norm_real = factor_real * inv_diag
             norm_imag = factor_imag * inv_diag
@@ -513,9 +499,6 @@ def cholesky_solve_complex_blocked_kernel(
                         other=0.0,
                     )
                 )
-                if storage_conj:
-                    tile_imag = -tile_imag
-                tile_imag = -tile_imag
             else:
                 tile_offset = (
                     L_base
@@ -532,8 +515,8 @@ def cholesky_solve_complex_blocked_kernel(
                     mask=rows_m_mask[:, None],
                     other=0.0,
                 )
-                if storage_conj:
-                    tile_imag = -tile_imag
+            if storage_conj != upper:
+                tile_imag = -tile_imag
 
             tail_offset = (
                 B_base
@@ -638,9 +621,7 @@ def cholesky_solve_complex_blocked_kernel(
                 mask=k_offsets < ii_idx,
                 other=0.0,
             )
-            if storage_conj:
-                factor_imag = -factor_imag
-            if not upper:
+            if storage_conj == upper:
                 factor_imag = -factor_imag
             norm_real = factor_real * inv_diag
             norm_imag = factor_imag * inv_diag
@@ -685,8 +666,6 @@ def cholesky_solve_complex_blocked_kernel(
                     mask=rows_m_mask[:, None],
                     other=0.0,
                 )
-                if storage_conj:
-                    tile_imag = -tile_imag
             else:
                 tile_offset = (
                     L_base
@@ -707,8 +686,7 @@ def cholesky_solve_complex_blocked_kernel(
                         other=0.0,
                     )
                 )
-                if storage_conj:
-                    tile_imag = -tile_imag
+            if storage_conj == upper:
                 tile_imag = -tile_imag
 
             head_offset = (
@@ -822,9 +800,7 @@ def cholesky_solve_complex_single_rhs_blocked_kernel(
                 mask=k_offsets > i,
                 other=0.0,
             )
-            if storage_conj:
-                factor_imag = -factor_imag
-            if upper:
+            if storage_conj != upper:
                 factor_imag = -factor_imag
             norm_real = factor_real * inv_diag
             norm_imag = factor_imag * inv_diag
@@ -855,9 +831,8 @@ def cholesky_solve_complex_single_rhs_blocked_kernel(
                     mask=rows_m_mask[None, :],
                     other=0.0,
                 )
-                if storage_conj:
+                if storage_conj != upper:
                     tile_imag = -tile_imag
-                tile_imag = -tile_imag
                 update_real = tl.sum(
                     tile_real * w_real[:, None]
                     - tile_imag * w_imag[:, None],
@@ -884,7 +859,7 @@ def cholesky_solve_complex_single_rhs_blocked_kernel(
                     mask=rows_m_mask[:, None],
                     other=0.0,
                 )
-                if storage_conj:
+                if storage_conj != upper:
                     tile_imag = -tile_imag
                 update_real = tl.sum(
                     tile_real * w_real[None, :]
@@ -964,9 +939,7 @@ def cholesky_solve_complex_single_rhs_blocked_kernel(
                 mask=k_offsets < ii_idx,
                 other=0.0,
             )
-            if storage_conj:
-                factor_imag = -factor_imag
-            if not upper:
+            if storage_conj == upper:
                 factor_imag = -factor_imag
             norm_real = factor_real * inv_diag
             norm_imag = factor_imag * inv_diag
@@ -1001,7 +974,7 @@ def cholesky_solve_complex_single_rhs_blocked_kernel(
                     mask=rows_m_mask[:, None],
                     other=0.0,
                 )
-                if storage_conj:
+                if storage_conj == upper:
                     tile_imag = -tile_imag
                 update_real = tl.sum(
                     tile_real * w_real[None, :]
@@ -1029,9 +1002,8 @@ def cholesky_solve_complex_single_rhs_blocked_kernel(
                     mask=rows_m_mask[None, :],
                     other=0.0,
                 )
-                if storage_conj:
+                if storage_conj == upper:
                     tile_imag = -tile_imag
-                tile_imag = -tile_imag
                 update_real = tl.sum(
                     tile_real * w_real[:, None]
                     - tile_imag * w_imag[:, None],
@@ -2305,13 +2277,64 @@ def _get_small_gather_launch_config(dtype, N):
     return {"num_warps": 1, "num_stages": 1}
 
 
+def _get_complex_blocked_launch_config(dtype, N):
+    """Return shape/dtype-specific configs for complex multi-RHS solves.
+
+    complex128 retains the 16x32x8 configuration that already beats Torch on
+    nearly every multi-RHS shape. complex64 expands only the N=256 panel from
+    32 to 64 rows, halving the number of four-dot panel-update groups without
+    the register pressure of a 128-row complex tile.
+    """
+    if dtype == torch.complex128:
+        return {
+            "BLOCK_K": 16,
+            "BLOCK_M": 32,
+            "BLOCK_RHS": 8,
+            "num_warps": 4,
+            "num_stages": 1,
+        }
+    return {
+        "BLOCK_K": 32,
+        "BLOCK_M": 64 if N >= 256 else 32,
+        "BLOCK_RHS": 4,
+        "num_warps": 4,
+        "num_stages": 2,
+    }
+
+
+def _get_complex_single_rhs_launch_config(dtype, N):
+    """Return configs for complex blocked single-RHS solves.
+
+    All dtypes use 32-row diagonal blocks. This mirrors the measured real
+    single-RHS winners and halves complex128's serial block/barrier count.
+    complex64 uses a 64-row panel at N=64 and N=256; N=128 keeps the lower
+    register-pressure 32-row panel that is already competitive with Torch.
+    """
+    if dtype == torch.complex128:
+        return {
+            "BLOCK_K": 32,
+            "BLOCK_M": 32,
+            "num_warps": 4,
+            "num_stages": 1,
+        }
+    return {
+        "BLOCK_K": 32,
+        "BLOCK_M": 32 if N == 128 else 64,
+        "num_warps": 2,
+        "num_stages": 1,
+    }
+
+
 def _cholesky_solve_complex(B, L, upper, batch_shape, N, nrhs):
     """Launch layout-aware complex64/complex128 specialized kernels."""
-    # view_as_real rejects unresolved conjugate views. This materialization is
-    # only needed for explicit lazy-conjugate inputs; ordinary Cholesky output
-    # is handled without a copy below.
-    if L.is_conj():
-        L = L.resolve_conj()
+    # view_as_real rejects lazy-conjugate tensors. Toggle the metadata bit off
+    # with another lazy conj view and carry the logical conjugation explicitly
+    # into the kernels instead of materializing through resolve_conj(). This is
+    # the common upper-factor layout produced by L.mH: it is already row-major
+    # but retains a conjugate bit, so resolving it used to cost ~15 us.
+    input_storage_conj = L.is_conj()
+    if input_storage_conj:
+        L = L.conj()
     if B.is_conj():
         B = B.resolve_conj()
 
@@ -2323,15 +2346,15 @@ def _cholesky_solve_complex(B, L, upper, batch_shape, N, nrhs):
     # row-major panel loads.
     if L.is_contiguous():
         effective_upper = upper
-        storage_conj = False
+        storage_conj = input_storage_conj
     elif L.mT.is_contiguous():
         L = L.mT
         effective_upper = not upper
-        storage_conj = True
+        storage_conj = not input_storage_conj
     else:
         L = L.contiguous()
         effective_upper = upper
-        storage_conj = False
+        storage_conj = input_storage_conj
     if not B.is_contiguous():
         B = B.contiguous()
     X = torch.empty_like(B)
@@ -2345,7 +2368,7 @@ def _cholesky_solve_complex(B, L, upper, batch_shape, N, nrhs):
     X_real = torch.view_as_real(X).reshape(-1, N, nrhs, 2)
 
     with torch.no_grad():
-        if (N <= 32 and nrhs <= 8) or (N <= 64 and nrhs == 1):
+        if (N <= 32 and nrhs <= 8) or (N < 64 and nrhs == 1):
             block_n = triton.next_power_of_2(N)
             block_rhs = triton.next_power_of_2(nrhs)
             num_warps = (
@@ -2376,9 +2399,8 @@ def _cholesky_solve_complex(B, L, upper, batch_shape, N, nrhs):
             )
         elif N >= 64 and N % 32 == 0 and nrhs >= 4:
             is_double = B.dtype == torch.complex128
-            block_k = 16 if is_double else 32
-            block_rhs = 8 if is_double else 4
-            grid = (batch_size, triton.cdiv(nrhs, block_rhs))
+            config = _get_complex_blocked_launch_config(B.dtype, N)
+            grid = (batch_size, triton.cdiv(nrhs, config["BLOCK_RHS"]))
             cholesky_solve_complex_blocked_kernel[grid](
                 L_real,
                 B_real,
@@ -2391,17 +2413,13 @@ def _cholesky_solve_complex(B, L, upper, batch_shape, N, nrhs):
                 L_real.stride(2),
                 B_real.stride(1),
                 B_real.stride(2),
-                BLOCK_K=block_k,
-                BLOCK_M=32,
-                BLOCK_RHS=block_rhs,
                 upper=effective_upper,
                 storage_conj=storage_conj,
                 IS_DOUBLE=is_double,
-                num_warps=4,
-                num_stages=1 if is_double else 2,
+                **config,
             )
         elif nrhs == 1 and N >= 64 and N % 32 == 0:
-            is_double = B.dtype == torch.complex128
+            config = _get_complex_single_rhs_launch_config(B.dtype, N)
             cholesky_solve_complex_single_rhs_blocked_kernel[(batch_size,)](
                 L_real,
                 B_real,
@@ -2412,12 +2430,9 @@ def _cholesky_solve_complex(B, L, upper, batch_shape, N, nrhs):
                 L_real.stride(1),
                 L_real.stride(2),
                 B_real.stride(1),
-                BLOCK_K=16 if is_double else 32,
-                BLOCK_M=32,
                 upper=effective_upper,
                 storage_conj=storage_conj,
-                num_warps=4 if is_double else 2,
-                num_stages=1,
+                **config,
             )
         else:
             block_rhs = 4 if B.dtype == torch.complex64 else 2
