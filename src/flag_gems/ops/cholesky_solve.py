@@ -749,8 +749,11 @@ def cholesky_solve_complex_single_rhs_blocked_kernel(
     BLOCK_M: tl.constexpr,
     upper: tl.constexpr,
     storage_conj: tl.constexpr,
+    USE_PACKED_DOT: tl.constexpr,
+    PACK_SIZE: tl.constexpr,
+    IS_DOUBLE: tl.constexpr,
 ):
-    """Blocked complex TRSV using vector reductions for panel updates."""
+    """Blocked complex TRSV with packed-dot or scalar panel updates."""
     batch_pid = program_id(0)
     L_base = batch_pid * batch_stride_L
     B_base = batch_pid * batch_stride_B
@@ -821,27 +824,19 @@ def cholesky_solve_complex_single_rhs_blocked_kernel(
                     + rows_k[:, None] * stride_L_row
                     + rows_m[None, :] * stride_L_col
                 )
-                tile_real = tl.load(
-                    L_ptr + tile_offset,
-                    mask=rows_m_mask[None, :],
-                    other=0.0,
+                tile_real = tl.trans(
+                    tl.load(
+                        L_ptr + tile_offset,
+                        mask=rows_m_mask[None, :],
+                        other=0.0,
+                    )
                 )
-                tile_imag = tl.load(
-                    L_ptr + tile_offset + 1,
-                    mask=rows_m_mask[None, :],
-                    other=0.0,
-                )
-                if storage_conj != upper:
-                    tile_imag = -tile_imag
-                update_real = tl.sum(
-                    tile_real * w_real[:, None]
-                    - tile_imag * w_imag[:, None],
-                    axis=0,
-                )
-                update_imag = tl.sum(
-                    tile_real * w_imag[:, None]
-                    + tile_imag * w_real[:, None],
-                    axis=0,
+                tile_imag = tl.trans(
+                    tl.load(
+                        L_ptr + tile_offset + 1,
+                        mask=rows_m_mask[None, :],
+                        other=0.0,
+                    )
                 )
             else:
                 tile_offset = (
@@ -859,8 +854,57 @@ def cholesky_solve_complex_single_rhs_blocked_kernel(
                     mask=rows_m_mask[:, None],
                     other=0.0,
                 )
-                if storage_conj != upper:
-                    tile_imag = -tile_imag
+            if storage_conj != upper:
+                tile_imag = -tile_imag
+
+            if USE_PACKED_DOT:
+                pack_cols = tl.arange(0, PACK_SIZE)
+                packed_w = tl.where(
+                    pack_cols[None, :] == 0,
+                    w_real[:, None],
+                    tl.where(
+                        pack_cols[None, :] == 1,
+                        w_imag[:, None],
+                        0.0,
+                    ),
+                )
+                if IS_DOUBLE:
+                    product_real = tl.dot(tile_real, packed_w)
+                    product_imag = tl.dot(tile_imag, packed_w)
+                else:
+                    product_real = tl.dot(
+                        tile_real, packed_w, input_precision="tf32x3"
+                    )
+                    product_imag = tl.dot(
+                        tile_imag, packed_w, input_precision="tf32x3"
+                    )
+                update_real = tl.sum(
+                    tl.where(
+                        pack_cols[None, :] == 0,
+                        product_real,
+                        0.0,
+                    )
+                    - tl.where(
+                        pack_cols[None, :] == 1,
+                        product_imag,
+                        0.0,
+                    ),
+                    axis=1,
+                )
+                update_imag = tl.sum(
+                    tl.where(
+                        pack_cols[None, :] == 1,
+                        product_real,
+                        0.0,
+                    )
+                    + tl.where(
+                        pack_cols[None, :] == 0,
+                        product_imag,
+                        0.0,
+                    ),
+                    axis=1,
+                )
+            else:
                 update_real = tl.sum(
                     tile_real * w_real[None, :]
                     - tile_imag * w_imag[None, :],
@@ -974,8 +1018,77 @@ def cholesky_solve_complex_single_rhs_blocked_kernel(
                     mask=rows_m_mask[:, None],
                     other=0.0,
                 )
-                if storage_conj == upper:
-                    tile_imag = -tile_imag
+            else:
+                tile_offset = (
+                    L_base
+                    + rows_k[:, None] * stride_L_row
+                    + rows_m[None, :] * stride_L_col
+                )
+                tile_real = tl.trans(
+                    tl.load(
+                        L_ptr + tile_offset,
+                        mask=rows_m_mask[None, :],
+                        other=0.0,
+                    )
+                )
+                tile_imag = tl.trans(
+                    tl.load(
+                        L_ptr + tile_offset + 1,
+                        mask=rows_m_mask[None, :],
+                        other=0.0,
+                    )
+                )
+            if storage_conj == upper:
+                tile_imag = -tile_imag
+
+            if USE_PACKED_DOT:
+                pack_cols = tl.arange(0, PACK_SIZE)
+                packed_w = tl.where(
+                    pack_cols[None, :] == 0,
+                    w_real[:, None],
+                    tl.where(
+                        pack_cols[None, :] == 1,
+                        w_imag[:, None],
+                        0.0,
+                    ),
+                )
+                if IS_DOUBLE:
+                    product_real = tl.dot(tile_real, packed_w)
+                    product_imag = tl.dot(tile_imag, packed_w)
+                else:
+                    product_real = tl.dot(
+                        tile_real, packed_w, input_precision="tf32x3"
+                    )
+                    product_imag = tl.dot(
+                        tile_imag, packed_w, input_precision="tf32x3"
+                    )
+                update_real = tl.sum(
+                    tl.where(
+                        pack_cols[None, :] == 0,
+                        product_real,
+                        0.0,
+                    )
+                    - tl.where(
+                        pack_cols[None, :] == 1,
+                        product_imag,
+                        0.0,
+                    ),
+                    axis=1,
+                )
+                update_imag = tl.sum(
+                    tl.where(
+                        pack_cols[None, :] == 1,
+                        product_real,
+                        0.0,
+                    )
+                    + tl.where(
+                        pack_cols[None, :] == 0,
+                        product_imag,
+                        0.0,
+                    ),
+                    axis=1,
+                )
+            else:
                 update_real = tl.sum(
                     tile_real * w_real[None, :]
                     - tile_imag * w_imag[None, :],
@@ -985,34 +1098,6 @@ def cholesky_solve_complex_single_rhs_blocked_kernel(
                     tile_real * w_imag[None, :]
                     + tile_imag * w_real[None, :],
                     axis=1,
-                )
-            else:
-                tile_offset = (
-                    L_base
-                    + rows_k[:, None] * stride_L_row
-                    + rows_m[None, :] * stride_L_col
-                )
-                tile_real = tl.load(
-                    L_ptr + tile_offset,
-                    mask=rows_m_mask[None, :],
-                    other=0.0,
-                )
-                tile_imag = tl.load(
-                    L_ptr + tile_offset + 1,
-                    mask=rows_m_mask[None, :],
-                    other=0.0,
-                )
-                if storage_conj == upper:
-                    tile_imag = -tile_imag
-                update_real = tl.sum(
-                    tile_real * w_real[:, None]
-                    - tile_imag * w_imag[:, None],
-                    axis=0,
-                )
-                update_imag = tl.sum(
-                    tile_real * w_imag[:, None]
-                    + tile_imag * w_real[:, None],
-                    axis=0,
                 )
             head_offset = B_base + rows_m * stride_B_row
             head_real = tl.load(
@@ -2305,23 +2390,30 @@ def _get_complex_blocked_launch_config(dtype, N):
 def _get_complex_single_rhs_launch_config(dtype, N):
     """Return configs for complex blocked single-RHS solves.
 
-    All dtypes use 32-row diagonal blocks. This mirrors the measured real
-    single-RHS winners and halves complex128's serial block/barrier count.
-    complex64 uses a 64-row panel at N=64 and N=256; N=128 keeps the lower
-    register-pressure 32-row panel that is already competitive with Torch.
+    N >= 128 packs the real and imaginary vectors into two columns of a
+    4/8-column dot operand. Two matrix products then produce all four terms of
+    the complex MatVec, replacing four scalar reduction streams with MMA. N=64
+    keeps the lower-overhead scalar path, which already beats Torch.
     """
     if dtype == torch.complex128:
         return {
             "BLOCK_K": 32,
             "BLOCK_M": 32,
+            "USE_PACKED_DOT": N >= 128,
+            "PACK_SIZE": 8,
+            "IS_DOUBLE": True,
             "num_warps": 4,
             "num_stages": 1,
         }
+    use_packed_dot = N >= 128
     return {
         "BLOCK_K": 32,
         "BLOCK_M": 32 if N == 128 else 64,
-        "num_warps": 2,
-        "num_stages": 1,
+        "USE_PACKED_DOT": use_packed_dot,
+        "PACK_SIZE": 4,
+        "IS_DOUBLE": False,
+        "num_warps": 4 if use_packed_dot else 2,
+        "num_stages": 2 if use_packed_dot else 1,
     }
 
 
