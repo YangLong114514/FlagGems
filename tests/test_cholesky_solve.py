@@ -227,7 +227,7 @@ def test_cholesky_solve_blocked_single_rhs(shape, dtype, upper):
 
 @pytest.mark.cholesky_solve
 @pytest.mark.skipif(not IS_ASCEND, reason="Ascend-specific small-N layout path")
-@pytest.mark.parametrize("batch_size", [16, 64, 256])
+@pytest.mark.parametrize("batch_size", [64, 256])
 def test_cholesky_solve_ascend_batched_small_lower_single_rhs(batch_size):
     dtype = torch.float32
     A, factor, rhs = _make_cholesky_solve_inputs((batch_size, 16, 1), dtype)

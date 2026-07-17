@@ -738,12 +738,13 @@ def cholesky_solve(B, L, upper=False):
     # torch.linalg.cholesky commonly returns a transpose-contiguous factor.
     # Reinterpret that storage through an mT view and flip the triangular
     # orientation instead of materializing an F-to-C layout conversion.
-    # The batched small-N lower single-RHS kernel is an exception: on Ascend,
-    # its row-contiguous lower specialization is faster even after paying for
-    # the layout conversion.
+    # The large-batch small-N lower single-RHS kernel is an exception: on
+    # Ascend, its row-contiguous lower specialization is faster even after
+    # paying for the layout conversion. Small batches retain the zero-copy
+    # effective-upper path because the conversion cost is not recovered.
     keep_small_batched_lower = (
         not upper
-        and batch_size > 1
+        and batch_size >= 64
         and nrhs == 1
         and _can_use_small_gather_path(N, nrhs)
     )
