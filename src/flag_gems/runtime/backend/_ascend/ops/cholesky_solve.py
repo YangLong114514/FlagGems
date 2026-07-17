@@ -18,9 +18,6 @@ import torch
 import triton
 import triton.language as tl
 import triton.experimental.tle as tle
-from triton.language.extra.cann.extension.aux_ops import (
-    sync_block_all as ascend_sync_block_all,
-)
 
 from flag_gems import runtime
 from flag_gems.runtime import torch_device_fn
@@ -667,141 +664,6 @@ def cholesky_solve_single_rhs_blocked_kernel(
 
 
 # ---------------------------------------------------------------------------
-# Persistent multi-core single-RHS kernel (batch=1, 128 <= N <= 256)
-# ---------------------------------------------------------------------------
-
-@libentry()
-@triton.jit
-def cholesky_solve_single_rhs_wavefront_kernel(
-    L_ptr,
-    B_ptr,
-    X_ptr,
-    stride_L,
-    stride_B,
-    BLOCK_K: tl.constexpr,
-    NUM_BLOCKS: tl.constexpr,
-    upper: tl.constexpr,
-):
-    """Persistent 910B Vector-Core wavefront for one linear system.
-
-    One program owns one BLOCK_K-row state block.  The diagonal owner solves
-    its block, publishes it through X, and all later (or earlier in the
-    backward phase) owners update their disjoint state blocks concurrently.
-    Forty programs are launched so every physical 910B Vector Core reaches
-    each all-vector barrier, while only NUM_BLOCKS programs perform work.
-    """
-    block_pid = ext.program_id(0)
-    offsets = tl.arange(0, BLOCK_K)
-    active = block_pid < NUM_BLOCKS
-    rows = block_pid * BLOCK_K + offsets
-
-    state = tl.load(
-        B_ptr + rows * stride_B,
-        mask=active,
-        other=0.0,
-    )
-    diag = tl.load(
-        L_ptr + rows * stride_L + rows,
-        mask=active,
-        other=1.0,
-    )
-    inv_diag = 1.0 / diag
-    inv_diag = inv_diag * (2.0 - diag * inv_diag)
-
-    # Forward blocked solve.  Event IDs [0, NUM_BLOCKS) publish each solved
-    # diagonal block before the independent destination blocks consume it.
-    for block_k in tl.static_range(0, NUM_BLOCKS):
-        rows_k = block_k * BLOCK_K + offsets
-        if block_pid == block_k:
-            solved = state * inv_diag
-            for i in tl.static_range(0, BLOCK_K):
-                if upper:
-                    factor_col = tl.load(
-                        L_ptr + (block_k * BLOCK_K + i) * stride_L + rows,
-                        mask=offsets > i,
-                        other=0.0,
-                    )
-                else:
-                    factor_col = tl.load(
-                        L_ptr + rows * stride_L + block_k * BLOCK_K + i,
-                        mask=offsets > i,
-                        other=0.0,
-                    )
-                pivot = tle.dsa.extract_element(solved, (i,))
-                solved = solved - (factor_col * inv_diag) * pivot
-            state = solved
-            tl.store(X_ptr + rows * stride_B, state)
-
-        # The direct-HIR API currently lowers ALL_VECTOR with PIPE_ALL, while
-        # 910B BiSheng requires PIPE_MTE3.  The custom-op compatibility path
-        # performs the required PIPE_MTE3 lowering in TritonToHIVM.
-        ascend_sync_block_all("all_vector", block_k)
-
-        if active & (block_pid > block_k):
-            solved_k = tl.load(X_ptr + rows_k * stride_B)
-            if upper:
-                factor_panel = tl.load(
-                    L_ptr
-                    + rows_k[:, None] * stride_L
-                    + rows[None, :]
-                )
-                update = tl.sum(factor_panel * solved_k[:, None], axis=0)
-            else:
-                factor_panel = tl.load(
-                    L_ptr
-                    + rows[:, None] * stride_L
-                    + rows_k[None, :]
-                )
-                update = tl.sum(factor_panel * solved_k[None, :], axis=1)
-            state = state - update
-
-    # Backward blocked solve.  Use the remaining event IDs so N=256 consumes
-    # exactly the supported range [0, 15] without reusing an in-flight event.
-    for reverse_idx in tl.static_range(0, NUM_BLOCKS):
-        block_k = NUM_BLOCKS - 1 - reverse_idx
-        rows_k = block_k * BLOCK_K + offsets
-        if block_pid == block_k:
-            solved = state * inv_diag
-            for reverse_i in tl.static_range(0, BLOCK_K):
-                i = BLOCK_K - 1 - reverse_i
-                if upper:
-                    factor_row = tl.load(
-                        L_ptr + rows * stride_L + block_k * BLOCK_K + i,
-                        mask=offsets < i,
-                        other=0.0,
-                    )
-                else:
-                    factor_row = tl.load(
-                        L_ptr + (block_k * BLOCK_K + i) * stride_L + rows,
-                        mask=offsets < i,
-                        other=0.0,
-                    )
-                pivot = tle.dsa.extract_element(solved, (i,))
-                solved = solved - (factor_row * inv_diag) * pivot
-            state = solved
-            tl.store(X_ptr + rows * stride_B, state)
-
-        ascend_sync_block_all("all_vector", NUM_BLOCKS + reverse_idx)
-
-        if active & (block_pid < block_k):
-            solved_k = tl.load(X_ptr + rows_k * stride_B)
-            if upper:
-                factor_panel = tl.load(
-                    L_ptr
-                    + rows[:, None] * stride_L
-                    + rows_k[None, :]
-                )
-            else:
-                factor_panel = tl.load(
-                    L_ptr
-                    + rows_k[None, :] * stride_L
-                    + rows[:, None]
-                )
-            update = tl.sum(factor_panel * solved_k[None, :], axis=1)
-            state = state - update
-
-
-# ---------------------------------------------------------------------------
 # Single-RHS scalar kernel
 # ---------------------------------------------------------------------------
 
@@ -1031,20 +893,6 @@ def _can_use_full_vector_single_rhs_path(N, nrhs):
     return nrhs == 1 and N <= 32
 
 
-_ASCEND_910B_VECTOR_CORES = 40
-
-
-def _can_use_wavefront_single_rhs_path(N, nrhs, batch_size):
-    # sync_block_all requires every physical Vector Core to participate, so
-    # this path is restricted to one system and at most eight 32-row blocks.
-    return (
-        batch_size == 1
-        and nrhs == 1
-        and 128 <= N <= 256
-        and N % 32 == 0
-    )
-
-
 def _can_use_blocked_single_rhs_path(N, nrhs):
     return nrhs == 1 and N >= 64 and N % 32 == 0
 
@@ -1098,7 +946,6 @@ def cholesky_solve(B, L, upper=False):
 
     Dispatch rules (based on what works on Ascend 910B):
       - N <= 32, nrhs <= 8          → register-resident small gather kernel
-      - batch=1, nrhs=1, N=128..256 → multi-core persistent wavefront
       - nrhs == 1, regular N >= 64  → blocked single-RHS matvec kernel
       - other nrhs == 1             → scalar single-RHS kernel
       - nrhs >= 4, N >= 64, N%32==0 → blocked kernel (tl.dot accelerated)
@@ -1213,18 +1060,7 @@ def cholesky_solve(B, L, upper=False):
                 upper=effective_upper,
                 num_warps=2 if N <= 32 else 4, num_stages=1,
             )
-        # Path 2: one persistent program per block, synchronized across all
-        # 910B Vector Cores.  Only safe for a single system per launch.
-        elif _can_use_wavefront_single_rhs_path(N, nrhs, batch_size):
-            cholesky_solve_single_rhs_wavefront_kernel[
-                (_ASCEND_910B_VECTOR_CORES,)
-            ](
-                L_kernel, B_kernel, X_kernel, stride_L, stride_B,
-                BLOCK_K=32, NUM_BLOCKS=N // 32,
-                upper=effective_upper,
-                num_warps=4, num_stages=1,
-            )
-        # Path 3: small multi-RHS gather kernel (N<=32, nrhs<=8)
+        # Path 2: small multi-RHS gather kernel (N<=32, nrhs<=8)
         elif _can_use_small_gather_path(N, nrhs):
             block_n = triton.next_power_of_2(N)
             block_rhs = triton.next_power_of_2(nrhs)
@@ -1235,7 +1071,7 @@ def cholesky_solve(B, L, upper=False):
                 dtype_flag=0, upper=effective_upper,
                 num_warps=2, num_stages=1,
             )
-        # Path 4: regular large single RHS → blocked matvec kernel
+        # Path 3: regular large single RHS → blocked matvec kernel
         elif _can_use_blocked_single_rhs_path(N, nrhs):
             single_rhs_config = _get_ascend_single_rhs_config()
             cholesky_solve_single_rhs_blocked_kernel[(batch_size,)](
@@ -1244,14 +1080,14 @@ def cholesky_solve(B, L, upper=False):
                 dtype_flag=dtype_flag, upper=effective_upper,
                 **single_rhs_config,
             )
-        # Path 5: irregular large single RHS → scalar kernel
+        # Path 4: irregular large single RHS → scalar kernel
         elif nrhs == 1:
             cholesky_solve_single_rhs_kernel[(batch_size,)](
                 L_kernel, B_kernel, X_kernel, N,
                 batch_stride_L, batch_stride_B, stride_L, stride_B,
                 dtype_flag=dtype_flag, upper=effective_upper,
             )
-        # Path 6: blocked multi-RHS (tl.dot accelerated, nrhs>=4 required for alignment)
+        # Path 5: blocked multi-RHS (tl.dot accelerated, nrhs>=4 required for alignment)
         elif not effective_upper and N >= 64 and N % 32 == 0 and nrhs >= 4:
             blk_k, blk_m, blk_rhs = _get_ascend_tile_config(B.dtype)
             warp = _get_ascend_warp_config(B.dtype)
@@ -1272,7 +1108,7 @@ def cholesky_solve(B, L, upper=False):
                 BLOCK_K=blk_k, BLOCK_M=blk_m, BLOCK_RHS=blk_rhs,
                 dtype_flag=dtype_flag, **warp,
             )
-        # Path 7: general scalar vectorized kernel (any N, any nrhs)
+        # Path 6: general scalar vectorized kernel (any N, any nrhs)
         else:
             blk_rhs = min(nrhs, 16)
             grid = (batch_size, triton.cdiv(nrhs, blk_rhs))
