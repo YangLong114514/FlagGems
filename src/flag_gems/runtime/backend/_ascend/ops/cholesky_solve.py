@@ -936,6 +936,23 @@ def _get_ascend_single_rhs_config():
     }
 
 
+def _get_ascend_padded_single_rhs_config(N):
+    """Return the padded-dot config for one RHS on Ascend 910B.
+
+    Wider panels reduce the number of serial Cube updates for N >= 128.
+    Keep one pipeline stage there so the larger factor and output tiles do
+    not multiply their UB footprint through automatic multi-buffering.
+    """
+    use_wide_panel = N >= 128
+    return {
+        "BLOCK_K": 32,
+        "BLOCK_M": 64 if use_wide_panel else 32,
+        "BLOCK_RHS": 16,
+        "num_warps": 4,
+        "num_stages": 1 if use_wide_panel else 3,
+    }
+
+
 # ---------------------------------------------------------------------------
 # Main dispatch function for Ascend
 # ---------------------------------------------------------------------------
@@ -1076,22 +1093,20 @@ def cholesky_solve(B, L, upper=False):
         # updates run on the Cube path.  The masked RHS lanes remain zero and
         # are never written back to the compact input/output tensors.
         elif _can_use_blocked_single_rhs_path(N, nrhs):
-            blk_k, blk_m, blk_rhs = _get_ascend_tile_config(B.dtype)
-            warp = _get_ascend_warp_config(B.dtype)
+            padded_config = _get_ascend_padded_single_rhs_config(N)
             grid = (batch_size, 1)
             if effective_upper:
                 cholesky_solve_blocked_upper_kernel[grid](
                     L_kernel, B_kernel, X_kernel, N, nrhs,
                     batch_stride_L, batch_stride_B, stride_L, stride_B,
-                    BLOCK_K=blk_k, BLOCK_M=blk_m, BLOCK_RHS=blk_rhs,
-                    dtype_flag=dtype_flag, **warp,
+                    dtype_flag=dtype_flag, **padded_config,
                 )
             else:
                 cholesky_solve_blocked_lower_kernel[grid](
                     L_kernel, B_kernel, X_kernel, N, nrhs,
                     batch_stride_L, batch_stride_B, stride_L, stride_B,
-                    BLOCK_K=blk_k, BLOCK_M=blk_m, BLOCK_RHS=blk_rhs,
-                    dtype_flag=dtype_flag, PRELOAD_DIAG=False, **warp,
+                    dtype_flag=dtype_flag, PRELOAD_DIAG=False,
+                    **padded_config,
                 )
         # Path 4: irregular large single RHS → scalar kernel
         elif nrhs == 1:
