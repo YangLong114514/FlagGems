@@ -562,21 +562,45 @@ def cholesky_solve_single_rhs_blocked_kernel(
         # it as [BLOCK_K, 1] can widen the one-element inner dimension to the
         # vector alignment and consume substantially more UB space.
         w = y_block * inv_diag_block
-        for i in range(BLOCK_K):
-            if upper:
+        if upper:
+            for i in range(BLOCK_K):
                 factor_col = tl.load(
                     L_ptr + L_base + (k + i) * stride_L + rows_k,
                     mask=k_offsets > i,
                     other=0.0,
                 )
-            else:
-                factor_col = tl.load(
-                    L_ptr + L_base + rows_k * stride_L + (k + i),
-                    mask=k_offsets > i,
+                w_i = tle.dsa.extract_element(w, (i,))
+                w = w - (factor_col * inv_diag_block) * w_i
+        else:
+            # Column gathers from a row-major diagonal block are expensive,
+            # and slicing a full cached tile at column ``i`` gives an
+            # unaligned UB base for most pivots.  Load eight adjacent columns
+            # per row (exactly 32 bytes), transpose the small tile in UB, and
+            # consume eight aligned contiguous rows instead.
+            group_offsets = tl.arange(0, 8)
+            for group_start in range(0, BLOCK_K, 8):
+                group_cols = group_start + group_offsets
+                factor_group = tl.load(
+                    L_ptr
+                    + L_base
+                    + rows_k[:, None] * stride_L
+                    + (k + group_cols)[None, :],
+                    mask=k_offsets[:, None] > group_cols[None, :],
                     other=0.0,
                 )
-            w_i = tle.dsa.extract_element(w, (i,))
-            w = w - (factor_col * inv_diag_block) * w_i
+                factor_group = tl.reshape(
+                    tl.trans(factor_group), (8 * BLOCK_K,)
+                )
+                for group_i in range(8):
+                    i = group_start + group_i
+                    factor_col = tle.dsa.extract_slice(
+                        factor_group,
+                        offsets=(group_i * BLOCK_K,),
+                        sizes=(BLOCK_K,),
+                        strides=(1,),
+                    )
+                    w_i = tle.dsa.extract_element(w, (i,))
+                    w = w - (factor_col * inv_diag_block) * w_i
 
         tl.store(X_ptr + B_base + rows_k * stride_B, w)
 
@@ -624,21 +648,40 @@ def cholesky_solve_single_rhs_blocked_kernel(
             )
 
         w = x_block * inv_diag_block
-        for ii in range(BLOCK_K - 1, -1, -1):
-            if upper:
-                factor_row = tl.load(
-                    L_ptr + L_base + rows_k * stride_L + (k + ii),
-                    mask=k_offsets < ii,
+        if upper:
+            group_offsets = tl.arange(0, 8)
+            for group_start in range(BLOCK_K - 8, -1, -8):
+                group_cols = group_start + group_offsets
+                factor_group = tl.load(
+                    L_ptr
+                    + L_base
+                    + rows_k[:, None] * stride_L
+                    + (k + group_cols)[None, :],
+                    mask=k_offsets[:, None] < group_cols[None, :],
                     other=0.0,
                 )
-            else:
+                factor_group = tl.reshape(
+                    tl.trans(factor_group), (8 * BLOCK_K,)
+                )
+                for group_i in range(7, -1, -1):
+                    ii = group_start + group_i
+                    factor_row = tle.dsa.extract_slice(
+                        factor_group,
+                        offsets=(group_i * BLOCK_K,),
+                        sizes=(BLOCK_K,),
+                        strides=(1,),
+                    )
+                    w_i = tle.dsa.extract_element(w, (ii,))
+                    w = w - (factor_row * inv_diag_block) * w_i
+        else:
+            for ii in range(BLOCK_K - 1, -1, -1):
                 factor_row = tl.load(
                     L_ptr + L_base + (k + ii) * stride_L + rows_k,
                     mask=k_offsets < ii,
                     other=0.0,
                 )
-            w_i = tle.dsa.extract_element(w, (ii,))
-            w = w - (factor_row * inv_diag_block) * w_i
+                w_i = tle.dsa.extract_element(w, (ii,))
+                w = w - (factor_row * inv_diag_block) * w_i
 
         tl.store(X_ptr + B_base + rows_k * stride_B, w)
 
