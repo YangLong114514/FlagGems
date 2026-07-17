@@ -580,11 +580,6 @@ def cholesky_solve_single_rhs_blocked_kernel(
 
         tl.store(X_ptr + B_base + rows_k * stride_B, w)
 
-        # Keep the dependent triangular solve as a compact 1-D vector, but
-        # hand the independent panel update to Cube.  The Ascend hint avoids
-        # widening the logical [BLOCK_K, 1] operand to an 8-lane UB tile.
-        w_dot = w[:, None]
-        tle.dsa.ascend.compile_hint(w_dot, "mayDiscretememaccess")
         for m in range(k + BLOCK_K, N, BLOCK_M):
             rows_m = m + m_offsets
             if upper:
@@ -594,7 +589,9 @@ def cholesky_solve_single_rhs_blocked_kernel(
                     + rows_k[:, None] * stride_L
                     + rows_m[None, :]
                 )
-                factor_panel = tl.trans(factor_panel)
+                update = tl.sum(
+                    factor_panel * w[:, None], axis=0
+                )
             else:
                 factor_panel = tl.load(
                     L_ptr
@@ -602,8 +599,9 @@ def cholesky_solve_single_rhs_blocked_kernel(
                     + rows_m[:, None] * stride_L
                     + rows_k[None, :]
                 )
-            update = tl.dot(factor_panel, w_dot)
-            update = tl.reshape(update, (BLOCK_M,))
+                update = tl.sum(
+                    factor_panel * w[None, :], axis=1
+                )
             if k == 0:
                 tail = tl.load(B_ptr + B_base + rows_m * stride_B)
             else:
@@ -644,8 +642,6 @@ def cholesky_solve_single_rhs_blocked_kernel(
 
         tl.store(X_ptr + B_base + rows_k * stride_B, w)
 
-        w_dot = w[:, None]
-        tle.dsa.ascend.compile_hint(w_dot, "mayDiscretememaccess")
         for m in range(0, k, BLOCK_M):
             rows_m = m + m_offsets
             if upper:
@@ -663,8 +659,7 @@ def cholesky_solve_single_rhs_blocked_kernel(
                     + rows_m[:, None]
                 )
             head = tl.load(X_ptr + B_base + rows_m * stride_B)
-            update = tl.dot(factor_panel, w_dot)
-            update = tl.reshape(update, (BLOCK_M,))
+            update = tl.sum(factor_panel * w[None, :], axis=1)
             tl.store(X_ptr + B_base + rows_m * stride_B, head - update)
 
 
@@ -951,7 +946,7 @@ def cholesky_solve(B, L, upper=False):
 
     Dispatch rules (based on what works on Ascend 910B):
       - N <= 32, nrhs <= 8          → register-resident small gather kernel
-      - nrhs == 1, regular N >= 64  → blocked single-RHS Cube-panel kernel
+      - nrhs == 1, regular N >= 64  → padded blocked tl.dot kernel
       - other nrhs == 1             → scalar single-RHS kernel
       - nrhs >= 4, N >= 64, N%32==0 → blocked kernel (tl.dot accelerated)
       - otherwise                   → scalar vectorized kernel
@@ -1076,16 +1071,28 @@ def cholesky_solve(B, L, upper=False):
                 dtype_flag=0, upper=effective_upper,
                 num_warps=2, num_stages=1,
             )
-        # Path 3: regular large single RHS → compact diagonal solve with
-        # Cube-accelerated panel updates.
+        # Path 3: regular large single RHS → padded tl.dot kernel.  Although
+        # only column zero is active, the fixed 16-column tile lets panel
+        # updates run on the Cube path.  The masked RHS lanes remain zero and
+        # are never written back to the compact input/output tensors.
         elif _can_use_blocked_single_rhs_path(N, nrhs):
-            single_rhs_config = _get_ascend_single_rhs_config()
-            cholesky_solve_single_rhs_blocked_kernel[(batch_size,)](
-                L_kernel, B_kernel, X_kernel, N,
-                batch_stride_L, batch_stride_B, stride_L, stride_B,
-                dtype_flag=dtype_flag, upper=effective_upper,
-                **single_rhs_config,
-            )
+            blk_k, blk_m, blk_rhs = _get_ascend_tile_config(B.dtype)
+            warp = _get_ascend_warp_config(B.dtype)
+            grid = (batch_size, 1)
+            if effective_upper:
+                cholesky_solve_blocked_upper_kernel[grid](
+                    L_kernel, B_kernel, X_kernel, N, nrhs,
+                    batch_stride_L, batch_stride_B, stride_L, stride_B,
+                    BLOCK_K=blk_k, BLOCK_M=blk_m, BLOCK_RHS=blk_rhs,
+                    dtype_flag=dtype_flag, **warp,
+                )
+            else:
+                cholesky_solve_blocked_lower_kernel[grid](
+                    L_kernel, B_kernel, X_kernel, N, nrhs,
+                    batch_stride_L, batch_stride_B, stride_L, stride_B,
+                    BLOCK_K=blk_k, BLOCK_M=blk_m, BLOCK_RHS=blk_rhs,
+                    dtype_flag=dtype_flag, PRELOAD_DIAG=False, **warp,
+                )
         # Path 4: irregular large single RHS → scalar kernel
         elif nrhs == 1:
             cholesky_solve_single_rhs_kernel[(batch_size,)](
