@@ -723,7 +723,7 @@ def cholesky_solve_single_rhs_kernel(
 
 
 # ---------------------------------------------------------------------------
-# Full-vector single-RHS kernel (N <= 128)
+# Full-vector single-RHS kernel (N <= 32)
 # ---------------------------------------------------------------------------
 
 @libentry()
@@ -888,7 +888,9 @@ def _can_use_small_gather_path(N, nrhs):
 
 
 def _can_use_full_vector_single_rhs_path(N, nrhs):
-    return nrhs == 1 and N <= 128
+    # N=64/128 suffer from a long full-width dependency chain and UB traffic;
+    # the blocked kernel is substantially faster for those sizes.
+    return nrhs == 1 and N <= 32
 
 
 def _can_use_blocked_single_rhs_path(N, nrhs):
