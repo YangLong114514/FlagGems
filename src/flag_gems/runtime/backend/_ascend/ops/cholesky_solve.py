@@ -18,6 +18,9 @@ import torch
 import triton
 import triton.language as tl
 import triton.experimental.tle as tle
+from triton.language.extra.cann.extension.aux_ops import (
+    sync_block_all as ascend_sync_block_all,
+)
 
 from flag_gems import runtime
 from flag_gems.runtime import torch_device_fn
@@ -729,7 +732,10 @@ def cholesky_solve_single_rhs_wavefront_kernel(
             state = solved
             tl.store(X_ptr + rows * stride_B, state)
 
-        tle.dsa.ascend.sync_block_all("all_vector", block_k)
+        # The direct-HIR API currently lowers ALL_VECTOR with PIPE_ALL, while
+        # 910B BiSheng requires PIPE_MTE3.  The custom-op compatibility path
+        # performs the required PIPE_MTE3 lowering in TritonToHIVM.
+        ascend_sync_block_all("all_vector", block_k)
 
         if active & (block_pid > block_k):
             solved_k = tl.load(X_ptr + rows_k * stride_B)
@@ -775,9 +781,7 @@ def cholesky_solve_single_rhs_wavefront_kernel(
             state = solved
             tl.store(X_ptr + rows * stride_B, state)
 
-        tle.dsa.ascend.sync_block_all(
-            "all_vector", NUM_BLOCKS + reverse_idx
-        )
+        ascend_sync_block_all("all_vector", NUM_BLOCKS + reverse_idx)
 
         if active & (block_pid < block_k):
             solved_k = tl.load(X_ptr + rows_k * stride_B)
