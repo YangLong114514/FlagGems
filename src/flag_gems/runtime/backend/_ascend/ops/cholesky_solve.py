@@ -531,7 +531,8 @@ def cholesky_solve_single_rhs_blocked_kernel(
     dependent pivot is a DSA row extraction followed by one vector rank-1
     update. Off-diagonal panels use matvec reductions instead of padding the
     single RHS into a matrix-multiply tile. Dispatch guarantees that N is a
-    multiple of both BLOCK_K and BLOCK_M, so panel loads need no tail masks.
+    multiple of BLOCK_K.  A dedicated BLOCK_K-wide tail handles odd panel
+    groups, so panel loads need no masks even when BLOCK_M is wider.
     """
     batch_pid = ext.program_id(0)
 
@@ -580,9 +581,10 @@ def cholesky_solve_single_rhs_blocked_kernel(
 
         tl.store(X_ptr + B_base + rows_k * stride_B, w)
 
-        # Panels update disjoint destination rows and can be scheduled
-        # independently by the Ascend DSA pipeline.
-        for m in tle.dsa.parallel(k + BLOCK_K, N, BLOCK_M):
+        # Combine adjacent 32-row panels into a wider vector operation.  The
+        # loop only emits complete BLOCK_M tiles; a possible BLOCK_K tail is
+        # handled separately below without masked or redundant computation.
+        for m in range(k + BLOCK_K, N - BLOCK_M + 1, BLOCK_M):
             rows_m = m + m_offsets
             if upper:
                 factor_panel = tl.load(
@@ -604,6 +606,30 @@ def cholesky_solve_single_rhs_blocked_kernel(
                 update = tl.sum(
                     factor_panel * w[None, :], axis=1
                 )
+            if k == 0:
+                tail = tl.load(B_ptr + B_base + rows_m * stride_B)
+            else:
+                tail = tl.load(X_ptr + B_base + rows_m * stride_B)
+            tl.store(X_ptr + B_base + rows_m * stride_B, tail - update)
+
+        if (N - k - BLOCK_K) % BLOCK_M != 0:
+            rows_m = N - BLOCK_K + k_offsets
+            if upper:
+                factor_panel = tl.load(
+                    L_ptr
+                    + L_base
+                    + rows_k[:, None] * stride_L
+                    + rows_m[None, :]
+                )
+                update = tl.sum(factor_panel * w[:, None], axis=0)
+            else:
+                factor_panel = tl.load(
+                    L_ptr
+                    + L_base
+                    + rows_m[:, None] * stride_L
+                    + rows_k[None, :]
+                )
+                update = tl.sum(factor_panel * w[None, :], axis=1)
             if k == 0:
                 tail = tl.load(B_ptr + B_base + rows_m * stride_B)
             else:
@@ -644,10 +670,28 @@ def cholesky_solve_single_rhs_blocked_kernel(
 
         tl.store(X_ptr + B_base + rows_k * stride_B, w)
 
-        # The head panels are likewise independent until the next diagonal
-        # block is consumed.
-        for m in tle.dsa.parallel(0, k, BLOCK_M):
+        for m in range(0, k - BLOCK_M + 1, BLOCK_M):
             rows_m = m + m_offsets
+            if upper:
+                factor_panel = tl.load(
+                    L_ptr
+                    + L_base
+                    + rows_m[:, None] * stride_L
+                    + rows_k[None, :]
+                )
+            else:
+                factor_panel = tl.load(
+                    L_ptr
+                    + L_base
+                    + rows_k[None, :] * stride_L
+                    + rows_m[:, None]
+                )
+            head = tl.load(X_ptr + B_base + rows_m * stride_B)
+            update = tl.sum(factor_panel * w[None, :], axis=1)
+            tl.store(X_ptr + B_base + rows_m * stride_B, head - update)
+
+        if k % BLOCK_M != 0:
+            rows_m = k - BLOCK_K + k_offsets
             if upper:
                 factor_panel = tl.load(
                     L_ptr
@@ -930,11 +974,11 @@ def _get_ascend_warp_config(dtype):
     return {"num_warps": 4, "num_stages": 3}
 
 
-def _get_ascend_single_rhs_config():
-    """Return the conservative 910B blocked single-RHS launch config."""
+def _get_ascend_single_rhs_config(N):
+    """Return the 910B blocked single-RHS launch config for a matrix size."""
     return {
         "BLOCK_K": 32,
-        "BLOCK_M": 32,
+        "BLOCK_M": 64 if N >= 128 else 32,
         "num_warps": 4,
         "num_stages": 1,
     }
@@ -1077,7 +1121,7 @@ def cholesky_solve(B, L, upper=False):
             )
         # Path 3: regular large single RHS → blocked matvec kernel
         elif _can_use_blocked_single_rhs_path(N, nrhs):
-            single_rhs_config = _get_ascend_single_rhs_config()
+            single_rhs_config = _get_ascend_single_rhs_config(N)
             cholesky_solve_single_rhs_blocked_kernel[(batch_size,)](
                 L_kernel, B_kernel, X_kernel, N,
                 batch_stride_L, batch_stride_B, stride_L, stride_B,
