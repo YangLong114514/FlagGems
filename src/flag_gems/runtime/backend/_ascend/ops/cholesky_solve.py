@@ -522,6 +522,7 @@ def cholesky_solve_single_rhs_blocked_kernel(
     stride_B,
     BLOCK_K: tl.constexpr,
     BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
     dtype_flag: tl.constexpr,
     upper: tl.constexpr,
 ):
@@ -539,6 +540,20 @@ def cholesky_solve_single_rhs_blocked_kernel(
     B_base = batch_pid * batch_stride_B
     k_offsets = tl.arange(0, BLOCK_K)
     m_offsets = tl.arange(0, BLOCK_M)
+    diag_offsets = tl.arange(0, BLOCK_N)
+
+    # The same diagonal reciprocals are used by both triangular solves.
+    # Compute the complete 1-D vector once and extract a BLOCK_K slice for
+    # each diagonal block.  At N=256 this occupies only 1 KiB of UB.
+    diag = tl.load(
+        L_ptr + L_base + diag_offsets * stride_L + diag_offsets,
+        mask=diag_offsets < N,
+        other=1.0,
+    )
+    inv_diag = 1.0 / diag
+    inv_diag = inv_diag * (2.0 - diag * inv_diag)
+    if dtype_flag == 1:
+        inv_diag = inv_diag * (2.0 - diag * inv_diag)
 
     # Forward blocked TRSM: L * Y = B or U^T * Y = B.
     for k in range(0, N, BLOCK_K):
@@ -548,15 +563,10 @@ def cholesky_solve_single_rhs_blocked_kernel(
         else:
             y_block = tl.load(X_ptr + B_base + rows_k * stride_B)
 
-        diag_block = tl.load(L_ptr + L_base + rows_k * stride_L + rows_k)
-        inv_diag_block = 1.0 / diag_block
-        inv_diag_block = inv_diag_block * (
-            2.0 - diag_block * inv_diag_block
+        inv_diag_block = tle.dsa.extract_slice(
+            inv_diag, (k,), (BLOCK_K,), (1,)
         )
-        if dtype_flag == 1:
-            inv_diag_block = inv_diag_block * (
-                2.0 - diag_block * inv_diag_block
-            )
+        tl.compile_hint(inv_diag_block, "disable_bubble_up")
 
         # Keep the single RHS as a true 1-D tensor.  On Ascend, representing
         # it as [BLOCK_K, 1] can widen the one-element inner dimension to the
@@ -580,9 +590,7 @@ def cholesky_solve_single_rhs_blocked_kernel(
 
         tl.store(X_ptr + B_base + rows_k * stride_B, w)
 
-        # Panels update disjoint destination rows and can be scheduled
-        # independently by the Ascend DSA pipeline.
-        for m in tle.dsa.parallel(k + BLOCK_K, N, BLOCK_M):
+        for m in range(k + BLOCK_K, N, BLOCK_M):
             rows_m = m + m_offsets
             if upper:
                 factor_panel = tl.load(
@@ -615,15 +623,10 @@ def cholesky_solve_single_rhs_blocked_kernel(
         rows_k = k + k_offsets
         x_block = tl.load(X_ptr + B_base + rows_k * stride_B)
 
-        diag_block = tl.load(L_ptr + L_base + rows_k * stride_L + rows_k)
-        inv_diag_block = 1.0 / diag_block
-        inv_diag_block = inv_diag_block * (
-            2.0 - diag_block * inv_diag_block
+        inv_diag_block = tle.dsa.extract_slice(
+            inv_diag, (k,), (BLOCK_K,), (1,)
         )
-        if dtype_flag == 1:
-            inv_diag_block = inv_diag_block * (
-                2.0 - diag_block * inv_diag_block
-            )
+        tl.compile_hint(inv_diag_block, "disable_bubble_up")
 
         w = x_block * inv_diag_block
         for ii in range(BLOCK_K - 1, -1, -1):
@@ -644,9 +647,7 @@ def cholesky_solve_single_rhs_blocked_kernel(
 
         tl.store(X_ptr + B_base + rows_k * stride_B, w)
 
-        # The head panels are likewise independent until the next diagonal
-        # block is consumed.
-        for m in tle.dsa.parallel(0, k, BLOCK_M):
+        for m in range(0, k, BLOCK_M):
             rows_m = m + m_offsets
             if upper:
                 factor_panel = tl.load(
@@ -1081,6 +1082,7 @@ def cholesky_solve(B, L, upper=False):
             cholesky_solve_single_rhs_blocked_kernel[(batch_size,)](
                 L_kernel, B_kernel, X_kernel, N,
                 batch_stride_L, batch_stride_B, stride_L, stride_B,
+                BLOCK_N=triton.next_power_of_2(N),
                 dtype_flag=dtype_flag, upper=effective_upper,
                 **single_rhs_config,
             )
