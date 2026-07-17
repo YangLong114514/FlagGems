@@ -506,6 +506,171 @@ def cholesky_solve_blocked_upper_kernel(
 
 
 # ---------------------------------------------------------------------------
+# Blocked single-RHS kernel (N >= 64, N % 32 == 0)
+# ---------------------------------------------------------------------------
+
+@libentry()
+@triton.jit
+def cholesky_solve_single_rhs_blocked_kernel(
+    L_ptr,
+    B_ptr,
+    X_ptr,
+    N: tl.constexpr,
+    batch_stride_L,
+    batch_stride_B,
+    stride_L,
+    stride_B,
+    BLOCK_K: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    dtype_flag: tl.constexpr,
+    upper: tl.constexpr,
+):
+    """Blocked single-RHS Cholesky solve for Ascend NPU.
+
+    The diagonal block stays pre-scaled by the reciprocal diagonal, so each
+    dependent pivot is a DSA row extraction followed by one vector rank-1
+    update. Off-diagonal panels use matvec reductions instead of padding the
+    single RHS into a matrix-multiply tile. Dispatch guarantees that N is a
+    multiple of both BLOCK_K and BLOCK_M, so panel loads need no tail masks.
+    """
+    batch_pid = ext.program_id(0)
+
+    L_base = batch_pid * batch_stride_L
+    B_base = batch_pid * batch_stride_B
+    k_offsets = tl.arange(0, BLOCK_K)
+    m_offsets = tl.arange(0, BLOCK_M)
+
+    # Forward blocked TRSM: L * Y = B or U^T * Y = B.
+    for k in range(0, N, BLOCK_K):
+        rows_k = k + k_offsets
+        if k == 0:
+            y_block = tl.load(B_ptr + B_base + rows_k * stride_B)
+        else:
+            y_block = tl.load(X_ptr + B_base + rows_k * stride_B)
+
+        diag_block = tl.load(L_ptr + L_base + rows_k * stride_L + rows_k)
+        inv_diag_block = 1.0 / diag_block
+        inv_diag_block = inv_diag_block * (
+            2.0 - diag_block * inv_diag_block
+        )
+        if dtype_flag == 1:
+            inv_diag_block = inv_diag_block * (
+                2.0 - diag_block * inv_diag_block
+            )
+
+        w = y_block[:, None] * inv_diag_block[:, None]
+        for i in range(BLOCK_K):
+            if upper:
+                factor_col = tl.load(
+                    L_ptr + L_base + (k + i) * stride_L + rows_k,
+                    mask=k_offsets > i,
+                    other=0.0,
+                )
+            else:
+                factor_col = tl.load(
+                    L_ptr + L_base + rows_k * stride_L + (k + i),
+                    mask=k_offsets > i,
+                    other=0.0,
+                )
+            w_i_2d = tle.dsa.extract_slice(w, (i, 0), (1, 1), (1, 1))
+            tl.compile_hint(w_i_2d, "disable_bubble_up")
+            w_i = tl.reshape(w_i_2d, (1,))
+            w = w - (
+                factor_col * inv_diag_block
+            )[:, None] * w_i[None, :]
+
+        w_vec = tl.reshape(w, (BLOCK_K,))
+        tl.store(X_ptr + B_base + rows_k * stride_B, w_vec)
+
+        for m in range(k + BLOCK_K, N, BLOCK_M):
+            rows_m = m + m_offsets
+            if upper:
+                factor_panel = tl.load(
+                    L_ptr
+                    + L_base
+                    + rows_k[:, None] * stride_L
+                    + rows_m[None, :]
+                )
+                update = tl.sum(
+                    factor_panel * w_vec[:, None], axis=0
+                )
+            else:
+                factor_panel = tl.load(
+                    L_ptr
+                    + L_base
+                    + rows_m[:, None] * stride_L
+                    + rows_k[None, :]
+                )
+                update = tl.sum(
+                    factor_panel * w_vec[None, :], axis=1
+                )
+            if k == 0:
+                tail = tl.load(B_ptr + B_base + rows_m * stride_B)
+            else:
+                tail = tl.load(X_ptr + B_base + rows_m * stride_B)
+            tl.store(X_ptr + B_base + rows_m * stride_B, tail - update)
+
+    # Backward blocked TRSM: L^T * X = Y or U * X = Y.
+    for k in range(N - BLOCK_K, -1, -BLOCK_K):
+        rows_k = k + k_offsets
+        x_block = tl.load(X_ptr + B_base + rows_k * stride_B)
+
+        diag_block = tl.load(L_ptr + L_base + rows_k * stride_L + rows_k)
+        inv_diag_block = 1.0 / diag_block
+        inv_diag_block = inv_diag_block * (
+            2.0 - diag_block * inv_diag_block
+        )
+        if dtype_flag == 1:
+            inv_diag_block = inv_diag_block * (
+                2.0 - diag_block * inv_diag_block
+            )
+
+        w = x_block[:, None] * inv_diag_block[:, None]
+        for ii in range(BLOCK_K - 1, -1, -1):
+            if upper:
+                factor_row = tl.load(
+                    L_ptr + L_base + rows_k * stride_L + (k + ii),
+                    mask=k_offsets < ii,
+                    other=0.0,
+                )
+            else:
+                factor_row = tl.load(
+                    L_ptr + L_base + (k + ii) * stride_L + rows_k,
+                    mask=k_offsets < ii,
+                    other=0.0,
+                )
+            w_i_2d = tle.dsa.extract_slice(w, (ii, 0), (1, 1), (1, 1))
+            tl.compile_hint(w_i_2d, "disable_bubble_up")
+            w_i = tl.reshape(w_i_2d, (1,))
+            w = w - (
+                factor_row * inv_diag_block
+            )[:, None] * w_i[None, :]
+
+        w_vec = tl.reshape(w, (BLOCK_K,))
+        tl.store(X_ptr + B_base + rows_k * stride_B, w_vec)
+
+        for m in range(0, k, BLOCK_M):
+            rows_m = m + m_offsets
+            if upper:
+                factor_panel = tl.load(
+                    L_ptr
+                    + L_base
+                    + rows_m[:, None] * stride_L
+                    + rows_k[None, :]
+                )
+            else:
+                factor_panel = tl.load(
+                    L_ptr
+                    + L_base
+                    + rows_k[None, :] * stride_L
+                    + rows_m[:, None]
+                )
+            head = tl.load(X_ptr + B_base + rows_m * stride_B)
+            update = tl.sum(factor_panel * w_vec[None, :], axis=1)
+            tl.store(X_ptr + B_base + rows_m * stride_B, head - update)
+
+
+# ---------------------------------------------------------------------------
 # Single-RHS scalar kernel
 # ---------------------------------------------------------------------------
 
@@ -641,6 +806,10 @@ def _can_use_small_gather_path(N, nrhs):
     return N <= 32 and nrhs <= 8
 
 
+def _can_use_blocked_single_rhs_path(N, nrhs):
+    return nrhs == 1 and N >= 64 and N % 32 == 0
+
+
 # ---------------------------------------------------------------------------
 # Dispatch helpers
 # ---------------------------------------------------------------------------
@@ -670,6 +839,16 @@ def _get_ascend_warp_config(dtype):
     return {"num_warps": 4, "num_stages": 3}
 
 
+def _get_ascend_single_rhs_config():
+    """Return the conservative 910B blocked single-RHS launch config."""
+    return {
+        "BLOCK_K": 32,
+        "BLOCK_M": 32,
+        "num_warps": 4,
+        "num_stages": 1,
+    }
+
+
 # ---------------------------------------------------------------------------
 # Main dispatch function for Ascend
 # ---------------------------------------------------------------------------
@@ -679,7 +858,9 @@ def cholesky_solve(B, L, upper=False):
     matrix using the Cholesky factorization on Ascend NPU.
 
     Dispatch rules (based on what works on Ascend 910B):
-      - nrhs == 1                   → scalar single-RHS kernel
+      - N <= 32, nrhs <= 8          → register-resident small gather kernel
+      - nrhs == 1, regular N >= 64  → blocked single-RHS matvec kernel
+      - other nrhs == 1             → scalar single-RHS kernel
       - nrhs >= 4, N >= 64, N%32==0 → blocked kernel (tl.dot accelerated)
       - otherwise                   → scalar vectorized kernel
 
@@ -793,14 +974,23 @@ def cholesky_solve(B, L, upper=False):
                 dtype_flag=0, upper=effective_upper,
                 num_warps=2, num_stages=1,
             )
-        # Path 2: single RHS → scalar kernel
+        # Path 2: regular medium/large single RHS → blocked matvec kernel
+        elif _can_use_blocked_single_rhs_path(N, nrhs):
+            single_rhs_config = _get_ascend_single_rhs_config()
+            cholesky_solve_single_rhs_blocked_kernel[(batch_size,)](
+                L_kernel, B_kernel, X_kernel, N,
+                batch_stride_L, batch_stride_B, stride_L, stride_B,
+                dtype_flag=dtype_flag, upper=effective_upper,
+                **single_rhs_config,
+            )
+        # Path 3: irregular single RHS → scalar kernel
         elif nrhs == 1:
             cholesky_solve_single_rhs_kernel[(batch_size,)](
                 L_kernel, B_kernel, X_kernel, N,
                 batch_stride_L, batch_stride_B, stride_L, stride_B,
                 dtype_flag=dtype_flag, upper=effective_upper,
             )
-        # Path 2: blocked multi-RHS (tl.dot accelerated, nrhs>=4 required for alignment)
+        # Path 4: blocked multi-RHS (tl.dot accelerated, nrhs>=4 required for alignment)
         elif not effective_upper and N >= 64 and N % 32 == 0 and nrhs >= 4:
             blk_k, blk_m, blk_rhs = _get_ascend_tile_config(B.dtype)
             warp = _get_ascend_warp_config(B.dtype)
