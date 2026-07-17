@@ -580,7 +580,9 @@ def cholesky_solve_single_rhs_blocked_kernel(
 
         tl.store(X_ptr + B_base + rows_k * stride_B, w)
 
-        for m in range(k + BLOCK_K, N, BLOCK_M):
+        # Panels update disjoint destination rows and can be scheduled
+        # independently by the Ascend DSA pipeline.
+        for m in tle.dsa.parallel(k + BLOCK_K, N, BLOCK_M):
             rows_m = m + m_offsets
             if upper:
                 factor_panel = tl.load(
@@ -642,7 +644,9 @@ def cholesky_solve_single_rhs_blocked_kernel(
 
         tl.store(X_ptr + B_base + rows_k * stride_B, w)
 
-        for m in range(0, k, BLOCK_M):
+        # The head panels are likewise independent until the next diagonal
+        # block is consumed.
+        for m in tle.dsa.parallel(0, k, BLOCK_M):
             rows_m = m + m_offsets
             if upper:
                 factor_panel = tl.load(
