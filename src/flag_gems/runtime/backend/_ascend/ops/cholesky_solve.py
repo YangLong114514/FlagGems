@@ -558,6 +558,25 @@ def cholesky_solve_single_rhs_blocked_kernel(
                 2.0 - diag_block * inv_diag_block
             )
 
+        # For a lower-triangular factor, forward substitution consumes
+        # columns of this diagonal block.  Loading every column separately
+        # gives GM accesses with ``stride_L`` between adjacent vector lanes.
+        # Stage the strictly-lower tile once as contiguous rows in UB, then
+        # extract each pivot column locally.  The upper path already loads
+        # contiguous rows here, so leave it unchanged.
+        if not upper:
+            forward_diag_tile = tl.load(
+                L_ptr
+                + L_base
+                + rows_k[:, None] * stride_L
+                + rows_k[None, :],
+                mask=k_offsets[:, None] > k_offsets[None, :],
+                other=0.0,
+            )
+            forward_diag_tile = tl.reshape(
+                forward_diag_tile, (BLOCK_K * BLOCK_K,)
+            )
+
         # Keep the single RHS as a true 1-D tensor.  On Ascend, representing
         # it as [BLOCK_K, 1] can widen the one-element inner dimension to the
         # vector alignment and consume substantially more UB space.
@@ -570,10 +589,11 @@ def cholesky_solve_single_rhs_blocked_kernel(
                     other=0.0,
                 )
             else:
-                factor_col = tl.load(
-                    L_ptr + L_base + rows_k * stride_L + (k + i),
-                    mask=k_offsets > i,
-                    other=0.0,
+                factor_col = tle.dsa.extract_slice(
+                    forward_diag_tile,
+                    offsets=(i,),
+                    sizes=(BLOCK_K,),
+                    strides=(BLOCK_K,),
                 )
             w_i = tle.dsa.extract_element(w, (i,))
             w = w - (factor_col * inv_diag_block) * w_i
@@ -623,13 +643,30 @@ def cholesky_solve_single_rhs_blocked_kernel(
                 2.0 - diag_block * inv_diag_block
             )
 
+        # Backward substitution for an upper-triangular factor has the
+        # symmetric strided-column access.  Cache only this phase's tile;
+        # the lower path below already reads contiguous rows.
+        if upper:
+            backward_diag_tile = tl.load(
+                L_ptr
+                + L_base
+                + rows_k[:, None] * stride_L
+                + rows_k[None, :],
+                mask=k_offsets[:, None] < k_offsets[None, :],
+                other=0.0,
+            )
+            backward_diag_tile = tl.reshape(
+                backward_diag_tile, (BLOCK_K * BLOCK_K,)
+            )
+
         w = x_block * inv_diag_block
         for ii in range(BLOCK_K - 1, -1, -1):
             if upper:
-                factor_row = tl.load(
-                    L_ptr + L_base + rows_k * stride_L + (k + ii),
-                    mask=k_offsets < ii,
-                    other=0.0,
+                factor_row = tle.dsa.extract_slice(
+                    backward_diag_tile,
+                    offsets=(ii,),
+                    sizes=(BLOCK_K,),
+                    strides=(BLOCK_K,),
                 )
             else:
                 factor_row = tl.load(
