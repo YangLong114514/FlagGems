@@ -226,6 +226,18 @@ def test_cholesky_solve_blocked_single_rhs(shape, dtype, upper):
 
 
 @pytest.mark.cholesky_solve
+@pytest.mark.skipif(not IS_ASCEND, reason="Ascend-specific small-N layout path")
+@pytest.mark.parametrize("batch_size", [16, 64, 256])
+def test_cholesky_solve_ascend_batched_small_lower_single_rhs(batch_size):
+    dtype = torch.float32
+    A, factor, rhs = _make_cholesky_solve_inputs((batch_size, 16, 1), dtype)
+
+    assert not factor.is_contiguous()
+    assert factor.mT.is_contiguous()
+    _assert_cholesky_solve_matches(A, factor, rhs, dtype, upper=False)
+
+
+@pytest.mark.cholesky_solve
 @pytest.mark.skipif(IS_ASCEND, reason="fp64 not supported on Ascend")
 @pytest.mark.parametrize("shape", CHOLESKY_SOLVE_FP64_BLOCKED_SHAPES)
 @pytest.mark.parametrize("upper", [False, True])

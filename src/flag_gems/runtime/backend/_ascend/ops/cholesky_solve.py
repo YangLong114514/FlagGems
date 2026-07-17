@@ -731,13 +731,26 @@ def cholesky_solve(B, L, upper=False):
             f"{B_shape[:-2]} vs {L_shape[:-2]}"
         ) from exc
 
+    batch_size = 1
+    for dim in batch_shape:
+        batch_size *= dim
+
     # torch.linalg.cholesky commonly returns a transpose-contiguous factor.
     # Reinterpret that storage through an mT view and flip the triangular
     # orientation instead of materializing an F-to-C layout conversion.
+    # The batched small-N lower single-RHS kernel is an exception: on Ascend,
+    # its row-contiguous lower specialization is faster even after paying for
+    # the layout conversion.
+    keep_small_batched_lower = (
+        not upper
+        and batch_size > 1
+        and nrhs == 1
+        and _can_use_small_gather_path(N, nrhs)
+    )
     effective_upper = upper
     if L.is_contiguous():
         pass
-    elif L.mT.is_contiguous():
+    elif L.mT.is_contiguous() and not keep_small_batched_lower:
         L = L.mT
         effective_upper = not upper
     else:
@@ -754,10 +767,6 @@ def cholesky_solve(B, L, upper=False):
     if not B.is_contiguous():
         B = B.contiguous()
     X = torch.empty_like(B)
-
-    batch_size = 1
-    for dim in batch_shape:
-        batch_size *= dim
 
     L_kernel = L.reshape(-1, N, N)
     B_kernel = B.reshape(-1, N, nrhs)
