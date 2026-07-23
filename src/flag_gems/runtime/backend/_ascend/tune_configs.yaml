@@ -908,3 +908,15 @@ index_adjacent_ascend:
     BLOCK_S: 8192
     LAYOUT: 1
     SUFFIX_TILES_PER_PROGRAM: 32
+
+cholesky_solve:
+- META:
+    BLOCK_RHS: 1
+- META:
+    BLOCK_RHS: 2
+- META:
+    BLOCK_RHS: 4
+- META:
+    BLOCK_RHS: 8
+- META:
+    BLOCK_RHS: 16
