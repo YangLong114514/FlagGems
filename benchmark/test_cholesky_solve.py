@@ -1,7 +1,15 @@
 import pytest
 import torch
 
+import flag_gems
+
 from . import base
+
+
+IS_ASCEND = flag_gems.vendor_name == "ascend"
+
+if IS_ASCEND:
+    from flag_gems.runtime.backend._ascend.ops.cholesky_solve import cholesky_solve
 
 # Two-dimensional entries are single systems; longer entries benchmark batched
 # solves. Keep one shape list and derive both factor orientations from it so
@@ -75,16 +83,38 @@ class CholeskySolveBenchmark(base.Benchmark):
             yield (rhs, factor, upper)
 
 
+def _composed_cholesky_solve(rhs, factor, upper=False):
+    """Reference composed from two native triangular solves on Ascend."""
+    if upper:
+        y = torch.linalg.solve_triangular(factor.mH, rhs, upper=False)
+        return torch.linalg.solve_triangular(factor, y, upper=True)
+
+    y = torch.linalg.solve_triangular(factor, rhs, upper=False)
+    return torch.linalg.solve_triangular(factor.mH, y, upper=True)
+
+
 @pytest.mark.cholesky_solve
 def test_cholesky_solve():
-    bench = CholeskySolveBenchmark(
-        op_name="cholesky_solve",
-        torch_op=torch.ops.aten.cholesky_solve,
-        dtypes=[
+    if IS_ASCEND:
+        # torch.cholesky_solve has no native NPU implementation. Compare the
+        # fused Ascend kernel against two native solve_triangular operators.
+        torch_op = _composed_cholesky_solve
+        gems_op = cholesky_solve
+        dtypes = [torch.float32]
+    else:
+        torch_op = torch.ops.aten.cholesky_solve
+        gems_op = None
+        dtypes = [
             torch.float32,
             torch.float64,
             torch.complex64,
             torch.complex128,
-        ],
+        ]
+
+    bench = CholeskySolveBenchmark(
+        op_name="cholesky_solve",
+        torch_op=torch_op,
+        gems_op=gems_op,
+        dtypes=dtypes,
     )
     bench.run()

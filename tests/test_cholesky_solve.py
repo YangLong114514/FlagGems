@@ -4,9 +4,16 @@ import pytest
 import torch
 
 import flag_gems
-from flag_gems.ops.cholesky_solve import cholesky_solve
 
 from . import accuracy_utils as utils
+
+
+IS_ASCEND = getattr(flag_gems, "vendor_name", "") == "ascend"
+
+if IS_ASCEND:
+    from flag_gems.runtime.backend._ascend.ops.cholesky_solve import cholesky_solve
+else:
+    from flag_gems.ops.cholesky_solve import cholesky_solve
 
 
 CHOLESKY_SOLVE_BASIC_SHAPES = [
@@ -147,12 +154,23 @@ def _make_noncontiguous_last_dim(tensor):
 
 
 def _solve_with_gems(rhs, L, upper=False):
+    if IS_ASCEND:
+        return cholesky_solve(rhs, L, upper=upper)
+
     with flag_gems.use_gems(include=["cholesky_solve"]):
         assert "cholesky_solve" in flag_gems.current_work_registrar.get_all_keys()
         return torch.cholesky_solve(rhs, L, upper=upper)
 
 
 def _assert_backward_error(A, X, rhs, dtype):
+    if IS_ASCEND:
+        # torch.linalg.cholesky falls back to CPU on Ascend. Keep the residual
+        # calculation on CPU as well to avoid mixing fallback tensors with NPU
+        # norm/matmul operations in the torch_npu runtime.
+        A = A.detach().contiguous().cpu()
+        X = X.detach().contiguous().cpu()
+        rhs = rhs.detach().contiguous().cpu()
+
     residual = A @ X - rhs
     denom = A.norm() * X.norm() + rhs.norm()
     is_single_precision = dtype in (torch.float32, torch.complex64)
@@ -172,9 +190,13 @@ def _assert_cholesky_solve_matches(A, factor, rhs, dtype, upper=False):
     _assert_backward_error(A, res_out, rhs.expand_as(res_out), dtype)
 
 
+_REAL_DTYPES = [torch.float32] if IS_ASCEND else [torch.float32, torch.float64]
+_COMPLEX_DTYPES = [] if IS_ASCEND else [torch.complex64, torch.complex128]
+
+
 @pytest.mark.cholesky_solve
 @pytest.mark.parametrize("shape", CHOLESKY_SOLVE_BASIC_SHAPES)
-@pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
+@pytest.mark.parametrize("dtype", _REAL_DTYPES)
 @pytest.mark.parametrize("contiguous_factor", [False, True])
 def test_cholesky_solve(shape, dtype, contiguous_factor):
     _, L, rhs = _make_cholesky_solve_inputs(shape, dtype)
@@ -188,7 +210,7 @@ def test_cholesky_solve(shape, dtype, contiguous_factor):
 
 @pytest.mark.cholesky_solve
 @pytest.mark.parametrize("shape", CHOLESKY_SOLVE_LARGE_SHAPES)
-@pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
+@pytest.mark.parametrize("dtype", _REAL_DTYPES)
 def test_cholesky_solve_larger_shapes(shape, dtype):
     _, L, rhs = _make_cholesky_solve_inputs(shape, dtype)
     ref_out = torch.cholesky_solve(rhs, L, upper=False)
@@ -199,7 +221,7 @@ def test_cholesky_solve_larger_shapes(shape, dtype):
 
 @pytest.mark.cholesky_solve
 @pytest.mark.parametrize("shape", CHOLESKY_SOLVE_RHS_BOUNDARY_SHAPES)
-@pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
+@pytest.mark.parametrize("dtype", _REAL_DTYPES)
 def test_cholesky_solve_rhs_boundaries(shape, dtype):
     A, L, rhs = _make_cholesky_solve_inputs(shape, dtype)
     _assert_cholesky_solve_matches(A, L, rhs, dtype, upper=False)
@@ -207,7 +229,7 @@ def test_cholesky_solve_rhs_boundaries(shape, dtype):
 
 @pytest.mark.cholesky_solve
 @pytest.mark.parametrize("shape", CHOLESKY_SOLVE_UPPER_SHAPES)
-@pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
+@pytest.mark.parametrize("dtype", _REAL_DTYPES)
 def test_cholesky_solve_upper(shape, dtype):
     A, L, rhs = _make_cholesky_solve_inputs(shape, dtype)
     U = L.mH.contiguous()
@@ -219,8 +241,21 @@ def test_cholesky_solve_upper(shape, dtype):
 
 
 @pytest.mark.cholesky_solve
+@pytest.mark.parametrize("upper", [False, True])
+def test_cholesky_solve_transpose_contiguous_factor(upper):
+    dtype = torch.float32
+    A, L, rhs = _make_cholesky_solve_inputs((64, 16), dtype)
+    factor_c = L.mT.contiguous() if upper else L.contiguous()
+    factor = factor_c.mT.contiguous().mT
+
+    assert not factor.is_contiguous()
+    assert factor.mT.is_contiguous()
+    _assert_cholesky_solve_matches(A, factor, rhs, dtype, upper=upper)
+
+
+@pytest.mark.cholesky_solve
 @pytest.mark.parametrize("shape", CHOLESKY_SOLVE_BLOCKED_SINGLE_RHS_SHAPES)
-@pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
+@pytest.mark.parametrize("dtype", _REAL_DTYPES)
 @pytest.mark.parametrize("upper", [False, True])
 def test_cholesky_solve_blocked_single_rhs(shape, dtype, upper):
     A, L, rhs = _make_cholesky_solve_inputs(shape, dtype)
@@ -230,6 +265,30 @@ def test_cholesky_solve_blocked_single_rhs(shape, dtype, upper):
 
 
 @pytest.mark.cholesky_solve
+@pytest.mark.skipif(not IS_ASCEND, reason="Ascend-specific small-N layout path")
+@pytest.mark.parametrize("batch_size", [64, 256])
+def test_cholesky_solve_ascend_batched_small_lower_single_rhs(batch_size):
+    dtype = torch.float32
+    A, factor, rhs = _make_cholesky_solve_inputs((batch_size, 16, 1), dtype)
+
+    assert not factor.is_contiguous()
+    assert factor.mT.is_contiguous()
+    _assert_cholesky_solve_matches(A, factor, rhs, dtype, upper=False)
+
+
+@pytest.mark.cholesky_solve
+@pytest.mark.skipif(not IS_ASCEND, reason="Ascend-specific blocked single-RHS path")
+@pytest.mark.parametrize("upper", [False, True])
+def test_cholesky_solve_ascend_blocked_single_rhs_conditioned(upper):
+    dtype = torch.float32
+    A, L, rhs = _make_conditioned_inputs((128, 1), dtype)
+    factor = L.mH.contiguous() if upper else L
+
+    _assert_cholesky_solve_matches(A, factor, rhs, dtype, upper=upper)
+
+
+@pytest.mark.cholesky_solve
+@pytest.mark.skipif(IS_ASCEND, reason="fp64 not supported on Ascend")
 @pytest.mark.parametrize("shape", CHOLESKY_SOLVE_FP64_BLOCKED_SHAPES)
 @pytest.mark.parametrize("upper", [False, True])
 def test_cholesky_solve_fp64_blocked(shape, upper):
@@ -264,7 +323,7 @@ def test_cholesky_solve_fp32_blocked_lower(shape, contiguous_factor):
 
 @pytest.mark.cholesky_solve
 @pytest.mark.parametrize("shape", CHOLESKY_SOLVE_BATCH_SHAPES)
-@pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
+@pytest.mark.parametrize("dtype", _REAL_DTYPES)
 @pytest.mark.parametrize("contiguous_factor", [False, True])
 def test_cholesky_solve_batch(shape, dtype, contiguous_factor):
     _, L, rhs = _make_cholesky_solve_inputs(shape, dtype)
@@ -278,7 +337,7 @@ def test_cholesky_solve_batch(shape, dtype, contiguous_factor):
 
 @pytest.mark.cholesky_solve
 @pytest.mark.parametrize("shapes", CHOLESKY_SOLVE_BROADCAST_SHAPES)
-@pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
+@pytest.mark.parametrize("dtype", _REAL_DTYPES)
 @pytest.mark.parametrize("upper", [False, True])
 def test_cholesky_solve_broadcast_batch(shapes, dtype, upper):
     A_shape, rhs_shape = shapes
@@ -292,7 +351,7 @@ def test_cholesky_solve_broadcast_batch(shapes, dtype, upper):
 
 
 @pytest.mark.cholesky_solve
-@pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
+@pytest.mark.parametrize("dtype", _REAL_DTYPES)
 def test_cholesky_solve_noncontiguous_inputs(dtype):
     _, L, rhs = _make_cholesky_solve_inputs((16, 4), dtype)
     L_nc = _make_noncontiguous_last_dim(L)
@@ -308,7 +367,7 @@ def test_cholesky_solve_noncontiguous_inputs(dtype):
 
 
 @pytest.mark.cholesky_solve
-@pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
+@pytest.mark.parametrize("dtype", _REAL_DTYPES)
 def test_cholesky_solve_scaled_inputs(dtype):
     for matrix_scale, rhs_scale in [(1e-3, 1e3), (1e3, 1e-3)]:
         A, L, rhs = _make_cholesky_solve_inputs(
@@ -322,7 +381,7 @@ def test_cholesky_solve_scaled_inputs(dtype):
 
 
 @pytest.mark.cholesky_solve
-@pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
+@pytest.mark.parametrize("dtype", _REAL_DTYPES)
 def test_cholesky_solve_conditioned_matrix(dtype):
     A, L, rhs = _make_conditioned_inputs((16, 4), dtype)
     ref_out = torch.cholesky_solve(rhs, L, upper=False)
@@ -333,7 +392,7 @@ def test_cholesky_solve_conditioned_matrix(dtype):
 
 
 @pytest.mark.cholesky_solve
-@pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
+@pytest.mark.parametrize("dtype", _REAL_DTYPES)
 def test_cholesky_solve_accuracy(dtype):
     A, L, rhs = _make_cholesky_solve_inputs((4, 2), dtype)
     X = _solve_with_gems(rhs, L, upper=False)
@@ -343,7 +402,7 @@ def test_cholesky_solve_accuracy(dtype):
 
 @pytest.mark.cholesky_solve
 @pytest.mark.parametrize("shape", [(4, 2), (2, 4, 1)])
-@pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
+@pytest.mark.parametrize("dtype", _REAL_DTYPES)
 @pytest.mark.parametrize("upper", [False, True])
 def test_cholesky_solve_direct(shape, dtype, upper):
     _, L, rhs = _make_cholesky_solve_inputs(shape, dtype)
@@ -356,8 +415,9 @@ def test_cholesky_solve_direct(shape, dtype, upper):
 
 
 @pytest.mark.cholesky_solve
+@pytest.mark.skipif(IS_ASCEND, reason="complex not supported on Ascend")
 @pytest.mark.parametrize("shape", CHOLESKY_SOLVE_COMPLEX_SHAPES)
-@pytest.mark.parametrize("dtype", [torch.complex64, torch.complex128])
+@pytest.mark.parametrize("dtype", _COMPLEX_DTYPES)
 @pytest.mark.parametrize("upper", [False, True])
 def test_cholesky_solve_complex(shape, dtype, upper):
     A, L, rhs = _make_cholesky_solve_inputs(shape, dtype)
@@ -367,7 +427,8 @@ def test_cholesky_solve_complex(shape, dtype, upper):
 
 
 @pytest.mark.cholesky_solve
-@pytest.mark.parametrize("dtype", [torch.complex64, torch.complex128])
+@pytest.mark.skipif(IS_ASCEND, reason="complex not supported on Ascend")
+@pytest.mark.parametrize("dtype", _COMPLEX_DTYPES)
 @pytest.mark.parametrize("upper", [False, True])
 def test_cholesky_solve_complex_noncontiguous(dtype, upper):
     A, L, rhs = _make_cholesky_solve_inputs((2, 16, 5), dtype)
@@ -379,7 +440,8 @@ def test_cholesky_solve_complex_noncontiguous(dtype, upper):
 
 
 @pytest.mark.cholesky_solve
-@pytest.mark.parametrize("dtype", [torch.complex64, torch.complex128])
+@pytest.mark.skipif(IS_ASCEND, reason="complex not supported on Ascend")
+@pytest.mark.parametrize("dtype", _COMPLEX_DTYPES)
 @pytest.mark.parametrize("upper", [False, True])
 def test_cholesky_solve_complex_broadcast(dtype, upper):
     A_shape = (2, 1, 4, 4)
@@ -396,7 +458,8 @@ def test_cholesky_solve_complex_broadcast(dtype, upper):
 
 
 @pytest.mark.cholesky_solve
-@pytest.mark.parametrize("dtype", [torch.complex64, torch.complex128])
+@pytest.mark.skipif(IS_ASCEND, reason="complex not supported on Ascend")
+@pytest.mark.parametrize("dtype", _COMPLEX_DTYPES)
 @pytest.mark.parametrize("upper", [False, True])
 def test_cholesky_solve_complex_small_gather_conditioned(dtype, upper):
     A, L, rhs = _make_conditioned_inputs((16, 5), dtype)
@@ -406,8 +469,9 @@ def test_cholesky_solve_complex_small_gather_conditioned(dtype, upper):
 
 
 @pytest.mark.cholesky_solve
+@pytest.mark.skipif(IS_ASCEND, reason="complex not supported on Ascend")
 @pytest.mark.parametrize("shape", CHOLESKY_SOLVE_COMPLEX_BLOCKED_SHAPES)
-@pytest.mark.parametrize("dtype", [torch.complex64, torch.complex128])
+@pytest.mark.parametrize("dtype", _COMPLEX_DTYPES)
 @pytest.mark.parametrize("upper", [False, True])
 def test_cholesky_solve_complex_blocked(shape, dtype, upper):
     A, L, rhs = _make_cholesky_solve_inputs(shape, dtype)
@@ -417,7 +481,8 @@ def test_cholesky_solve_complex_blocked(shape, dtype, upper):
 
 
 @pytest.mark.cholesky_solve
-@pytest.mark.parametrize("dtype", [torch.complex64, torch.complex128])
+@pytest.mark.skipif(IS_ASCEND, reason="complex not supported on Ascend")
+@pytest.mark.parametrize("dtype", _COMPLEX_DTYPES)
 @pytest.mark.parametrize("upper", [False, True])
 def test_cholesky_solve_complex_blocked_conditioned(dtype, upper):
     A, L, rhs = _make_conditioned_inputs((64, 4), dtype)
@@ -427,8 +492,9 @@ def test_cholesky_solve_complex_blocked_conditioned(dtype, upper):
 
 
 @pytest.mark.cholesky_solve
+@pytest.mark.skipif(IS_ASCEND, reason="complex not supported on Ascend")
 @pytest.mark.parametrize("shape", [(16, 5), (64, 4), (128, 1), (256, 16)])
-@pytest.mark.parametrize("dtype", [torch.complex64, torch.complex128])
+@pytest.mark.parametrize("dtype", _COMPLEX_DTYPES)
 def test_cholesky_solve_complex_lazy_conjugate_upper(shape, dtype):
     A, L, rhs = _make_cholesky_solve_inputs(shape, dtype)
     factor = L.mH
