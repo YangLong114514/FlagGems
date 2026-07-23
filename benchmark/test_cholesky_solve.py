@@ -55,9 +55,9 @@ class CholeskySolveBenchmark(base.Benchmark):
             eye = torch.eye(n, dtype=cur_dtype, device=self.device)
             for _ in batch_dims:
                 eye = eye.unsqueeze(0)
-            A = B_mat @ B_mat.transpose(-2, -1) + eye * 0.1
+            A = B_mat @ B_mat.mH + eye * 0.1
             L = torch.linalg.cholesky(A)
-            factor = L.mT.contiguous() if upper else L
+            factor = L.mH.contiguous() if upper else L
             rhs = torch.randn(*batch_dims, n, nrhs, dtype=cur_dtype, device=self.device)
             yield (rhs, factor, upper)
 
@@ -66,13 +66,13 @@ def _composed_cholesky_solve(rhs, factor, upper=False):
     """Reference path composed from two native triangular solves."""
     if upper:
         y = torch.linalg.solve_triangular(
-            factor.transpose(-2, -1), rhs, upper=False
+            factor.mH, rhs, upper=False
         )
         return torch.linalg.solve_triangular(factor, y, upper=True)
 
     y = torch.linalg.solve_triangular(factor, rhs, upper=False)
     return torch.linalg.solve_triangular(
-        factor.transpose(-2, -1), y, upper=True
+        factor.mH, y, upper=True
     )
 
 
@@ -86,7 +86,12 @@ def test_cholesky_solve():
     else:
         torch_op = torch.ops.aten.cholesky_solve
         gems_op = None
-        dtypes = [torch.float32, torch.float64]
+        dtypes = [
+            torch.float32,
+            torch.float64,
+            torch.complex64,
+            torch.complex128,
+        ]
 
     bench = CholeskySolveBenchmark(
         op_name="cholesky_solve",
