@@ -471,3 +471,7 @@ def test_cholesky_solve_invalid_inputs():
     L_bad_batch = torch.eye(2, dtype=torch.float32, device=flag_gems.device).expand(2, 2, 2)
     with pytest.raises(ValueError, match="not broadcastable"):
         cholesky_solve(B_bad_batch, L_bad_batch)
+
+    B_bad_dtype = torch.randn(2, 1, dtype=torch.float64, device=flag_gems.device)
+    with pytest.raises(AssertionError, match="same dtype"):
+        cholesky_solve(B_bad_dtype, L_square)
