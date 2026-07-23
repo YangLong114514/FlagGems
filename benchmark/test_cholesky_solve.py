@@ -65,6 +65,21 @@ class CholeskySolveBenchmark(base.Benchmark):
         self.shapes = CHOLESKY_SOLVE_CASES
         self.shape_desc = "((*batch, N, nrhs), upper)"
 
+    def get_latency(self, op, *args, **kwargs):
+        if not IS_ASCEND or base.Config.mode != base.consts.BenchMode.KERNEL:
+            return super().get_latency(op, *args, **kwargs)
+
+        # do_bench_npu reports profiler rows in microseconds and assumes one
+        # kernel per callable. The Ascend reference uses two triangular solves,
+        # so measure the complete callable with device events instead.
+        fn = lambda: op(*args, **kwargs)
+        return base.triton.testing.do_bench(
+            fn,
+            warmup=base.Config.warm_up,
+            rep=base.Config.repetition,
+            return_mode="median",
+        )
+
     def get_input_iter(self, cur_dtype):
         for shape, upper in self.shapes:
             *batch_dims, n, nrhs = shape
