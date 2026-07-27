@@ -18,6 +18,10 @@ import torch
 import triton
 import triton.language as tl
 
+from flag_gems.ops._cholesky_solve_out import (
+    check_cholesky_solve_out,
+    copy_cholesky_solve_out,
+)
 from flag_gems.utils import libentry
 from flag_gems.utils.triton_lang_extension import program_id
 
@@ -28,6 +32,7 @@ CHOLESKY_SOLVE_AUTOTUNE_CONFIGS = [
     triton.Config({"BLOCK_RHS": block_rhs}, num_warps=1, num_stages=1)
     for block_rhs in (1, 2, 4, 8, 16, 32)
 ]
+
 
 @libentry()
 @triton.autotune(
@@ -2831,3 +2836,11 @@ def cholesky_solve(B, L, upper=False):
             )
 
     return X
+
+
+def cholesky_solve_out(B, L, upper=False, *, out):
+    """Out variant with the same temporary-and-copy semantics as PyTorch."""
+    logger.debug("GEMS CHOLESKY_SOLVE_OUT")
+    check_cholesky_solve_out(B, out)
+    result = cholesky_solve(B, L, upper=upper)
+    return copy_cholesky_solve_out(result, out)

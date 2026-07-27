@@ -4793,6 +4793,7 @@ ops:
       using its Cholesky factorization.
     for:
       - cholesky_solve
+      - cholesky_solve.out
     labels:
       - aten
       - KernelGen

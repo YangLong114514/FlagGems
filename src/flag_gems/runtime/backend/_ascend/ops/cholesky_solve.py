@@ -16,12 +16,14 @@ import logging
 
 import torch
 import triton
-import triton.language as tl
 import triton.experimental.tle as tle
+import triton.language as tl
 
-from flag_gems import runtime
+from flag_gems.ops._cholesky_solve_out import (
+    check_cholesky_solve_out,
+    copy_cholesky_solve_out,
+)
 from flag_gems.runtime import torch_device_fn
-
 from flag_gems.utils import libentry
 from flag_gems.utils import triton_lang_extension as ext
 
@@ -609,3 +611,11 @@ def cholesky_solve(B, L, upper=False):
             )
 
     return X
+
+
+def cholesky_solve_out(B, L, upper=False, *, out):
+    """Out variant with the same temporary-and-copy semantics as PyTorch."""
+    logger.debug("GEMS_ASCEND CHOLESKY_SOLVE_OUT")
+    check_cholesky_solve_out(B, out)
+    result = cholesky_solve(B, L, upper=upper)
+    return copy_cholesky_solve_out(result, out)
