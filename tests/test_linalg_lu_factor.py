@@ -16,7 +16,9 @@ else:
     _TEST_DTYPES = [torch.float32, torch.float64]
 
 # pivot=False is only supported on CUDA
-if DEVICE == "cuda":
+if utils.TO_CPU:
+    _PIVOT_VALUES = [True]
+elif DEVICE == "cuda":
     _PIVOT_VALUES = [True, False]
 else:
     _PIVOT_VALUES = [True]
@@ -73,7 +75,7 @@ def _make_input(shape, pivot, device, dtype):
     ],
 )
 @pytest.mark.parametrize("dtype", _TEST_DTYPES)
-@pytest.mark.parametrize("pivot", [True, False])
+@pytest.mark.parametrize("pivot", _PIVOT_VALUES)
 def test_linalg_lu_factor(shape, dtype, pivot):
     inp = _make_input(shape, pivot, flag_gems.device, dtype)
     ref_inp = utils.to_reference(inp)
