@@ -156,6 +156,12 @@ def _make_noncontiguous_last_dim(tensor):
     return holder[..., ::2]
 
 
+def _reference_cholesky_solve(rhs, factor, upper=False):
+    ref_rhs = utils.to_reference(rhs)
+    ref_factor = utils.to_reference(factor)
+    return torch.cholesky_solve(ref_rhs, ref_factor, upper=upper)
+
+
 def _solve_with_gems(rhs, L, upper=False):
     if IS_ASCEND:
         return cholesky_solve(rhs, L, upper=upper)
@@ -197,7 +203,7 @@ def _assert_backward_error(A, X, rhs, dtype):
 
 
 def _assert_cholesky_solve_matches(A, factor, rhs, dtype, upper=False):
-    ref_out = torch.cholesky_solve(rhs, factor, upper=upper)
+    ref_out = _reference_cholesky_solve(rhs, factor, upper=upper)
     res_out = _solve_with_gems(rhs, factor, upper=upper)
 
     utils.gems_assert_close(res_out, ref_out, dtype)
@@ -216,7 +222,7 @@ def test_cholesky_solve(shape, dtype, contiguous_factor):
     _, L, rhs = _make_cholesky_solve_inputs(shape, dtype)
     if contiguous_factor:
         L = L.contiguous()
-    ref_out = torch.cholesky_solve(rhs, L, upper=False)
+    ref_out = _reference_cholesky_solve(rhs, L, upper=False)
     res_out = _solve_with_gems(rhs, L, upper=False)
 
     utils.gems_assert_close(res_out, ref_out, dtype)
@@ -227,7 +233,7 @@ def test_cholesky_solve(shape, dtype, contiguous_factor):
 @pytest.mark.parametrize("dtype", _REAL_DTYPES)
 def test_cholesky_solve_larger_shapes(shape, dtype):
     _, L, rhs = _make_cholesky_solve_inputs(shape, dtype)
-    ref_out = torch.cholesky_solve(rhs, L, upper=False)
+    ref_out = _reference_cholesky_solve(rhs, L, upper=False)
     res_out = _solve_with_gems(rhs, L, upper=False)
 
     utils.gems_assert_close(res_out, ref_out, dtype)
@@ -247,7 +253,7 @@ def test_cholesky_solve_rhs_boundaries(shape, dtype):
 def test_cholesky_solve_upper(shape, dtype):
     A, L, rhs = _make_cholesky_solve_inputs(shape, dtype)
     U = L.mH.contiguous()
-    ref_out = torch.cholesky_solve(rhs, U, upper=True)
+    ref_out = _reference_cholesky_solve(rhs, U, upper=True)
     res_out = _solve_with_gems(rhs, U, upper=True)
 
     utils.gems_assert_close(res_out, ref_out, dtype)
@@ -355,7 +361,7 @@ def test_cholesky_solve_batch(shape, dtype, contiguous_factor):
     _, L, rhs = _make_cholesky_solve_inputs(shape, dtype)
     if contiguous_factor:
         L = L.contiguous()
-    ref_out = torch.cholesky_solve(rhs, L, upper=False)
+    ref_out = _reference_cholesky_solve(rhs, L, upper=False)
     res_out = _solve_with_gems(rhs, L, upper=False)
 
     utils.gems_assert_close(res_out, ref_out, dtype)
@@ -369,7 +375,7 @@ def test_cholesky_solve_broadcast_batch(shapes, dtype, upper):
     A_shape, rhs_shape = shapes
     _, L, rhs = _make_cholesky_solve_broadcast_inputs(A_shape, rhs_shape, dtype, upper)
 
-    ref_out = torch.cholesky_solve(rhs, L, upper=upper)
+    ref_out = _reference_cholesky_solve(rhs, L, upper=upper)
     res_out = _solve_with_gems(rhs, L, upper=upper)
 
     utils.gems_assert_close(res_out, ref_out, dtype)
@@ -386,7 +392,7 @@ def test_cholesky_solve_noncontiguous_inputs(dtype):
     assert not L_nc.is_contiguous()
     assert not rhs_nc.is_contiguous()
 
-    ref_out = torch.cholesky_solve(rhs_nc, L_nc, upper=False)
+    ref_out = _reference_cholesky_solve(rhs_nc, L_nc, upper=False)
     res_out = _solve_with_gems(rhs_nc, L_nc, upper=False)
 
     utils.gems_assert_close(res_out, ref_out, dtype)
@@ -399,7 +405,7 @@ def test_cholesky_solve_scaled_inputs(dtype):
         A, L, rhs = _make_cholesky_solve_inputs(
             (16, 4), dtype, matrix_scale=matrix_scale, rhs_scale=rhs_scale
         )
-        ref_out = torch.cholesky_solve(rhs, L, upper=False)
+        ref_out = _reference_cholesky_solve(rhs, L, upper=False)
         res_out = _solve_with_gems(rhs, L, upper=False)
 
         utils.gems_assert_close(res_out, ref_out, dtype)
@@ -410,7 +416,7 @@ def test_cholesky_solve_scaled_inputs(dtype):
 @pytest.mark.parametrize("dtype", _REAL_DTYPES)
 def test_cholesky_solve_conditioned_matrix(dtype):
     A, L, rhs = _make_conditioned_inputs((16, 4), dtype)
-    ref_out = torch.cholesky_solve(rhs, L, upper=False)
+    ref_out = _reference_cholesky_solve(rhs, L, upper=False)
     res_out = _solve_with_gems(rhs, L, upper=False)
 
     utils.gems_assert_close(res_out, ref_out, dtype)
@@ -434,7 +440,7 @@ def test_cholesky_solve_direct(shape, dtype, upper):
     _, L, rhs = _make_cholesky_solve_inputs(shape, dtype)
     factor = L.mH.contiguous() if upper else L
 
-    ref_out = torch.cholesky_solve(rhs, factor, upper=upper)
+    ref_out = _reference_cholesky_solve(rhs, factor, upper=upper)
     res_out = cholesky_solve(rhs, factor, upper=upper)
 
     utils.gems_assert_close(res_out, ref_out, dtype)
@@ -476,7 +482,7 @@ def test_cholesky_solve_complex_broadcast(dtype, upper):
         A_shape, rhs_shape, dtype, upper
     )
 
-    ref_out = torch.cholesky_solve(rhs, factor, upper=upper)
+    ref_out = _reference_cholesky_solve(rhs, factor, upper=upper)
     res_out = _solve_with_gems(rhs, factor, upper=upper)
 
     utils.gems_assert_close(res_out, ref_out, dtype)
@@ -537,7 +543,7 @@ def test_cholesky_solve_complex_lazy_conjugate_with_all_gems(dtype):
     factor = L.mH
     assert factor.is_conj()
 
-    ref_out = torch.cholesky_solve(rhs, factor, upper=True)
+    ref_out = _reference_cholesky_solve(rhs, factor, upper=True)
     with flag_gems.use_gems(exclude=["zero_"]):
         res_out = torch.cholesky_solve(rhs, factor, upper=True)
 
@@ -551,8 +557,8 @@ def test_cholesky_solve_complex_lazy_conjugate_with_all_gems(dtype):
 def test_cholesky_solve_out(dtype, upper):
     _, L, rhs = _make_cholesky_solve_inputs((2, 16, 4), dtype)
     factor = L.mH if upper else L
-    ref_out = torch.cholesky_solve(rhs, factor, upper=upper)
-    out = torch.empty_like(ref_out)
+    ref_out = _reference_cholesky_solve(rhs, factor, upper=upper)
+    out = torch.empty(ref_out.shape, dtype=ref_out.dtype, device=flag_gems.device)
     original_data_ptr = out.data_ptr()
 
     res_out = _solve_out_with_gems(rhs, factor, out, upper=upper)
@@ -570,7 +576,7 @@ def test_cholesky_solve_out_resizes_for_broadcast_result():
     _, factor, rhs = _make_cholesky_solve_broadcast_inputs(
         (2, 1, 4, 4), (3, 4, 2), dtype
     )
-    ref_out = torch.cholesky_solve(rhs, factor)
+    ref_out = _reference_cholesky_solve(rhs, factor)
 
     empty_out = torch.empty(0, dtype=dtype, device=flag_gems.device)
     res_out = _solve_out_with_gems(rhs, factor, empty_out)
@@ -592,7 +598,7 @@ def test_cholesky_solve_out_resizes_for_broadcast_result():
 def test_cholesky_solve_out_noncontiguous_and_alias():
     dtype = torch.float32
     _, factor, rhs = _make_cholesky_solve_inputs((2, 16, 4), dtype)
-    ref_out = torch.cholesky_solve(rhs, factor)
+    ref_out = _reference_cholesky_solve(rhs, factor)
 
     holder = torch.empty(
         *ref_out.shape[:-1],
@@ -616,7 +622,7 @@ def test_cholesky_solve_out_noncontiguous_and_alias():
 @pytest.mark.skipif(IS_ASCEND, reason="Ascend cholesky_solve only supports fp32")
 def test_cholesky_solve_out_safe_dtype_cast():
     _, factor, rhs = _make_cholesky_solve_inputs((16, 4), torch.float32)
-    ref_out = torch.cholesky_solve(rhs, factor).to(torch.float64)
+    ref_out = _reference_cholesky_solve(rhs, factor).to(torch.float64)
     out = torch.empty(rhs.shape, dtype=torch.float64, device=flag_gems.device)
 
     res_out = _solve_out_with_gems(rhs, factor, out)
