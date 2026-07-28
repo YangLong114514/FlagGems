@@ -284,10 +284,6 @@ _FULL_CONFIG = (
     ("celu", celu),
     ("celu_", celu_),
     ("channel_shuffle", channel_shuffle),
-    # Registering the Conjugate key lets upper-triangular factors carrying a
-    # lazy conj bit (the common L.mH view) reach the wrapper directly; the
-    # default conjugate fallback otherwise materializes them with a clone on
-    # every call, adding ~15-20 us of host time per solve.
     ("cholesky_solve", cholesky_solve, None, (CONJUGATE_DISPATCH_KEY,)),
     ("cholesky_solve.out", cholesky_solve_out, None, (CONJUGATE_DISPATCH_KEY,)),
     ("clamp", clamp),
