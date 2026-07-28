@@ -13,7 +13,6 @@
 # limitations under the License.
 
 import logging
-import os
 
 import torch
 import triton
@@ -27,11 +26,6 @@ from flag_gems.utils import libentry
 from flag_gems.utils.triton_lang_extension import program_id
 
 logger = logging.getLogger(__name__)
-
-
-_ENABLE_REAL_SMALL_GATHER_EXPERIMENT = os.getenv(
-    "FLAG_GEMS_CHOL_SOLVE_REAL_SMALL_GATHER", "1"
-).lower() not in {"0", "false", "off"}
 
 
 CHOLESKY_SOLVE_AUTOTUNE_CONFIGS = [
@@ -2227,9 +2221,7 @@ def cholesky_solve_small_gather_kernel(
 
 
 def _can_use_small_gather_path(N, nrhs):
-    return (N <= 32 and nrhs <= 8) or (
-        _ENABLE_REAL_SMALL_GATHER_EXPERIMENT and 32 < N < 64 and nrhs == 1
-    )
+    return (N <= 32 and nrhs <= 8) or (32 < N < 64 and nrhs == 1)
 
 
 @libentry()

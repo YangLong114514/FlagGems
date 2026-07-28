@@ -18,7 +18,7 @@ CHOLESKY_SOLVE_SHAPES = [
     (8, 1),
     (16, 1),
     (32, 1),
-    # Experimental real small-gather range (BLOCK_N=64).
+    # Real small-gather single-RHS range (BLOCK_N=64).
     (33, 1),
     (48, 1),
     (63, 1),
