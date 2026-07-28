@@ -2042,94 +2042,6 @@ def cholesky_solve_single_rhs_blocked_upper_kernel(
 
 @libentry()
 @triton.jit
-def cholesky_solve_small_single_rhs_kernel(
-    L_ptr,
-    B_ptr,
-    X_ptr,
-    N: tl.constexpr,
-    batch_stride_L,
-    batch_stride_B,
-    stride_L,
-    stride_B,
-    BLOCK_N: tl.constexpr,
-    dtype_flag: tl.constexpr,
-    upper: tl.constexpr,
-):
-    """Small-N single RHS kernel that keeps intermediate values in registers.
-
-    This avoids the global-memory Y write/read round trip used by the generic
-    single-RHS path. It is intended for small systems where BLOCK_N <= 64.
-    """
-    batch_pid = program_id(0)
-
-    L_base = batch_pid * batch_stride_L
-    B_base = batch_pid * batch_stride_B
-    offsets = tl.arange(0, BLOCK_N)
-
-    if dtype_flag == 0:
-        y_vec = tl.zeros([BLOCK_N], dtype=tl.float32)
-    else:
-        y_vec = tl.zeros([BLOCK_N], dtype=tl.float64)
-
-    # Phase 1: solve L * Y = B or U^T * Y = B.
-    for i in range(N):
-        if upper:
-            L_vals = tl.load(
-                L_ptr + L_base + offsets * stride_L + i,
-                mask=offsets < i, other=0.0,
-            )
-        else:
-            L_vals = tl.load(
-                L_ptr + L_base + i * stride_L + offsets,
-                mask=offsets < i, other=0.0,
-            )
-        dot = tl.sum(L_vals * y_vec, axis=0)
-        rhs_val = tl.load(B_ptr + B_base + i * stride_B)
-        diag = tl.load(L_ptr + L_base + i * stride_L + i)
-        inv_diag = 1.0 / diag
-        inv_diag = inv_diag * (2.0 - diag * inv_diag)
-        if dtype_flag == 1:
-            inv_diag = inv_diag * (2.0 - diag * inv_diag)
-        y_i = (rhs_val - dot) * inv_diag
-        y_vec = tl.where(offsets == i, y_i, y_vec)
-
-    x_vec = y_vec
-
-    # Phase 2: solve L^T * X = Y or U * X = Y.
-    for i in range(N - 1, -1, -1):
-        active = (offsets > i) & (offsets < N)
-        if upper:
-            L_vals = tl.load(
-                L_ptr + L_base + i * stride_L + offsets,
-                mask=active, other=0.0,
-            )
-        else:
-            L_vals = tl.load(
-                L_ptr + L_base + offsets * stride_L + i,
-                mask=active, other=0.0,
-            )
-        dot = tl.sum(L_vals * x_vec, axis=0)
-        # Rows <= i have not been overwritten yet, so x_vec[i] is still Y[i].
-        # Reading it from x_vec lets y_vec die before the backward phase instead
-        # of keeping both full vectors live in registers.
-        y_i = tl.sum(tl.where(offsets == i, x_vec, 0.0), axis=0)
-        diag = tl.load(L_ptr + L_base + i * stride_L + i)
-        inv_diag = 1.0 / diag
-        inv_diag = inv_diag * (2.0 - diag * inv_diag)
-        if dtype_flag == 1:
-            inv_diag = inv_diag * (2.0 - diag * inv_diag)
-        x_i = (y_i - dot) * inv_diag
-        x_vec = tl.where(offsets == i, x_i, x_vec)
-
-    tl.store(
-        X_ptr + B_base + offsets * stride_B,
-        x_vec,
-        mask=offsets < N,
-    )
-
-
-@libentry()
-@triton.jit
 def cholesky_solve_small_gather_kernel(
     L_ptr,
     B_ptr,
@@ -2350,13 +2262,6 @@ def _get_single_rhs_blocked_launch_config(dtype, N):
         "num_warps": 1,
         "num_stages": 1,
     }
-
-
-def _get_small_single_rhs_launch_config(dtype):
-    """Return H20 winners for register-resident N=33..63 solves."""
-    if dtype == torch.float32:
-        return {"num_warps": 1, "num_stages": 1}
-    return {"num_warps": 4, "num_stages": 3}
 
 
 def _get_small_gather_launch_config(dtype, N):
@@ -2796,15 +2701,6 @@ def cholesky_solve(B, L, upper=False):
                 BLOCK_N=block_n, BLOCK_RHS=block_rhs,
                 dtype_flag=dtype_flag, upper=effective_upper,
                 **small_gather_config,
-            )
-        elif nrhs == 1 and N <= 64:
-            block_n = triton.next_power_of_2(N)
-            small_single_rhs_config = _get_small_single_rhs_launch_config(B.dtype)
-            cholesky_solve_small_single_rhs_kernel[(batch_size,)](
-                L_kernel, B_kernel, X_kernel, N,
-                batch_stride_L, batch_stride_B, stride_L, stride_B,
-                BLOCK_N=block_n, dtype_flag=dtype_flag,
-                upper=effective_upper, **small_single_rhs_config,
             )
         elif nrhs == 1:
             cholesky_solve_single_rhs_kernel[(batch_size,)](
