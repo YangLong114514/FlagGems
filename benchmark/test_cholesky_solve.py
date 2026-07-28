@@ -5,7 +5,6 @@ import flag_gems
 
 from . import base
 
-
 IS_ASCEND = flag_gems.vendor_name == "ascend"
 
 if IS_ASCEND:
@@ -19,6 +18,10 @@ CHOLESKY_SOLVE_SHAPES = [
     (8, 1),
     (16, 1),
     (32, 1),
+    # Experimental real small-gather range (BLOCK_N=64).
+    (33, 1),
+    (48, 1),
+    (63, 1),
     (64, 1),
     (128, 1),
     (256, 1),

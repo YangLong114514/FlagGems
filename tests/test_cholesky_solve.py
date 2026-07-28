@@ -36,6 +36,7 @@ CHOLESKY_SOLVE_BLOCKED_SINGLE_RHS_SHAPES = [
     (256, 1),
     (2, 128, 1),
 ]
+CHOLESKY_SOLVE_SMALL_GATHER_EXPERIMENT_SHAPES = [(33, 1), (48, 1), (63, 1)]
 CHOLESKY_SOLVE_FP64_BLOCKED_SHAPES = [
     (64, 4),
     (128, 16),
@@ -271,6 +272,18 @@ def test_cholesky_solve_transpose_contiguous_factor(upper):
 @pytest.mark.parametrize("dtype", _REAL_DTYPES)
 @pytest.mark.parametrize("upper", [False, True])
 def test_cholesky_solve_blocked_single_rhs(shape, dtype, upper):
+    A, L, rhs = _make_cholesky_solve_inputs(shape, dtype)
+    factor = L.mH.contiguous() if upper else L
+
+    _assert_cholesky_solve_matches(A, factor, rhs, dtype, upper=upper)
+
+
+@pytest.mark.cholesky_solve
+@pytest.mark.skipif(IS_ASCEND, reason="GPU small-gather dispatch experiment")
+@pytest.mark.parametrize("shape", CHOLESKY_SOLVE_SMALL_GATHER_EXPERIMENT_SHAPES)
+@pytest.mark.parametrize("dtype", _REAL_DTYPES)
+@pytest.mark.parametrize("upper", [False, True])
+def test_cholesky_solve_small_gather_single_rhs_experiment(shape, dtype, upper):
     A, L, rhs = _make_cholesky_solve_inputs(shape, dtype)
     factor = L.mH.contiguous() if upper else L
 
