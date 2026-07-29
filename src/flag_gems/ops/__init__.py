@@ -97,6 +97,7 @@ from flag_gems.ops.angle import angle
 from flag_gems.ops.any import any, any_dim, any_dims
 from flag_gems.ops.arange import arange, arange_start
 from flag_gems.ops.arccos import arccos, arccos_
+from flag_gems.ops.arccosh_ import arccosh_
 from flag_gems.ops.arcsin import arcsin, arcsin_, arcsin_out
 from flag_gems.ops.arcsinh import arcsinh, arcsinh_out
 from flag_gems.ops.arcsinh_ import arcsinh_
@@ -253,6 +254,12 @@ from flag_gems.ops.flash_attention_backward import (
     scaled_dot_product_flash_attention_backward,
 )
 from flag_gems.ops.flip import flip
+from flag_gems.ops.float_power_ import (
+    float_power_tensor_scalar,
+    float_power_tensor_scalar_,
+    float_power_tensor_tensor,
+    float_power_tensor_tensor_,
+)
 from flag_gems.ops.floor import floor, floor_out
 from flag_gems.ops.floor_ import floor_
 from flag_gems.ops.fmax import fmax, fmax_out
@@ -335,6 +342,7 @@ from flag_gems.ops.lift_fresh_copy import lift_fresh_copy, lift_fresh_copy_out
 from flag_gems.ops.linalg_cholesky import linalg_cholesky
 from flag_gems.ops.linalg_ldl_factor import ldl_factor
 from flag_gems.ops.linalg_lu_factor import linalg_lu_factor, linalg_lu_factor_out
+from flag_gems.ops.linalg_ldl_solve import linalg_ldl_solve
 from flag_gems.ops.linalg_slogdet import linalg_slogdet
 from flag_gems.ops.linalg_svdvals import linalg_svdvals
 from flag_gems.ops.linear import linear
@@ -381,6 +389,7 @@ from flag_gems.ops.max_pool3d_with_indices import (
     max_pool3d_with_indices,
 )
 from flag_gems.ops.max_unpool2d import max_unpool2d
+from flag_gems.ops.max_unpool3d import max_unpool3d
 from flag_gems.ops.maximum import maximum
 from flag_gems.ops.mean import mean, mean_dim
 from flag_gems.ops.median import median, median_dim, median_dim_values, median_out
@@ -606,6 +615,7 @@ from flag_gems.ops.sym_stride import sym_stride
 from flag_gems.ops.t_copy import t_copy, t_copy_out
 from flag_gems.ops.tan import tan, tan_
 from flag_gems.ops.tanh import tanh, tanh_, tanh_backward
+from flag_gems.ops.te_rmsnorm import te_rmsnorm_bwd, te_rmsnorm_fwd
 from flag_gems.ops.tensor_split import tensor_split
 from flag_gems.ops.threshold import threshold, threshold_backward
 from flag_gems.ops.threshold_ import threshold_
@@ -757,6 +767,7 @@ __all__ = [
     "arange_start",
     "arccos",
     "arccos_",
+    "arccosh_",
     "arcsin",
     "arcsin_",
     "arcsin_out",
@@ -931,6 +942,10 @@ __all__ = [
     "flash_attn_varlen_func",
     "flash_attn_varlen_opt_func",
     "flip",
+    "float_power_tensor_scalar",
+    "float_power_tensor_scalar_",
+    "float_power_tensor_tensor",
+    "float_power_tensor_tensor_",
     "floor",
     "floor_",
     "floor_divide",
@@ -1047,6 +1062,7 @@ __all__ = [
     "linalg_cholesky",
     "linalg_lu_factor",
     "linalg_lu_factor_out",
+    "linalg_ldl_solve",
     "linalg_slogdet",
     "linalg_svdvals",
     "linear",
@@ -1109,6 +1125,7 @@ __all__ = [
     "max_pool3d_backward",
     "max_pool3d_with_indices",
     "max_unpool2d",
+    "max_unpool3d",
     "maximum",
     "mean",
     "mean_dim",
@@ -1230,6 +1247,8 @@ __all__ = [
     "rms_norm",
     "rms_norm_backward",
     "rms_norm_forward",
+    "te_rmsnorm_bwd",
+    "te_rmsnorm_fwd",
     "rnn_relu",
     "roll",
     "rot90",
