@@ -517,10 +517,10 @@ def cholesky_solve_complex_blocked_kernel(
                 update_imag = tl.dot(tile_real, w_imag)
                 update_imag += tl.dot(tile_imag, w_real)
             else:
-                update_real = tl.dot(tile_real, w_real, input_precision="tf32x3")
-                update_real -= tl.dot(tile_imag, w_imag, input_precision="tf32x3")
-                update_imag = tl.dot(tile_real, w_imag, input_precision="tf32x3")
-                update_imag += tl.dot(tile_imag, w_real, input_precision="tf32x3")
+                update_real = tl.dot(tile_real, w_real, input_precision="ieee")
+                update_real -= tl.dot(tile_imag, w_imag, input_precision="ieee")
+                update_imag = tl.dot(tile_real, w_imag, input_precision="ieee")
+                update_imag += tl.dot(tile_imag, w_real, input_precision="ieee")
             tail_real -= update_real
             tail_imag -= update_imag
             tl.store(X_ptr + tail_offset, tail_real, mask=tail_mask)
@@ -649,10 +649,10 @@ def cholesky_solve_complex_blocked_kernel(
                 update_imag = tl.dot(tile_real, w_imag)
                 update_imag += tl.dot(tile_imag, w_real)
             else:
-                update_real = tl.dot(tile_real, w_real, input_precision="tf32x3")
-                update_real -= tl.dot(tile_imag, w_imag, input_precision="tf32x3")
-                update_imag = tl.dot(tile_real, w_imag, input_precision="tf32x3")
-                update_imag += tl.dot(tile_imag, w_real, input_precision="tf32x3")
+                update_real = tl.dot(tile_real, w_real, input_precision="ieee")
+                update_real -= tl.dot(tile_imag, w_imag, input_precision="ieee")
+                update_imag = tl.dot(tile_real, w_imag, input_precision="ieee")
+                update_imag += tl.dot(tile_imag, w_real, input_precision="ieee")
             head_real -= update_real
             head_imag -= update_imag
             tl.store(X_ptr + head_offset, head_real, mask=head_mask)
@@ -1280,7 +1280,7 @@ def cholesky_solve_blocked_lower_kernel(
                     mask=rhs_mask[None, :],
                     other=0.0,
                 )
-            tail = tail - tl.dot(L_tile, y_block, input_precision="tf32x3")
+            tail = tail - tl.dot(L_tile, y_block, input_precision="ieee")
             tl.store(
                 X_ptr + B_base + rows_m[:, None] * stride_B + rhs_cols[None, :],
                 tail,
@@ -1327,7 +1327,7 @@ def cholesky_solve_blocked_lower_kernel(
                 mask=rhs_mask[None, :],
                 other=0.0,
             )
-            head = head - tl.dot(L_tile, x_block, input_precision="tf32x3")
+            head = head - tl.dot(L_tile, x_block, input_precision="ieee")
             tl.store(
                 X_ptr + B_base + rows_m[:, None] * stride_B + rhs_cols[None, :],
                 head,
@@ -1428,7 +1428,7 @@ def cholesky_solve_blocked_upper_kernel(
                     mask=rhs_mask[None, :],
                     other=0.0,
                 )
-            tail = tail - tl.dot(U_tile, y_block, input_precision="tf32x3")
+            tail = tail - tl.dot(U_tile, y_block, input_precision="ieee")
             tl.store(
                 X_ptr + B_base + rows_m[:, None] * stride_B + rhs_cols[None, :],
                 tail,
@@ -1475,7 +1475,7 @@ def cholesky_solve_blocked_upper_kernel(
                 mask=rhs_mask[None, :],
                 other=0.0,
             )
-            head = head - tl.dot(U_tile, x_block, input_precision="tf32x3")
+            head = head - tl.dot(U_tile, x_block, input_precision="ieee")
             tl.store(
                 X_ptr + B_base + rows_m[:, None] * stride_B + rhs_cols[None, :],
                 head,
