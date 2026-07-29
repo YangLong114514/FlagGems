@@ -7,7 +7,9 @@ import flag_gems
 
 from . import accuracy_utils as utils
 
-IS_ASCEND = getattr(flag_gems, "vendor_name", "") == "ascend"
+VENDOR_NAME = getattr(flag_gems, "vendor_name", "")
+IS_ASCEND = VENDOR_NAME == "ascend"
+IS_THEAD = VENDOR_NAME == "thead"
 
 if IS_ASCEND:
     from flag_gems.runtime.backend._ascend.ops.cholesky_solve import (
@@ -99,50 +101,66 @@ CHOLESKY_SOLVE_COMPLEX_BLOCKED_SHAPES = [
 ]
 
 
+def _use_cpu_complex_path(dtype):
+    return IS_THEAD and dtype in (torch.complex64, torch.complex128)
+
+
+def _move_setup_tensors_to_device(build_on_cpu, *tensors):
+    if build_on_cpu:
+        return tuple(tensor.to(flag_gems.device) for tensor in tensors)
+    return tensors
+
+
 def _make_cholesky_solve_inputs(shape, dtype, matrix_scale=1.0, rhs_scale=1.0):
     *batch_dims, n, nrhs = shape
-    B_mat = torch.randn(*batch_dims, n, n, dtype=dtype, device=flag_gems.device)
-    eye = torch.eye(n, dtype=dtype, device=flag_gems.device)
+    build_on_cpu = _use_cpu_complex_path(dtype)
+    setup_device = "cpu" if build_on_cpu else flag_gems.device
+    B_mat = torch.randn(*batch_dims, n, n, dtype=dtype, device=setup_device)
+    eye = torch.eye(n, dtype=dtype, device=setup_device)
     for _ in batch_dims:
         eye = eye.unsqueeze(0)
     A = matrix_scale * (B_mat @ B_mat.mH) + eye * 0.5
     L = torch.linalg.cholesky(A)
     rhs = rhs_scale * torch.randn(
-        *batch_dims, n, nrhs, dtype=dtype, device=flag_gems.device
+        *batch_dims, n, nrhs, dtype=dtype, device=setup_device
     )
-    return A, L, rhs
+    return _move_setup_tensors_to_device(build_on_cpu, A, L, rhs)
 
 
 def _make_cholesky_solve_broadcast_inputs(A_shape, rhs_shape, dtype, upper=False):
     *batch_dims, n, _ = A_shape
-    B_mat = torch.randn(*batch_dims, n, n, dtype=dtype, device=flag_gems.device)
-    eye = torch.eye(n, dtype=dtype, device=flag_gems.device)
+    build_on_cpu = _use_cpu_complex_path(dtype)
+    setup_device = "cpu" if build_on_cpu else flag_gems.device
+    B_mat = torch.randn(*batch_dims, n, n, dtype=dtype, device=setup_device)
+    eye = torch.eye(n, dtype=dtype, device=setup_device)
     for _ in batch_dims:
         eye = eye.unsqueeze(0)
     A = B_mat @ B_mat.mH + eye * 0.5
     factor = torch.linalg.cholesky(A, upper=upper)
-    rhs = torch.randn(*rhs_shape, dtype=dtype, device=flag_gems.device)
-    return A, factor, rhs
+    rhs = torch.randn(*rhs_shape, dtype=dtype, device=setup_device)
+    return _move_setup_tensors_to_device(build_on_cpu, A, factor, rhs)
 
 
 def _make_conditioned_inputs(shape, dtype):
     *batch_dims, n, nrhs = shape
+    build_on_cpu = _use_cpu_complex_path(dtype)
+    setup_device = "cpu" if build_on_cpu else flag_gems.device
     is_single_precision = dtype in (torch.float32, torch.complex64)
     real_dtype = torch.float32 if is_single_precision else torch.float64
     condition = 1e3 if is_single_precision else 1e6
-    Q_src = torch.randn(*batch_dims, n, n, dtype=dtype, device=flag_gems.device)
+    Q_src = torch.randn(*batch_dims, n, n, dtype=dtype, device=setup_device)
     Q, _ = torch.linalg.qr(Q_src)
     eigs = torch.logspace(
         0.0,
         math.log10(condition),
         n,
         dtype=real_dtype,
-        device=flag_gems.device,
+        device=setup_device,
     )
     A = (Q * eigs) @ Q.mH
     L = torch.linalg.cholesky(A)
-    rhs = torch.randn(*batch_dims, n, nrhs, dtype=dtype, device=flag_gems.device)
-    return A, L, rhs
+    rhs = torch.randn(*batch_dims, n, nrhs, dtype=dtype, device=setup_device)
+    return _move_setup_tensors_to_device(build_on_cpu, A, L, rhs)
 
 
 def _make_noncontiguous_last_dim(tensor):
@@ -157,6 +175,12 @@ def _make_noncontiguous_last_dim(tensor):
 
 
 def _reference_cholesky_solve(rhs, factor, upper=False):
+    if _use_cpu_complex_path(rhs.dtype):
+        ref_out = torch.cholesky_solve(
+            rhs.detach().cpu(), factor.detach().cpu(), upper=upper
+        )
+        return ref_out if utils.TO_CPU else ref_out.to(rhs.device)
+
     ref_rhs = utils.to_reference(rhs)
     ref_factor = utils.to_reference(factor)
     return torch.cholesky_solve(ref_rhs, ref_factor, upper=upper)
@@ -183,10 +207,9 @@ def _solve_out_with_gems(rhs, L, out, upper=False):
 
 
 def _assert_backward_error(A, X, rhs, dtype):
-    if IS_ASCEND:
-        # torch.linalg.cholesky falls back to CPU on Ascend. Keep the residual
-        # calculation on CPU as well to avoid mixing fallback tensors with NPU
-        # norm/matmul operations in the torch_npu runtime.
+    if IS_ASCEND or _use_cpu_complex_path(dtype):
+        # Ascend falls back to CPU during input construction, while T-Head does
+        # not support the complex GEMM used by the residual calculation.
         A = A.detach().contiguous().cpu()
         X = X.detach().contiguous().cpu()
         rhs = rhs.detach().contiguous().cpu()

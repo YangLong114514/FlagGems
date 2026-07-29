@@ -5,7 +5,9 @@ import flag_gems
 
 from . import base
 
-IS_ASCEND = flag_gems.vendor_name == "ascend"
+VENDOR_NAME = flag_gems.vendor_name
+IS_ASCEND = VENDOR_NAME == "ascend"
+IS_THEAD = VENDOR_NAME == "thead"
 
 if IS_ASCEND:
     from flag_gems.runtime.backend._ascend.ops.cholesky_solve import cholesky_solve
@@ -98,6 +100,11 @@ def test_cholesky_solve():
         torch_op = _composed_cholesky_solve
         gems_op = cholesky_solve
         dtypes = [torch.float32]
+    elif IS_THEAD:
+        # Thead torch.ops.aten.cholesky_solve do not support complex dtype
+        torch_op = torch.ops.aten.cholesky_solve
+        gems_op = None
+        dtypes = [torch.float32, torch.float64]
     else:
         torch_op = torch.ops.aten.cholesky_solve
         gems_op = None
