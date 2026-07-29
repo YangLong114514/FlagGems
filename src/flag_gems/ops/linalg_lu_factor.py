@@ -1430,11 +1430,19 @@ def linalg_lu_factor(input, *, pivot=True):
     return LinalgLUFactorResult(lu, pivots)
 
 
-def linalg_lu_factor_out(input, *, pivot=True, out=None):
-    logger.debug("GEMS LINALG_LU_FACTOR_OUT")
+def _resolve_linalg_lu_factor_out_args(LU, pivots):
+    if LU is None or pivots is None:
+        raise TypeError(
+            "linalg_lu_factor(): LU and pivots must both be provided " "for out variant"
+        )
+    return LU, pivots
+
+
+def linalg_lu_factor_out(input, *, pivot=True, LU=None, pivots=None):
+    logger.debug("GEMS LINALG_LU_FACTOR.OUT")
+    lu_out, pivots_out = _resolve_linalg_lu_factor_out_args(LU, pivots)
     lu, piv = linalg_lu_factor(input, pivot=pivot)
 
-    lu_out, pivots_out = out
     lu_out.resize_(lu.shape)
     pivots_out.resize_(piv.shape)
     lu_out.copy_(lu)

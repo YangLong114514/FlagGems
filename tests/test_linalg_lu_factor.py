@@ -149,7 +149,7 @@ def test_linalg_lu_factor_out(shape, dtype, pivot):
     )
     out = (res_LU_out, res_pivots_out)
     with flag_gems.use_gems():
-        res_LU, res_pivots = flag_gems.linalg_lu_factor_out(inp, pivot=pivot, out=out)
+        res_LU, res_pivots = torch.linalg.lu_factor(inp, pivot=pivot, out=out)
 
     assert res_LU is res_LU_out
     assert res_pivots is res_pivots_out
