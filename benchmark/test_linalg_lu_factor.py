@@ -63,7 +63,7 @@ class LinalgLuFactorOutBenchmark(base.Benchmark):
                 yield inp, {"pivot": pivot}, {"out": (LU, pivots)}
 
 
-@pytest.mark.linalg_lu_factor
+@pytest.mark.linalg_lu_factor_out
 def test_linalg_lu_factor_out():
     bench = LinalgLuFactorOutBenchmark(
         op_name="linalg_lu_factor_out",
