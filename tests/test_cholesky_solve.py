@@ -206,6 +206,14 @@ def _solve_out_with_gems(rhs, L, out, upper=False):
         return torch.cholesky_solve(rhs, L, upper=upper, out=out)
 
 
+def _assert_cholesky_solve_close(result, reference, dtype):
+    if dtype == torch.complex128:
+        result = utils.to_cpu(result, reference)
+        torch.testing.assert_close(result, reference, atol=1e-7, rtol=1e-7)
+    else:
+        utils.gems_assert_close(result, reference, dtype)
+
+
 def _assert_backward_error(A, X, rhs, dtype):
     if IS_ASCEND or _use_cpu_complex_path(dtype):
         # Ascend falls back to CPU during input construction, while T-Head does
@@ -229,7 +237,7 @@ def _assert_cholesky_solve_matches(A, factor, rhs, dtype, upper=False):
     ref_out = _reference_cholesky_solve(rhs, factor, upper=upper)
     res_out = _solve_with_gems(rhs, factor, upper=upper)
 
-    utils.gems_assert_close(res_out, ref_out, dtype)
+    _assert_cholesky_solve_close(res_out, ref_out, dtype)
     _assert_backward_error(A, res_out, rhs.expand_as(res_out), dtype)
 
 
@@ -248,7 +256,7 @@ def test_cholesky_solve(shape, dtype, contiguous_factor):
     ref_out = _reference_cholesky_solve(rhs, L, upper=False)
     res_out = _solve_with_gems(rhs, L, upper=False)
 
-    utils.gems_assert_close(res_out, ref_out, dtype)
+    _assert_cholesky_solve_close(res_out, ref_out, dtype)
 
 
 @pytest.mark.cholesky_solve
@@ -259,7 +267,7 @@ def test_cholesky_solve_larger_shapes(shape, dtype):
     ref_out = _reference_cholesky_solve(rhs, L, upper=False)
     res_out = _solve_with_gems(rhs, L, upper=False)
 
-    utils.gems_assert_close(res_out, ref_out, dtype)
+    _assert_cholesky_solve_close(res_out, ref_out, dtype)
 
 
 @pytest.mark.cholesky_solve
@@ -279,7 +287,7 @@ def test_cholesky_solve_upper(shape, dtype):
     ref_out = _reference_cholesky_solve(rhs, U, upper=True)
     res_out = _solve_with_gems(rhs, U, upper=True)
 
-    utils.gems_assert_close(res_out, ref_out, dtype)
+    _assert_cholesky_solve_close(res_out, ref_out, dtype)
     _assert_backward_error(A, res_out, rhs, dtype)
 
 
@@ -387,7 +395,7 @@ def test_cholesky_solve_batch(shape, dtype, contiguous_factor):
     ref_out = _reference_cholesky_solve(rhs, L, upper=False)
     res_out = _solve_with_gems(rhs, L, upper=False)
 
-    utils.gems_assert_close(res_out, ref_out, dtype)
+    _assert_cholesky_solve_close(res_out, ref_out, dtype)
 
 
 @pytest.mark.cholesky_solve
@@ -401,7 +409,7 @@ def test_cholesky_solve_broadcast_batch(shapes, dtype, upper):
     ref_out = _reference_cholesky_solve(rhs, L, upper=upper)
     res_out = _solve_with_gems(rhs, L, upper=upper)
 
-    utils.gems_assert_close(res_out, ref_out, dtype)
+    _assert_cholesky_solve_close(res_out, ref_out, dtype)
     assert res_out.shape == ref_out.shape
 
 
@@ -418,7 +426,7 @@ def test_cholesky_solve_noncontiguous_inputs(dtype):
     ref_out = _reference_cholesky_solve(rhs_nc, L_nc, upper=False)
     res_out = _solve_with_gems(rhs_nc, L_nc, upper=False)
 
-    utils.gems_assert_close(res_out, ref_out, dtype)
+    _assert_cholesky_solve_close(res_out, ref_out, dtype)
 
 
 @pytest.mark.cholesky_solve
@@ -431,7 +439,7 @@ def test_cholesky_solve_scaled_inputs(dtype):
         ref_out = _reference_cholesky_solve(rhs, L, upper=False)
         res_out = _solve_with_gems(rhs, L, upper=False)
 
-        utils.gems_assert_close(res_out, ref_out, dtype)
+        _assert_cholesky_solve_close(res_out, ref_out, dtype)
         _assert_backward_error(A, res_out, rhs, dtype)
 
 
@@ -442,7 +450,7 @@ def test_cholesky_solve_conditioned_matrix(dtype):
     ref_out = _reference_cholesky_solve(rhs, L, upper=False)
     res_out = _solve_with_gems(rhs, L, upper=False)
 
-    utils.gems_assert_close(res_out, ref_out, dtype)
+    _assert_cholesky_solve_close(res_out, ref_out, dtype)
     _assert_backward_error(A, res_out, rhs, dtype)
 
 
@@ -466,7 +474,7 @@ def test_cholesky_solve_direct(shape, dtype, upper):
     ref_out = _reference_cholesky_solve(rhs, factor, upper=upper)
     res_out = cholesky_solve(rhs, factor, upper=upper)
 
-    utils.gems_assert_close(res_out, ref_out, dtype)
+    _assert_cholesky_solve_close(res_out, ref_out, dtype)
 
 
 @pytest.mark.cholesky_solve
@@ -508,7 +516,7 @@ def test_cholesky_solve_complex_broadcast(dtype, upper):
     ref_out = _reference_cholesky_solve(rhs, factor, upper=upper)
     res_out = _solve_with_gems(rhs, factor, upper=upper)
 
-    utils.gems_assert_close(res_out, ref_out, dtype)
+    _assert_cholesky_solve_close(res_out, ref_out, dtype)
     assert res_out.shape == ref_out.shape
 
 
@@ -570,11 +578,11 @@ def test_cholesky_solve_complex_lazy_conjugate_with_all_gems(dtype):
     with flag_gems.use_gems(exclude=["zero_"]):
         res_out = torch.cholesky_solve(rhs, factor, upper=True)
 
-    utils.gems_assert_close(res_out, ref_out, dtype)
+    _assert_cholesky_solve_close(res_out, ref_out, dtype)
     _assert_backward_error(A, res_out, rhs, dtype)
 
 
-@pytest.mark.cholesky_solve
+@pytest.mark.cholesky_solve_out
 @pytest.mark.parametrize("dtype", _REAL_DTYPES + _COMPLEX_DTYPES)
 @pytest.mark.parametrize("upper", [False, True])
 def test_cholesky_solve_out(dtype, upper):
@@ -590,10 +598,10 @@ def test_cholesky_solve_out(dtype, upper):
     assert out.data_ptr() == original_data_ptr
     assert out.shape == ref_out.shape
     assert out.dtype == ref_out.dtype
-    utils.gems_assert_close(out, ref_out, dtype)
+    _assert_cholesky_solve_close(out, ref_out, dtype)
 
 
-@pytest.mark.cholesky_solve
+@pytest.mark.cholesky_solve_out
 def test_cholesky_solve_out_resizes_for_broadcast_result():
     dtype = torch.float32
     _, factor, rhs = _make_cholesky_solve_broadcast_inputs(
@@ -605,7 +613,7 @@ def test_cholesky_solve_out_resizes_for_broadcast_result():
     res_out = _solve_out_with_gems(rhs, factor, empty_out)
     assert res_out is empty_out
     assert empty_out.shape == ref_out.shape
-    utils.gems_assert_close(empty_out, ref_out, dtype)
+    _assert_cholesky_solve_close(empty_out, ref_out, dtype)
 
     nonempty_out = torch.empty(1, dtype=dtype, device=flag_gems.device)
     with pytest.warns(
@@ -614,10 +622,10 @@ def test_cholesky_solve_out_resizes_for_broadcast_result():
         res_out = _solve_out_with_gems(rhs, factor, nonempty_out)
     assert res_out is nonempty_out
     assert nonempty_out.shape == ref_out.shape
-    utils.gems_assert_close(nonempty_out, ref_out, dtype)
+    _assert_cholesky_solve_close(nonempty_out, ref_out, dtype)
 
 
-@pytest.mark.cholesky_solve
+@pytest.mark.cholesky_solve_out
 def test_cholesky_solve_out_noncontiguous_and_alias():
     dtype = torch.float32
     _, factor, rhs = _make_cholesky_solve_inputs((2, 16, 4), dtype)
@@ -633,15 +641,15 @@ def test_cholesky_solve_out_noncontiguous_and_alias():
     assert not out.is_contiguous()
     res_out = _solve_out_with_gems(rhs, factor, out)
     assert res_out is out
-    utils.gems_assert_close(out, ref_out, dtype)
+    _assert_cholesky_solve_close(out, ref_out, dtype)
 
     rhs_alias = rhs.clone()
     res_out = cholesky_solve_out(rhs_alias, factor, out=rhs_alias)
     assert res_out is rhs_alias
-    utils.gems_assert_close(rhs_alias, ref_out, dtype)
+    _assert_cholesky_solve_close(rhs_alias, ref_out, dtype)
 
 
-@pytest.mark.cholesky_solve
+@pytest.mark.cholesky_solve_out
 @pytest.mark.skipif(IS_ASCEND, reason="Ascend cholesky_solve only supports fp32")
 def test_cholesky_solve_out_safe_dtype_cast():
     _, factor, rhs = _make_cholesky_solve_inputs((16, 4), torch.float32)
@@ -652,10 +660,10 @@ def test_cholesky_solve_out_safe_dtype_cast():
 
     assert res_out is out
     assert out.dtype == torch.float64
-    utils.gems_assert_close(out, ref_out, torch.float64)
+    _assert_cholesky_solve_close(out, ref_out, torch.float64)
 
 
-@pytest.mark.cholesky_solve
+@pytest.mark.cholesky_solve_out
 def test_cholesky_solve_out_rejects_incompatible_dtype():
     _, factor, rhs = _make_cholesky_solve_inputs((16, 4), torch.float32)
     out = torch.empty(rhs.shape, dtype=torch.int64, device=flag_gems.device)
@@ -664,7 +672,7 @@ def test_cholesky_solve_out_rejects_incompatible_dtype():
         _solve_out_with_gems(rhs, factor, out)
 
 
-@pytest.mark.cholesky_solve
+@pytest.mark.cholesky_solve_out
 def test_cholesky_solve_out_rejects_different_device():
     _, factor, rhs = _make_cholesky_solve_inputs((16, 4), torch.float32)
     out = torch.empty(rhs.shape, dtype=rhs.dtype, device="cpu")
