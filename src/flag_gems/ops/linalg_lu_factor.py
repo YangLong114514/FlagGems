@@ -1121,16 +1121,24 @@ def _can_use_fast_triton(input):
     return m <= _LU_FACTOR_BLOCK_MAX and n <= _LU_FACTOR_BLOCK_MAX
 
 
-def _blocked_lu_factor(input_contiguous, pivot):
+def _blocked_lu_factor(input_contiguous, pivot, LU=None, pivots=None):
     batch_shape = input_contiguous.shape[:-2]
     m, n = input_contiguous.shape[-2], input_contiguous.shape[-1]
     k = min(m, n)
     batch = input_contiguous.numel() // (m * n)
 
-    lu = input_contiguous.clone()
-    pivots = torch.empty(
-        (*batch_shape, k), device=input_contiguous.device, dtype=torch.int32
-    )
+    if LU is None:
+        lu = input_contiguous.clone()
+    else:
+        LU.resize_(input_contiguous.shape)
+        LU.copy_(input_contiguous)
+        lu = LU
+    if pivots is None:
+        pivots = torch.empty(
+            (*batch_shape, k), device=input_contiguous.device, dtype=torch.int32
+        )
+    else:
+        pivots.resize_((*batch_shape, k))
 
     block_m = triton.next_power_of_2(m)
     nw = 8 if input_contiguous.dtype == torch.float64 else 4
@@ -1397,22 +1405,38 @@ def _blocked_lu_factor(input_contiguous, pivot):
     return LinalgLUFactorResult(lu, pivots)
 
 
-def linalg_lu_factor(input, *, pivot=True):
-    logger.debug("GEMS LINALG_LU_FACTOR")
+def _linalg_lu_factor_impl(input, *, pivot=True, LU=None, pivots=None):
     _linalg_lu_factor_check(input, pivot)
+
+    if (LU is not None and not LU.is_contiguous()) or (
+        pivots is not None and not pivots.is_contiguous()
+    ):
+        lu, piv = _linalg_lu_factor_impl(input, pivot=pivot)
+        LU.resize_(lu.shape)
+        pivots.resize_(piv.shape)
+        LU.copy_(lu)
+        pivots.copy_(piv)
+        return LinalgLUFactorResult(LU, pivots)
 
     input_contiguous = input.contiguous()
 
     if not _can_use_fast_triton(input_contiguous):
-        return _blocked_lu_factor(input_contiguous, pivot)
+        return _blocked_lu_factor(input_contiguous, pivot, LU=LU, pivots=pivots)
 
     batch_shape = input_contiguous.shape[:-2]
     m, n = input_contiguous.shape[-2], input_contiguous.shape[-1]
     k = min(m, n)
     batch = input_contiguous.numel() // (m * n)
 
-    lu = torch.empty_like(input_contiguous)
-    pivots = torch.empty((*batch_shape, k), device=input.device, dtype=torch.int32)
+    if LU is None:
+        lu = torch.empty_like(input_contiguous)
+    else:
+        LU.resize_(input_contiguous.shape)
+        lu = LU
+    if pivots is None:
+        pivots = torch.empty((*batch_shape, k), device=input.device, dtype=torch.int32)
+    else:
+        pivots.resize_((*batch_shape, k))
 
     with torch_device_fn.device(input.device):
         _linalg_lu_factor_kernel[(batch,)](
@@ -1430,6 +1454,11 @@ def linalg_lu_factor(input, *, pivot=True):
     return LinalgLUFactorResult(lu, pivots)
 
 
+def linalg_lu_factor(input, *, pivot=True):
+    logger.debug("GEMS LINALG_LU_FACTOR")
+    return _linalg_lu_factor_impl(input, pivot=pivot)
+
+
 def _resolve_linalg_lu_factor_out_args(LU, pivots):
     if LU is None or pivots is None:
         raise TypeError(
@@ -1441,6 +1470,4 @@ def _resolve_linalg_lu_factor_out_args(LU, pivots):
 def linalg_lu_factor_out(input, *, pivot=True, LU=None, pivots=None):
     logger.debug("GEMS LINALG_LU_FACTOR_OUT")
     lu_out, pivots_out = _resolve_linalg_lu_factor_out_args(LU, pivots)
-    lu_out, pivots_out = linalg_lu_factor(input, pivot=pivot)
-
-    return LinalgLUFactorResult(lu_out, pivots_out)
+    return _linalg_lu_factor_impl(input, pivot=pivot, LU=lu_out, pivots=pivots_out)
