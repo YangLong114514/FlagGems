@@ -39,9 +39,7 @@ def _check_cholesky_solve_out(B: torch.Tensor, out: torch.Tensor) -> None:
         )
 
 
-def _copy_cholesky_solve_out(
-    result: torch.Tensor, out: torch.Tensor
-) -> torch.Tensor:
+def _copy_cholesky_solve_out(result: torch.Tensor, out: torch.Tensor) -> torch.Tensor:
     """Resize and copy a temporary solve result into an out tensor."""
     if tuple(out.shape) != tuple(result.shape):
         if out.numel() != 0:
