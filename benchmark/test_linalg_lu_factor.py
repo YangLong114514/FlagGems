@@ -70,5 +70,4 @@ def test_linalg_lu_factor_out():
         torch_op=torch.linalg.lu_factor,
         dtypes=_TEST_DTYPES,
     )
-    bench.set_gems(flag_gems.linalg_lu_factor_out)
     bench.run()
