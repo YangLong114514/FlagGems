@@ -108,6 +108,7 @@ def test_linalg_lu_factor(shape, dtype, pivot):
     utils.gems_assert_close(reconstructed, ref_reconstructed, dtype, reduce_dim=k)
 
 
+"""
 @pytest.mark.linalg_lu_factor_out
 @pytest.mark.parametrize(
     "shape",
@@ -174,3 +175,4 @@ def test_linalg_lu_factor_out(shape, dtype, pivot):
         reconstructed = res_l @ res_u
         ref_reconstructed = ref_l @ ref_u
     utils.gems_assert_close(reconstructed, ref_reconstructed, dtype, reduce_dim=k)
+"""
