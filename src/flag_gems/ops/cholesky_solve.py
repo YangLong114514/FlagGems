@@ -2729,9 +2729,7 @@ def cholesky_solve(B, L, upper=False, *, _out=None):
         B = B.expand(batch_shape + B_shape[-2:])
 
     if B.is_complex():
-        return _cholesky_solve_complex(
-            B, L, upper, batch_shape, N, nrhs, X=_out
-        )
+        return _cholesky_solve_complex(B, L, upper, batch_shape, N, nrhs, X=_out)
 
     # Zero-copy layout normalization. Every kernel pair exists in both
     # orientations, and solving with a lower factor L is exactly solving with
