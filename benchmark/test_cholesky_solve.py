@@ -10,7 +10,10 @@ IS_ASCEND = VENDOR_NAME == "ascend"
 IS_THEAD = VENDOR_NAME == "thead"
 
 if IS_ASCEND:
-    from flag_gems.runtime.backend._ascend.ops.cholesky_solve import cholesky_solve
+    from flag_gems.runtime.backend._ascend.ops.cholesky_solve import (
+        cholesky_solve,
+        cholesky_solve_out,
+    )
 
 # Two-dimensional entries are single systems; longer entries benchmark batched
 # solves. Keep one shape list and derive both factor orientations from it so
@@ -62,6 +65,17 @@ CHOLESKY_SOLVE_CASES = [
     (shape, upper) for upper in (False, True) for shape in CHOLESKY_SOLVE_SHAPES
 ]
 
+# Keep the out benchmark intentionally small. These cases cover the main
+# dispatch paths without duplicating the complete functional benchmark matrix:
+# small-N, blocked single-RHS, an RHS tile tail, large multi-RHS, and batching.
+CHOLESKY_SOLVE_OUT_CASES = [
+    ((16, 4), False),
+    ((64, 1), True),
+    ((64, 33), False),
+    ((256, 128), True),
+    ((8, 128, 16), False),
+]
+
 
 class CholeskySolveBenchmark(base.Benchmark):
     def set_shapes(self, shape_file_path=None):
@@ -82,6 +96,16 @@ class CholeskySolveBenchmark(base.Benchmark):
             yield (rhs, factor, upper)
 
 
+class CholeskySolveOutBenchmark(CholeskySolveBenchmark):
+    def set_shapes(self, shape_file_path=None):
+        self.shapes = CHOLESKY_SOLVE_OUT_CASES
+        self.shape_desc = "((*batch, N, nrhs), upper, out)"
+
+    def get_input_iter(self, cur_dtype):
+        for rhs, factor, upper in super().get_input_iter(cur_dtype):
+            yield rhs, factor, upper, {"out": torch.empty_like(rhs)}
+
+
 def _composed_cholesky_solve(rhs, factor, upper=False):
     """Reference composed from two native triangular solves on Ascend."""
     if upper:
@@ -90,6 +114,11 @@ def _composed_cholesky_solve(rhs, factor, upper=False):
 
     y = torch.linalg.solve_triangular(factor, rhs, upper=False)
     return torch.linalg.solve_triangular(factor.mH, y, upper=True)
+
+
+def _composed_cholesky_solve_out(rhs, factor, upper=False, *, out):
+    out.copy_(_composed_cholesky_solve(rhs, factor, upper=upper))
+    return out
 
 
 @pytest.mark.cholesky_solve
@@ -117,6 +146,36 @@ def test_cholesky_solve():
 
     bench = CholeskySolveBenchmark(
         op_name="cholesky_solve",
+        torch_op=torch_op,
+        gems_op=gems_op,
+        dtypes=dtypes,
+    )
+    bench.run()
+
+
+@pytest.mark.cholesky_solve_out
+def test_cholesky_solve_out():
+    if IS_ASCEND:
+        torch_op = _composed_cholesky_solve_out
+        gems_op = cholesky_solve_out
+        dtypes = [torch.float32]
+    elif IS_THEAD:
+        # Thead torch.cholesky_solve does not support complex dtype.
+        torch_op = torch.cholesky_solve
+        gems_op = None
+        dtypes = [torch.float32, torch.float64]
+    else:
+        torch_op = torch.cholesky_solve
+        gems_op = None
+        dtypes = [
+            torch.float32,
+            torch.float64,
+            torch.complex64,
+            torch.complex128,
+        ]
+
+    bench = CholeskySolveOutBenchmark(
+        op_name="cholesky_solve_out",
         torch_op=torch_op,
         gems_op=gems_op,
         dtypes=dtypes,
