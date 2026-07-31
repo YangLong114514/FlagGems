@@ -39,6 +39,30 @@ def _check_cholesky_solve_out(B: torch.Tensor, out: torch.Tensor) -> None:
         )
 
 
+def _can_write_cholesky_solve_out_direct(
+    B: torch.Tensor, L: torch.Tensor, out: torch.Tensor
+) -> bool:
+    """Whether the solve kernels can safely use ``out`` as their X buffer."""
+    if B.layout != torch.strided or L.layout != torch.strided:
+        return False
+    if B.ndim < 2 or L.ndim < 2:
+        return False
+    if B.numel() == 0 or L.numel() == 0:
+        return False
+    if B.shape[:-2] != L.shape[:-2]:
+        # Broadcasted solves may produce a result shape different from B.
+        return False
+    if out.shape != B.shape or out.dtype != B.dtype or out.device != B.device:
+        return False
+    if not out.is_contiguous() or out.is_conj() or out.is_neg():
+        return False
+    if torch._C._is_alias_of(out, B) or torch._C._is_alias_of(out, L):
+        # A solve reads B and L while writing X, so overlapping storage needs
+        # the existing temporary-and-copy fallback.
+        return False
+    return True
+
+
 def _copy_cholesky_solve_out(result: torch.Tensor, out: torch.Tensor) -> torch.Tensor:
     """Resize and copy a temporary solve result into an out tensor."""
     if tuple(out.shape) != tuple(result.shape):
@@ -2450,7 +2474,7 @@ def _get_complex_single_rhs_launch_config(dtype, N):
     }
 
 
-def _cholesky_solve_complex(B, L, upper, batch_shape, N, nrhs):
+def _cholesky_solve_complex(B, L, upper, batch_shape, N, nrhs, X=None):
     """Launch layout-aware complex64/complex128 specialized kernels."""
     # view_as_real rejects lazy-conjugate tensors. Rebuild the same view from
     # its unconjugated base storage and carry the logical conjugation into the
@@ -2490,7 +2514,8 @@ def _cholesky_solve_complex(B, L, upper, batch_shape, N, nrhs):
         storage_conj = input_storage_conj
     if not B.is_contiguous():
         B = B.contiguous()
-    X = torch.empty_like(B)
+    if X is None:
+        X = torch.empty_like(B)
 
     batch_size = 1
     for dim in batch_shape:
@@ -2634,7 +2659,7 @@ def _cholesky_solve_complex(B, L, upper, batch_shape, N, nrhs):
     return X
 
 
-def cholesky_solve(B, L, upper=False):
+def cholesky_solve(B, L, upper=False, *, _out=None):
     """Solves a system of linear equations with a positive-definite
     matrix using the Cholesky factorization.
 
@@ -2704,7 +2729,9 @@ def cholesky_solve(B, L, upper=False):
         B = B.expand(batch_shape + B_shape[-2:])
 
     if B.is_complex():
-        return _cholesky_solve_complex(B, L, upper, batch_shape, N, nrhs)
+        return _cholesky_solve_complex(
+            B, L, upper, batch_shape, N, nrhs, X=_out
+        )
 
     # Zero-copy layout normalization. Every kernel pair exists in both
     # orientations, and solving with a lower factor L is exactly solving with
@@ -2725,7 +2752,7 @@ def cholesky_solve(B, L, upper=False):
         effective_upper = upper
     if not B.is_contiguous():
         B = B.contiguous()
-    X = torch.empty_like(B)
+    X = torch.empty_like(B) if _out is None else _out
 
     batch_size = 1
     for dim in batch_shape:
@@ -2894,8 +2921,10 @@ def cholesky_solve(B, L, upper=False):
 
 
 def cholesky_solve_out(B, L, upper=False, *, out):
-    """Out variant with the same temporary-and-copy semantics as PyTorch."""
+    """Out variant with direct writes for the common compatible case."""
     logger.debug("GEMS CHOLESKY_SOLVE_OUT")
     _check_cholesky_solve_out(B, out)
+    if _can_write_cholesky_solve_out_direct(B, L, out):
+        return cholesky_solve(B, L, upper=upper, _out=out)
     result = cholesky_solve(B, L, upper=upper)
     return _copy_cholesky_solve_out(result, out)
