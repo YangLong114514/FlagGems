@@ -1391,7 +1391,7 @@ def _linalg_lu_factor_impl(input, *, pivot=True, LU=None, pivots=None):
 
 
 def linalg_lu_factor(input, *, pivot=True):
-    logger.debug("GEMS LINALG_LU_FACTOR")
+    logger.debug("GEMS_ILUVATAR LINALG_LU_FACTOR")
     return _linalg_lu_factor_impl(input, pivot=pivot)
 
 
@@ -1404,6 +1404,6 @@ def _resolve_linalg_lu_factor_out_args(LU, pivots):
 
 
 def linalg_lu_factor_out(input, *, pivot=True, LU=None, pivots=None):
-    logger.debug("GEMS LINALG_LU_FACTOR_OUT")
+    logger.debug("GEMS_ILUVATAR LINALG_LU_FACTOR_OUT")
     lu_out, pivots_out = _resolve_linalg_lu_factor_out_args(LU, pivots)
     return _linalg_lu_factor_impl(input, pivot=pivot, LU=lu_out, pivots=pivots_out)
