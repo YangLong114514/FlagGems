@@ -8,6 +8,8 @@ import triton.language as tl
 from flag_gems.runtime import torch_device_fn
 from flag_gems.utils import libentry
 
+has_gather = hasattr(tl, "gather")
+
 logger = logging.getLogger(__name__)
 
 LinalgLUFactorResult = namedtuple("LinalgLUFactorResult", ["LU", "pivots"])
@@ -18,6 +20,7 @@ _LU_FACTOR_TILE_M = 64
 _LU_FACTOR_TILE_N = 128
 _LU_FACTOR_FUSED_TILE_N = 16
 _LU_FACTOR_ENABLE_FUSED_PIVOT = False
+_LU_FACTOR_ENABLE_FUSED_NO_PIVOT = False
 
 
 @libentry()
@@ -594,7 +597,6 @@ def _lu_factor_fused_iter_no_pivot_kernel(
     TRAIL_BLOCK_M: tl.constexpr,
     TRAIL_BLOCK_N: tl.constexpr,
     FUSE_NEXT_PANEL: tl.constexpr,
-    USE_GATHER: tl.constexpr,
 ):
     """Fused panel factor + right-block solve + trailing update for one iteration.
 
@@ -628,27 +630,13 @@ def _lu_factor_fused_iter_no_pivot_kernel(
         j_local = jj  # local column index within panel
 
         # Extract column jj from panel
-        if USE_GATHER:
-            col_idx = tl.full((BLOCK_M, 1), j_local, dtype=tl.int32)
-            col_vals = tl.ravel(tl.gather(panel_vals, col_idx, axis=1))
-        else:
-            col_vals = tl.sum(
-                tl.where(bcols[None, :] == j_local, panel_vals, 0.0), axis=1
-            )
+        col_vals = tl.sum(tl.where(bcols[None, :] == j_local, panel_vals, 0.0), axis=1)
 
         # Extract row jj from panel
-        if USE_GATHER:
-            row_idx = tl.full((1, BLOCK_B), j_local, dtype=tl.int32)
-            u_row = tl.ravel(tl.gather(panel_vals, row_idx, axis=0))
-        else:
-            u_row = tl.sum(tl.where(rows[:, None] == j_local, panel_vals, 0.0), axis=0)
+        u_row = tl.sum(tl.where(rows[:, None] == j_local, panel_vals, 0.0), axis=0)
 
         # Extract row jj from right block
-        if USE_GATHER:
-            right_row_idx = tl.full((1, RIGHT_BLOCK_N), j_local, dtype=tl.int32)
-            row_j = tl.ravel(tl.gather(right_vals, right_row_idx, axis=0))
-        else:
-            row_j = tl.sum(tl.where(brows[:, None] == j_local, right_vals, 0.0), axis=0)
+        row_j = tl.sum(tl.where(brows[:, None] == j_local, right_vals, 0.0), axis=0)
 
         # Pivot (diagonal element for no-pivot)
         pivot = tl.sum(tl.where(rows == j_local, col_vals, 0.0), axis=0)
@@ -671,7 +659,10 @@ def _lu_factor_fused_iter_no_pivot_kernel(
 
         # Right-block solve using the same L column (scaled_col).
         # Gather L factors for right-block rows (O(1) gather vs reduction).
-        l_col_right = tl.gather(scaled_col, right_rows, axis=0)
+        l_col_right = tl.sum(
+            tl.where(rows[:, None] == right_rows[None, :], scaled_col[:, None], 0.0),
+            axis=0,
+        )
         l_col_right = tl.where(brows <= j_local, 0.0, l_col_right)
         right_vals = tl.where(
             brows[:, None] > j_local,
@@ -728,22 +719,14 @@ def _lu_factor_fused_iter_no_pivot_kernel(
             j = K0 + PANEL + jj
 
             # Extract column jj from trail
-            if USE_GATHER:
-                col_idx = tl.full((TRAIL_BLOCK_M, 1), jj, dtype=tl.int32)
-                col_vals = tl.ravel(tl.gather(trail, col_idx, axis=1))
-            else:
-                col_vals = tl.sum(
-                    tl.where(trail_local_cols[None, :] == jj, trail, 0.0), axis=1
-                )
+            col_vals = tl.sum(
+                tl.where(trail_local_cols[None, :] == jj, trail, 0.0), axis=1
+            )
 
             # Extract row jj from trail
-            if USE_GATHER:
-                row_idx = tl.full((1, TRAIL_BLOCK_N), jj, dtype=tl.int32)
-                u_row = tl.ravel(tl.gather(trail, row_idx, axis=0))
-            else:
-                u_row = tl.sum(
-                    tl.where(trail_local_rows[:, None] == jj, trail, 0.0), axis=0
-                )
+            u_row = tl.sum(
+                tl.where(trail_local_rows[:, None] == jj, trail, 0.0), axis=0
+            )
 
             # Pivot (diagonal element)
             pivot = tl.sum(tl.where(trail_local_rows == jj, col_vals, 0.0), axis=0)
@@ -786,7 +769,6 @@ def _lu_factor_fused_iter_pivot_kernel(
     TRAIL_BLOCK_M: tl.constexpr,
     TRAIL_BLOCK_N: tl.constexpr,
     FUSE_NEXT_PANEL: tl.constexpr,
-    USE_GATHER: tl.constexpr,
 ):
     """Fused pivot panel factor + right swap-and-solve + trailing update.
 
@@ -820,13 +802,7 @@ def _lu_factor_fused_iter_pivot_kernel(
         j = K0 + jj
 
         # Pivot search — extract column jj
-        if USE_GATHER:
-            col_idx = tl.full((BLOCK_M, 1), jj, dtype=tl.int32)
-            row_j_idx = tl.full((1, BLOCK_B), jj, dtype=tl.int32)
-            right_row_idx = tl.full((1, RIGHT_BLOCK_N), jj, dtype=tl.int32)
-            col_vals = tl.ravel(tl.gather(panel_vals, col_idx, axis=1))
-        else:
-            col_vals = tl.sum(tl.where(bcols[None, :] == jj, panel_vals, 0.0), axis=1)
+        col_vals = tl.sum(tl.where(bcols[None, :] == jj, panel_vals, 0.0), axis=1)
         abs_col = tl.abs(col_vals)
         abs_col = tl.where(rows < j, -1.0, abs_col)
         abs_col = tl.where(rows < M, abs_col, -1.0)
@@ -834,17 +810,10 @@ def _lu_factor_fused_iter_pivot_kernel(
         pivot_row = tl.min(tl.where(abs_col == pivot_val, rows, BLOCK_M), axis=0)
 
         # Swap rows in panel — extract rows
-        if USE_GATHER:
-            row_j_panel = tl.ravel(tl.gather(panel_vals, row_j_idx, axis=0))
-        else:
-            row_j_panel = tl.sum(tl.where(rows[:, None] == jj, panel_vals, 0.0), axis=0)
-        if USE_GATHER:
-            row_p_idx = tl.full((1, BLOCK_B), pivot_row, dtype=tl.int32)
-            row_p_panel = tl.ravel(tl.gather(panel_vals, row_p_idx, axis=0))
-        else:
-            row_p_panel = tl.sum(
-                tl.where(rows[:, None] == pivot_row, panel_vals, 0.0), axis=0
-            )
+        row_j_panel = tl.sum(tl.where(rows[:, None] == jj, panel_vals, 0.0), axis=0)
+        row_p_panel = tl.sum(
+            tl.where(rows[:, None] == pivot_row, panel_vals, 0.0), axis=0
+        )
         panel_vals = tl.where(
             (rows[:, None] == j) & panel_mask, row_p_panel[None, :], panel_vals
         )
@@ -856,12 +825,7 @@ def _lu_factor_fused_iter_pivot_kernel(
         tl.store(PIVOTS + pid * K + j, pivot_row + 1)
 
         # Swap rows in right block — extract row jj
-        if USE_GATHER:
-            row_j_right = tl.ravel(tl.gather(right_vals, right_row_idx, axis=0))
-        else:
-            row_j_right = tl.sum(
-                tl.where(brows[:, None] == jj, right_vals, 0.0), axis=0
-            )
+        row_j_right = tl.sum(tl.where(brows[:, None] == jj, right_vals, 0.0), axis=0)
         row_p_right_offsets = pid * M * N + pivot_row * N + right_cols
         row_p_right = tl.load(
             LU + row_p_right_offsets, mask=right_cols < N, other=0.0
@@ -893,10 +857,7 @@ def _lu_factor_fused_iter_pivot_kernel(
         )
 
         # Scale column below diagonal
-        if USE_GATHER:
-            col_vals = tl.ravel(tl.gather(panel_vals, col_idx, axis=1))
-        else:
-            col_vals = tl.sum(tl.where(bcols[None, :] == jj, panel_vals, 0.0), axis=1)
+        col_vals = tl.sum(tl.where(bcols[None, :] == jj, panel_vals, 0.0), axis=1)
         col_vals = tl.where(rows > j, col_vals / pivot, col_vals)
         panel_vals = tl.where(
             (rows[:, None] > j) & (bcols[None, :] == jj),
@@ -906,27 +867,21 @@ def _lu_factor_fused_iter_pivot_kernel(
 
         # Rank-1 update on trailing sub-panel
         # Re-extract L column after scaling (column jj is unchanged by rank-1 update)
-        if USE_GATHER:
-            l_col = tl.ravel(tl.gather(panel_vals, col_idx, axis=1))
-        else:
-            l_col = tl.sum(tl.where(bcols[None, :] == jj, panel_vals, 0.0), axis=1)
-        if USE_GATHER:
-            u_row = tl.ravel(tl.gather(panel_vals, row_j_idx, axis=0))
-        else:
-            u_row = tl.sum(tl.where(rows[:, None] == jj, panel_vals, 0.0), axis=0)
+        l_col = tl.sum(tl.where(bcols[None, :] == jj, panel_vals, 0.0), axis=1)
+        u_row = tl.sum(tl.where(rows[:, None] == jj, panel_vals, 0.0), axis=0)
         update_mask = (rows[:, None] > j) & (bcols[None, :] > jj)
         panel_vals = tl.where(
             update_mask, panel_vals - l_col[:, None] * u_row[None, :], panel_vals
         )
 
         # ---- Right-block solve for this column (interleaved, reuses l_col) ----
-        if USE_GATHER:
-            row_j = tl.ravel(tl.gather(right_vals, right_row_idx, axis=0))
-        else:
-            row_j = tl.sum(tl.where(brows[:, None] == jj, right_vals, 0.0), axis=0)
+        row_j = tl.sum(tl.where(brows[:, None] == jj, right_vals, 0.0), axis=0)
 
         # Gather L factors for right-block rows (O(1) vs reduction)
-        l_col_right = tl.gather(l_col, right_rows, axis=0)
+        l_col_right = tl.sum(
+            tl.where(rows[:, None] == right_rows[None, :], l_col[:, None], 0.0),
+            axis=0,
+        )
         l_col_right = tl.where(brows <= jj, 0.0, l_col_right)
         right_vals = tl.where(
             brows[:, None] > jj,
@@ -978,14 +933,9 @@ def _lu_factor_fused_iter_pivot_kernel(
             j = K0 + PANEL + jj2
 
             # Pivot search on column jj2 of trail
-            if USE_GATHER:
-                col_idx2 = tl.full((TRAIL_BLOCK_M, 1), jj2, dtype=tl.int32)
-                row_jj_idx = tl.full((1, TRAIL_BLOCK_N), jj2, dtype=tl.int32)
-                col_vals = tl.ravel(tl.gather(trail, col_idx2, axis=1))
-            else:
-                col_vals = tl.sum(
-                    tl.where(trail_local_cols[None, :] == jj2, trail, 0.0), axis=1
-                )
+            col_vals = tl.sum(
+                tl.where(trail_local_cols[None, :] == jj2, trail, 0.0), axis=1
+            )
             abs_col = tl.abs(col_vals)
             abs_col = tl.where(trail_local_rows < jj2, -1.0, abs_col)
             trail_global_rows = K0 + PANEL + trail_local_rows
@@ -996,20 +946,13 @@ def _lu_factor_fused_iter_pivot_kernel(
             )
 
             # Swap rows in trail
-            if USE_GATHER:
-                row_jj = tl.ravel(tl.gather(trail, row_jj_idx, axis=0))
-            else:
-                row_jj = tl.sum(
-                    tl.where(trail_local_rows[:, None] == jj2, trail, 0.0), axis=0
-                )
-            if USE_GATHER:
-                row_p_idx = tl.full((1, TRAIL_BLOCK_N), pivot_row_local, dtype=tl.int32)
-                row_p = tl.ravel(tl.gather(trail, row_p_idx, axis=0))
-            else:
-                row_p = tl.sum(
-                    tl.where(trail_local_rows[:, None] == pivot_row_local, trail, 0.0),
-                    axis=0,
-                )
+            row_jj = tl.sum(
+                tl.where(trail_local_rows[:, None] == jj2, trail, 0.0), axis=0
+            )
+            row_p = tl.sum(
+                tl.where(trail_local_rows[:, None] == pivot_row_local, trail, 0.0),
+                axis=0,
+            )
             trail = tl.where((trail_local_rows[:, None] == jj2), row_p[None, :], trail)
             trail = tl.where(
                 (trail_local_rows[:, None] == pivot_row_local), row_jj[None, :], trail
@@ -1019,12 +962,9 @@ def _lu_factor_fused_iter_pivot_kernel(
             tl.store(PIVOTS + pid * K + j, pivot_row_global + 1)
 
             # Extract column after swap for pivot value
-            if USE_GATHER:
-                col_vals = tl.ravel(tl.gather(trail, col_idx2, axis=1))
-            else:
-                col_vals = tl.sum(
-                    tl.where(trail_local_cols[None, :] == jj2, trail, 0.0), axis=1
-                )
+            col_vals = tl.sum(
+                tl.where(trail_local_cols[None, :] == jj2, trail, 0.0), axis=1
+            )
 
             # Pivot value (diagonal element)
             pivot = tl.sum(tl.where(trail_local_rows == jj2, col_vals, 0.0), axis=0)
@@ -1040,12 +980,9 @@ def _lu_factor_fused_iter_pivot_kernel(
             )
 
             # Rank-1 update on trailing submatrix
-            if USE_GATHER:
-                u_row = tl.ravel(tl.gather(trail, row_jj_idx, axis=0))
-            else:
-                u_row = tl.sum(
-                    tl.where(trail_local_rows[:, None] == jj2, trail, 0.0), axis=0
-                )
+            u_row = tl.sum(
+                tl.where(trail_local_rows[:, None] == jj2, trail, 0.0), axis=0
+            )
             update_mask = (trail_local_rows[:, None] > jj2) & (
                 trail_local_cols[None, :] > jj2
             )
@@ -1196,7 +1133,6 @@ def _blocked_lu_factor(input_contiguous, pivot, LU=None, pivots=None):
                         trail_block_m,
                         trail_block_n,
                         FUSE_NEXT_PANEL=fuse_next,
-                        USE_GATHER=(nw == 8),
                         num_warps=nw,
                     )
                     if fuse_next:
@@ -1311,7 +1247,8 @@ def _blocked_lu_factor(input_contiguous, pivot, LU=None, pivots=None):
                 # For small matrices (k <= 128), fuse panel+solve+trailing_update
                 # into a single kernel to reduce kernel-launch overhead.
                 if (
-                    k <= 128
+                    _LU_FACTOR_ENABLE_FUSED_NO_PIVOT
+                    and k <= 128
                     and trailing_m > 0
                     and trailing_n > 0
                     and trailing_n <= panel_size
@@ -1336,7 +1273,6 @@ def _blocked_lu_factor(input_contiguous, pivot, LU=None, pivots=None):
                         trail_block_m,
                         trail_block_n,
                         FUSE_NEXT_PANEL=fuse_next,
-                        USE_GATHER=(nw == 8),
                         num_warps=nw,
                     )
                     if fuse_next:
