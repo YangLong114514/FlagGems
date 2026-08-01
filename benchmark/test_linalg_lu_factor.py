@@ -8,12 +8,10 @@ from . import base
 DEVICE = flag_gems.device
 VENDOR = flag_gems.vendor_name
 
-if DEVICE == "cuda":
+if VENDOR == "nvidia":
     _TEST_DTYPES = [torch.float32, torch.float64]
-elif DEVICE == "npu":
-    _TEST_DTYPES = [torch.float32]
 else:
-    _TEST_DTYPES = [torch.float32, torch.float64]
+    _TEST_DTYPES = [torch.float32]
 
 # pivot=False is only supported on CUDA
 if DEVICE == "cuda":
