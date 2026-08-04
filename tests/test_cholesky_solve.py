@@ -195,6 +195,10 @@ def _solve_out_with_gems(rhs, L, out, upper=False):
 
 
 def _assert_cholesky_solve_close(result, reference, dtype):
+    if IS_ILUVATAR and dtype in (torch.complex64, torch.complex128):
+        # Avoid CoreX complex comparison kernels while validating this op.
+        result = result.detach().contiguous().cpu()
+        reference = reference.detach().contiguous().cpu()
     if dtype == torch.complex128:
         result = utils.to_cpu(result, reference)
         torch.testing.assert_close(result, reference, atol=1e-7, rtol=1e-7)
@@ -208,9 +212,9 @@ def _assert_backward_error(A, X, rhs, dtype):
     )
     if use_cpu_residual:
         # Ascend falls back to CPU during input construction, while T-Head does
-        # not support the complex GEMM used by the residual calculation.
-        # CoreX complex GEMM can corrupt the narrow RHS buffer for matrix-vector
-        # residuals (for example 64x64 @ 64x1), so validate that residual on CPU.
+        # not support the complex GEMM used by the residual calculation. CoreX
+        # complex validation kernels are also unreliable for narrow operands,
+        # so keep both output comparison and residual validation on CPU.
         A = A.detach().contiguous().cpu()
         X = X.detach().contiguous().cpu()
         rhs = rhs.detach().contiguous().cpu()
