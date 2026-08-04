@@ -3195,7 +3195,7 @@ def _get_portable_single_rhs_blocked_launch_config(dtype, N):
     return _get_single_rhs_blocked_launch_config(dtype, N)
 
 
-def _get_portable_blocked_launch_config(dtype, N):
+def _get_portable_blocked_launch_config(dtype, N, min_dot_rhs=1):
     """Return tile/warp configs for the portable blocked multi-RHS kernels.
 
     Measured on MetaX MC550. fp32 keeps the H20-style 32x32x4 tl.dot tiles,
@@ -3215,13 +3215,13 @@ def _get_portable_blocked_launch_config(dtype, N):
     return {
         "BLOCK_K": 32,
         "BLOCK_M": 32,
-        "BLOCK_RHS": 4,
+        "BLOCK_RHS": max(4, min_dot_rhs),
         "num_warps": 4,
         "num_stages": 1,
     }
 
 
-def _get_portable_complex_blocked_launch_config(dtype, N):
+def _get_portable_complex_blocked_launch_config(dtype, N, min_dot_rhs=1):
     """Return tile/warp configs for the portable blocked complex kernels.
 
     Measured on MetaX MC550. complex64 keeps the tl.dot configuration;
@@ -3239,7 +3239,7 @@ def _get_portable_complex_blocked_launch_config(dtype, N):
     return {
         "BLOCK_K": 32,
         "BLOCK_M": 64 if N >= 256 else 32,
-        "BLOCK_RHS": 4,
+        "BLOCK_RHS": max(4, min_dot_rhs),
         "num_warps": 4,
         "num_stages": 1,
     }
@@ -3353,6 +3353,7 @@ def cholesky_solve_complex_invert_blocks_portable_kernel(
     diag_real = tl.load(L_ptr + diag_offset)
     # A valid complex Cholesky factor has a positive real diagonal.
     inv_diag = 1.0 / diag_real
+    inv_diag = inv_diag * (2.0 - diag_real * inv_diag)
 
     t_real = tl.where(rows[:, None] == rows[None, :], 1.0, 0.0).to(
         L_ptr.dtype.element_ty
@@ -3444,6 +3445,7 @@ def cholesky_solve_complex_blocked_portable_kernel(
         diag_offset = L_base + rows_k * stride_L_row + rows_k * stride_L_col
         diag_real = tl.load(L_ptr + diag_offset)
         inv_diag = 1.0 / diag_real
+        inv_diag = inv_diag * (2.0 - diag_real * inv_diag)
         sv_real = y_real * inv_diag[:, None]
         sv_imag = y_imag * inv_diag[:, None]
 
@@ -3554,6 +3556,7 @@ def cholesky_solve_complex_blocked_portable_kernel(
         diag_offset = L_base + rows_k * stride_L_row + rows_k * stride_L_col
         diag_real = tl.load(L_ptr + diag_offset)
         inv_diag = 1.0 / diag_real
+        inv_diag = inv_diag * (2.0 - diag_real * inv_diag)
 
         t_off = (
             T_base + k * BLOCK_K * 2 + k_offsets[:, None] * (BLOCK_K * 2)
@@ -3691,6 +3694,7 @@ def cholesky_solve_complex_single_rhs_blocked_portable_kernel(
         diag_offset = L_base + rows_k * stride_L_row + rows_k * stride_L_col
         diag_real = tl.load(L_ptr + diag_offset)
         inv_diag = 1.0 / diag_real
+        inv_diag = inv_diag * (2.0 - diag_real * inv_diag)
         sv_real = y_real * inv_diag
         sv_imag = y_imag * inv_diag
 
@@ -3762,6 +3766,7 @@ def cholesky_solve_complex_single_rhs_blocked_portable_kernel(
         diag_offset = L_base + rows_k * stride_L_row + rows_k * stride_L_col
         diag_real = tl.load(L_ptr + diag_offset)
         inv_diag = 1.0 / diag_real
+        inv_diag = inv_diag * (2.0 - diag_real * inv_diag)
 
         t_off = (
             T_base + k * BLOCK_K * 2 + k_offsets[:, None] * (BLOCK_K * 2)
@@ -3858,6 +3863,7 @@ def cholesky_solve_complex_small_portable_kernel(
     diag_real = tl.load(L_ptr + diag_offset, mask=rows_mask, other=1.0)
     # A valid complex Cholesky factor has a positive real diagonal.
     inv_diag = 1.0 / diag_real
+    inv_diag = inv_diag * (2.0 - diag_real * inv_diag)
 
     # Phase 1: solve L * Y = B, or U^H * Y = B.
     scaled_real = w_real * inv_diag[:, None]
@@ -3930,6 +3936,7 @@ def _cholesky_solve_complex(
     nrhs,
     X=None,
     use_portable_kernels=False,
+    portable_min_dot_rhs=1,
 ):
     """Launch layout-aware complex64/complex128 specialized kernels."""
     # view_as_real rejects lazy-conjugate tensors. Rebuild the same view from
@@ -3983,7 +3990,9 @@ def _cholesky_solve_complex(
 
     with torch.no_grad():
         if use_portable_kernels and (
-            (N <= 32 and nrhs <= 8) or (N < 64 and nrhs == 1)
+            (N <= 32 and nrhs <= 8)
+            or (portable_min_dot_rhs > 1 and N <= 32)
+            or (N < 64 and nrhs == 1)
         ):
             # Portable register-resident path: masked-reduce pivots instead
             # of the tl.gather used by the optimized small kernel.
@@ -4013,7 +4022,9 @@ def _cholesky_solve_complex(
             # (parallel masked-reduce kernel), then apply each block with a
             # single complex matmul.
             is_double = B.dtype == torch.complex128
-            config = _get_portable_complex_blocked_launch_config(B.dtype, N)
+            config = _get_portable_complex_blocked_launch_config(
+                B.dtype, N, portable_min_dot_rhs
+            )
             block_k = config["BLOCK_K"]
             T_scratch = torch.empty(
                 (2, batch_size, N, block_k, 2), dtype=B_real.dtype, device=B.device
@@ -4258,7 +4269,15 @@ def _cholesky_solve_complex(
     return X
 
 
-def cholesky_solve(B, L, upper=False, *, _out=None, _use_portable_kernels=False):
+def cholesky_solve(
+    B,
+    L,
+    upper=False,
+    *,
+    _out=None,
+    _use_portable_kernels=False,
+    _portable_min_dot_rhs=1,
+):
     """Solves a system of linear equations with a positive-definite
     matrix using the Cholesky factorization.
 
@@ -4337,6 +4356,7 @@ def cholesky_solve(B, L, upper=False, *, _out=None, _use_portable_kernels=False)
             nrhs,
             X=_out,
             use_portable_kernels=_use_portable_kernels,
+            portable_min_dot_rhs=_portable_min_dot_rhs,
         )
 
     # Zero-copy layout normalization. Every kernel pair exists in both
@@ -4380,7 +4400,9 @@ def cholesky_solve(B, L, upper=False, *, _out=None, _use_portable_kernels=False)
             if _can_use_blocked_path(N, nrhs):
                 # num_stages=1: the pipeliner mishandles the cross-warp
                 # debug_barrier handoff in these kernels on some backends.
-                tile = _get_portable_blocked_launch_config(B.dtype, N)
+                tile = _get_portable_blocked_launch_config(
+                    B.dtype, N, _portable_min_dot_rhs
+                )
                 block_k = tile["BLOCK_K"]
                 T_scratch = torch.empty(
                     (2, batch_size, N, block_k), dtype=B.dtype, device=B.device
@@ -4480,7 +4502,9 @@ def cholesky_solve(B, L, upper=False, *, _out=None, _use_portable_kernels=False)
                     dtype_flag=dtype_flag,
                     **single_rhs_config,
                 )
-            elif _can_use_small_gather_path(N, nrhs):
+            elif _can_use_small_gather_path(N, nrhs) or (
+                _portable_min_dot_rhs > 1 and N <= 32
+            ):
                 block_n = triton.next_power_of_2(N)
                 block_rhs = triton.next_power_of_2(nrhs)
                 cholesky_solve_small_portable_kernel[(batch_size,)](

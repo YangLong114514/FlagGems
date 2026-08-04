@@ -33,6 +33,7 @@ def cholesky_solve(B, L, upper=False, *, _out=None):
         upper=upper,
         _out=_out,
         _use_portable_kernels=True,
+        _portable_min_dot_rhs=16,
     )
 
 
