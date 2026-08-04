@@ -154,8 +154,9 @@ def test_linalg_lu_factor_ex_check_errors(shape, dtype, pivot):
 def test_linalg_lu_factor_ex_singular(shape, dtype):
     """Test that singular matrices produce non-zero info."""
     inp = _make_singular_input(shape, flag_gems.device, dtype)
+    ref_inp = utils.to_reference(inp)
 
-    ref_out = torch.linalg.lu_factor_ex(inp, pivot=True, check_errors=False)
+    ref_out = torch.linalg.lu_factor_ex(ref_inp, pivot=True, check_errors=False)
     with flag_gems.use_gems():
         res_out = torch.linalg.lu_factor_ex(inp, pivot=True, check_errors=False)
 
