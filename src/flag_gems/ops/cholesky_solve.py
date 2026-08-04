@@ -2474,7 +2474,16 @@ def _get_complex_single_rhs_launch_config(dtype, N):
     }
 
 
-def _cholesky_solve_complex(B, L, upper, batch_shape, N, nrhs, X=None):
+def _cholesky_solve_complex(
+    B,
+    L,
+    upper,
+    batch_shape,
+    N,
+    nrhs,
+    X=None,
+    use_portable_kernels=False,
+):
     """Launch layout-aware complex64/complex128 specialized kernels."""
     # view_as_real rejects lazy-conjugate tensors. Rebuild the same view from
     # its unconjugated base storage and carry the logical conjugation into the
@@ -2526,7 +2535,30 @@ def _cholesky_solve_complex(B, L, upper, batch_shape, N, nrhs, X=None):
     X_real = torch.view_as_real(X).reshape(-1, N, nrhs, 2)
 
     with torch.no_grad():
-        if (N <= 32 and nrhs <= 8) or (N < 64 and nrhs == 1):
+        if use_portable_kernels:
+            # Keep a scalar-substitution fallback for Triton backends that
+            # cannot lower the tl.gather used by the optimized kernels.
+            block_rhs = 4 if B.dtype == torch.complex64 else 2
+            grid = (batch_size, triton.cdiv(nrhs, block_rhs))
+            cholesky_solve_complex_kernel[grid](
+                L_real,
+                B_real,
+                X_real,
+                N,
+                nrhs,
+                L_real.stride(0),
+                B_real.stride(0),
+                L_real.stride(1),
+                L_real.stride(2),
+                B_real.stride(1),
+                B_real.stride(2),
+                BLOCK_RHS=block_rhs,
+                upper=effective_upper,
+                storage_conj=storage_conj,
+                num_warps=1,
+                num_stages=1,
+            )
+        elif (N <= 32 and nrhs <= 8) or (N < 64 and nrhs == 1):
             block_n = triton.next_power_of_2(N)
             block_rhs = triton.next_power_of_2(nrhs)
             num_warps = (
@@ -2659,7 +2691,7 @@ def _cholesky_solve_complex(B, L, upper, batch_shape, N, nrhs, X=None):
     return X
 
 
-def cholesky_solve(B, L, upper=False, *, _out=None):
+def cholesky_solve(B, L, upper=False, *, _out=None, _use_portable_kernels=False):
     """Solves a system of linear equations with a positive-definite
     matrix using the Cholesky factorization.
 
@@ -2729,7 +2761,16 @@ def cholesky_solve(B, L, upper=False, *, _out=None):
         B = B.expand(batch_shape + B_shape[-2:])
 
     if B.is_complex():
-        return _cholesky_solve_complex(B, L, upper, batch_shape, N, nrhs, X=_out)
+        return _cholesky_solve_complex(
+            B,
+            L,
+            upper,
+            batch_shape,
+            N,
+            nrhs,
+            X=_out,
+            use_portable_kernels=_use_portable_kernels,
+        )
 
     # Zero-copy layout normalization. Every kernel pair exists in both
     # orientations, and solving with a lower factor L is exactly solving with
@@ -2768,7 +2809,39 @@ def cholesky_solve(B, L, upper=False, *, _out=None):
     dtype_flag = 0 if B.dtype == torch.float32 else 1
 
     with torch.no_grad():
-        if _can_use_blocked_path(N, nrhs):
+        if _use_portable_kernels:
+            if nrhs == 1:
+                cholesky_solve_single_rhs_kernel[(batch_size,)](
+                    L_kernel,
+                    B_kernel,
+                    X_kernel,
+                    N,
+                    batch_stride_L,
+                    batch_stride_B,
+                    stride_L,
+                    stride_B,
+                    dtype_flag=dtype_flag,
+                    upper=effective_upper,
+                )
+            else:
+                grid = lambda meta: (
+                    batch_size,
+                    triton.cdiv(nrhs, meta["BLOCK_RHS"]),
+                )
+                cholesky_solve_kernel[grid](
+                    L_kernel,
+                    B_kernel,
+                    X_kernel,
+                    N,
+                    nrhs,
+                    batch_stride_L,
+                    batch_stride_B,
+                    stride_L,
+                    stride_B,
+                    dtype_flag=dtype_flag,
+                    upper=effective_upper,
+                )
+        elif _can_use_blocked_path(N, nrhs):
             tile = _get_blocked_tile_config(B.dtype)
             warp = _get_blocked_warp_config(B.dtype)
             grid = (batch_size, triton.cdiv(nrhs, tile["BLOCK_RHS"]))
