@@ -9,7 +9,6 @@ from . import accuracy_utils as utils
 
 VENDOR_NAME = getattr(flag_gems, "vendor_name", "")
 IS_ASCEND = VENDOR_NAME == "ascend"
-IS_ILUVATAR = VENDOR_NAME == "iluvatar"
 IS_THEAD = VENDOR_NAME == "thead"
 SUPPORT_FP64 = flag_gems.runtime.device.support_fp64
 
@@ -195,10 +194,6 @@ def _solve_out_with_gems(rhs, L, out, upper=False):
 
 
 def _assert_cholesky_solve_close(result, reference, dtype):
-    if IS_ILUVATAR and dtype in (torch.complex64, torch.complex128):
-        # Avoid CoreX complex comparison kernels while validating this op.
-        result = result.detach().contiguous().cpu()
-        reference = reference.detach().contiguous().cpu()
     if dtype == torch.complex128:
         result = utils.to_cpu(result, reference)
         torch.testing.assert_close(result, reference, atol=1e-7, rtol=1e-7)
@@ -207,14 +202,9 @@ def _assert_cholesky_solve_close(result, reference, dtype):
 
 
 def _assert_backward_error(A, X, rhs, dtype):
-    use_cpu_residual = IS_ASCEND or _use_cpu_complex_path(dtype) or (
-        IS_ILUVATAR and dtype in (torch.complex64, torch.complex128)
-    )
-    if use_cpu_residual:
+    if IS_ASCEND or _use_cpu_complex_path(dtype):
         # Ascend falls back to CPU during input construction, while T-Head does
-        # not support the complex GEMM used by the residual calculation. CoreX
-        # complex validation kernels are also unreliable for narrow operands,
-        # so keep both output comparison and residual validation on CPU.
+        # not support the complex GEMM used by the residual calculation.
         A = A.detach().contiguous().cpu()
         X = X.detach().contiguous().cpu()
         rhs = rhs.detach().contiguous().cpu()

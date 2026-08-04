@@ -1147,6 +1147,17 @@ def _get_complex_single_rhs_launch_config(dtype, N):
     and 64 rows for the wider complex128 elements. complex128 at N >= 256
     takes the inverse-matvec path instead (see the dispatcher).
     """
+    if dtype == torch.complex64 and N == 64:
+        # CoreX must not lower a partially masked 64-row interleaved-complex
+        # panel here: the only forward/backward panel contains exactly 32 rows.
+        # Matching BLOCK_M to that extent avoids any masked tail store without
+        # adding another panel iteration.
+        return {
+            "BLOCK_K": 32,
+            "BLOCK_M": 32,
+            "num_warps": 2,
+            "num_stages": 1,
+        }
     if dtype == torch.complex128:
         return {
             "BLOCK_K": 32,
