@@ -1190,6 +1190,18 @@ def _get_portable_blocked_launch_config(dtype, N, min_dot_rhs=16):
     }
 
 
+def _get_portable_sum_blocked_launch_config(dtype, N):
+    if dtype == torch.float64:
+        return _get_portable_blocked_launch_config(dtype, N)
+    return {
+        "BLOCK_K": 16,
+        "BLOCK_M": 32 if N >= 128 else 16,
+        "BLOCK_RHS": 4,
+        "num_warps": 4,
+        "num_stages": 1,
+    }
+
+
 def _get_portable_complex_blocked_launch_config(dtype, N, min_dot_rhs=16):
     if dtype == torch.complex128:
         return {
@@ -2162,8 +2174,16 @@ def cholesky_solve(
             if _can_use_blocked_path(N, nrhs):
                 # num_stages=1: the pipeliner mishandles the cross-warp
                 # debug_barrier handoff in these kernels on some backends.
-                tile = _get_portable_blocked_launch_config(
+                dot_tile = _get_portable_blocked_launch_config(
                     B.dtype, N, _portable_min_dot_rhs
+                )
+                use_sum_kernel = dtype_flag == 1 or (
+                    nrhs % dot_tile["BLOCK_RHS"] == 0
+                )
+                tile = (
+                    _get_portable_sum_blocked_launch_config(B.dtype, N)
+                    if use_sum_kernel
+                    else dot_tile
                 )
                 block_k = tile["BLOCK_K"]
                 T_scratch = torch.empty(
@@ -2185,9 +2205,9 @@ def cholesky_solve(
                     num_stages=1,
                 )
                 grid = (batch_size, triton.cdiv(nrhs, tile["BLOCK_RHS"]))
-                if dtype_flag == 1:
-                    # fp64 has no correct tl.dot lowering on portable-path
-                    # backends; use the tl.sum-dedicated kernels instead.
+                if use_sum_kernel:
+                    # CoreX miscomputes full-width fp32 tl.dot tiles; fp64
+                    # also has no correct tl.dot lowering. Use explicit sums.
                     solve_kernel = (
                         cholesky_solve_blocked_upper_portable_fp64_kernel
                         if effective_upper
@@ -2206,7 +2226,7 @@ def cholesky_solve(
                     "num_warps": tile["num_warps"],
                     "num_stages": tile["num_stages"],
                 }
-                if dtype_flag == 0:
+                if not use_sum_kernel:
                     solve_args["dtype_flag"] = dtype_flag
                 solve_kernel[grid](
                     L_kernel,
