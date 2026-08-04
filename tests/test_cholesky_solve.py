@@ -9,6 +9,7 @@ from . import accuracy_utils as utils
 
 VENDOR_NAME = getattr(flag_gems, "vendor_name", "")
 IS_ASCEND = VENDOR_NAME == "ascend"
+IS_ILUVATAR = VENDOR_NAME == "iluvatar"
 IS_THEAD = VENDOR_NAME == "thead"
 SUPPORT_FP64 = flag_gems.runtime.device.support_fp64
 
@@ -202,9 +203,14 @@ def _assert_cholesky_solve_close(result, reference, dtype):
 
 
 def _assert_backward_error(A, X, rhs, dtype):
-    if IS_ASCEND or _use_cpu_complex_path(dtype):
+    use_cpu_residual = IS_ASCEND or _use_cpu_complex_path(dtype) or (
+        IS_ILUVATAR and dtype in (torch.complex64, torch.complex128)
+    )
+    if use_cpu_residual:
         # Ascend falls back to CPU during input construction, while T-Head does
         # not support the complex GEMM used by the residual calculation.
+        # CoreX complex GEMM can corrupt the narrow RHS buffer for matrix-vector
+        # residuals (for example 64x64 @ 64x1), so validate that residual on CPU.
         A = A.detach().contiguous().cpu()
         X = X.detach().contiguous().cpu()
         rhs = rhs.detach().contiguous().cpu()

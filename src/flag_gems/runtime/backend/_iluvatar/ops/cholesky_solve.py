@@ -1147,15 +1147,6 @@ def _get_complex_single_rhs_launch_config(dtype, N):
     and 64 rows for the wider complex128 elements. complex128 at N >= 256
     takes the inverse-matvec path instead (see the dispatcher).
     """
-    if dtype == torch.complex64 and N == 64:
-        # Smaller inverse blocks reduce complex64 accumulation error while
-        # retaining blocked panel updates and one-CTA execution.
-        return {
-            "BLOCK_K": 16,
-            "BLOCK_M": 64,
-            "num_warps": 2,
-            "num_stages": 1,
-        }
     if dtype == torch.complex128:
         return {
             "BLOCK_K": 32,
