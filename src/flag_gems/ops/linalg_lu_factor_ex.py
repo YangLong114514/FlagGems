@@ -88,7 +88,7 @@ def _linalg_lu_factor_kernel_with_info(
     mask = (rows[:, None] < M) & (cols[None, :] < N)
     work = tl.load(A + offsets, mask=mask, other=0.0).to(tl.float32)
 
-    info_val: tl.int32 = 0
+    info_val = 0
 
     for j_ind in tl.range(0, K):
         if PIVOT:
