@@ -17,7 +17,7 @@ if IS_ASCEND:
         cholesky_solve_out,
     )
 else:
-    from flag_gems.ops.cholesky_solve import cholesky_solve, cholesky_solve_out
+    from flag_gems import cholesky_solve, cholesky_solve_out
 
 
 CHOLESKY_SOLVE_BASIC_SHAPES = [
@@ -644,7 +644,7 @@ def test_cholesky_solve_out_noncontiguous_and_alias():
     _assert_cholesky_solve_close(out, ref_out, dtype)
 
     rhs_alias = rhs.clone()
-    res_out = _solve_out_with_gems(rhs_alias, factor, rhs_alias)
+    res_out = cholesky_solve_out(rhs_alias, factor, out=rhs_alias)
     assert res_out is rhs_alias
     _assert_cholesky_solve_close(rhs_alias, ref_out, dtype)
 
