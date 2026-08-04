@@ -10,6 +10,7 @@ from . import accuracy_utils as utils
 VENDOR_NAME = getattr(flag_gems, "vendor_name", "")
 IS_ASCEND = VENDOR_NAME == "ascend"
 IS_THEAD = VENDOR_NAME == "thead"
+SUPPORT_FP64 = flag_gems.runtime.device.support_fp64
 
 
 CHOLESKY_SOLVE_BASIC_SHAPES = [
@@ -227,8 +228,12 @@ def _assert_cholesky_solve_matches(A, factor, rhs, dtype, upper=False):
     _assert_backward_error(A, res_out, rhs.expand_as(res_out), dtype)
 
 
-_REAL_DTYPES = [torch.float32] if IS_ASCEND else [torch.float32, torch.float64]
-_COMPLEX_DTYPES = [] if IS_ASCEND else [torch.complex64, torch.complex128]
+_REAL_DTYPES = [torch.float32] + ([torch.float64] if SUPPORT_FP64 else [])
+_COMPLEX_DTYPES = (
+    []
+    if IS_ASCEND
+    else [torch.complex64] + ([torch.complex128] if SUPPORT_FP64 else [])
+)
 
 
 @pytest.mark.cholesky_solve
@@ -337,7 +342,7 @@ def test_cholesky_solve_ascend_blocked_single_rhs_conditioned(upper):
 
 
 @pytest.mark.cholesky_solve
-@pytest.mark.skipif(IS_ASCEND, reason="fp64 not supported on Ascend")
+@pytest.mark.skipif(not SUPPORT_FP64, reason="fp64 not supported on this backend")
 @pytest.mark.parametrize("shape", CHOLESKY_SOLVE_FP64_BLOCKED_SHAPES)
 @pytest.mark.parametrize("upper", [False, True])
 def test_cholesky_solve_fp64_blocked(shape, upper):
@@ -636,7 +641,7 @@ def test_cholesky_solve_out_noncontiguous_and_alias():
 
 
 @pytest.mark.cholesky_solve_out
-@pytest.mark.skipif(IS_ASCEND, reason="Ascend cholesky_solve only supports fp32")
+@pytest.mark.skipif(not SUPPORT_FP64, reason="fp64 output not supported on this backend")
 def test_cholesky_solve_out_safe_dtype_cast():
     _, factor, rhs = _make_cholesky_solve_inputs((16, 4), torch.float32)
     ref_out = _reference_cholesky_solve(rhs, factor).to(torch.float64)
@@ -695,6 +700,6 @@ def test_cholesky_solve_invalid_inputs():
     with pytest.raises(ValueError, match="not broadcastable"):
         _solve_with_gems(B_bad_batch, L_bad_batch)
 
-    B_bad_dtype = torch.randn(2, 1, dtype=torch.float64, device=flag_gems.device)
+    B_bad_dtype = torch.randn(2, 1, dtype=torch.float16, device=flag_gems.device)
     with pytest.raises(AssertionError, match="same dtype"):
         _solve_with_gems(B_bad_dtype, L_square)
