@@ -11,14 +11,6 @@ VENDOR_NAME = getattr(flag_gems, "vendor_name", "")
 IS_ASCEND = VENDOR_NAME == "ascend"
 IS_THEAD = VENDOR_NAME == "thead"
 
-if IS_ASCEND:
-    from flag_gems.runtime.backend._ascend.ops.cholesky_solve import (
-        cholesky_solve,
-        cholesky_solve_out,
-    )
-else:
-    from flag_gems import cholesky_solve, cholesky_solve_out
-
 
 CHOLESKY_SOLVE_BASIC_SHAPES = [
     (2, 1),
@@ -187,18 +179,12 @@ def _reference_cholesky_solve(rhs, factor, upper=False):
 
 
 def _solve_with_gems(rhs, L, upper=False):
-    if IS_ASCEND:
-        return cholesky_solve(rhs, L, upper=upper)
-
     with flag_gems.use_gems(include=["cholesky_solve"]):
         assert "cholesky_solve" in flag_gems.current_work_registrar.get_all_keys()
         return torch.cholesky_solve(rhs, L, upper=upper)
 
 
 def _solve_out_with_gems(rhs, L, out, upper=False):
-    if IS_ASCEND:
-        return cholesky_solve_out(rhs, L, upper=upper, out=out)
-
     with flag_gems.use_gems(include=["cholesky_solve", "cholesky_solve_out"]):
         registered_keys = flag_gems.current_work_registrar.get_all_keys()
         assert "cholesky_solve" in registered_keys
@@ -472,7 +458,7 @@ def test_cholesky_solve_direct(shape, dtype, upper):
     factor = L.mH.contiguous() if upper else L
 
     ref_out = _reference_cholesky_solve(rhs, factor, upper=upper)
-    res_out = cholesky_solve(rhs, factor, upper=upper)
+    res_out = _solve_with_gems(rhs, factor, upper=upper)
 
     _assert_cholesky_solve_close(res_out, ref_out, dtype)
 
@@ -644,7 +630,7 @@ def test_cholesky_solve_out_noncontiguous_and_alias():
     _assert_cholesky_solve_close(out, ref_out, dtype)
 
     rhs_alias = rhs.clone()
-    res_out = cholesky_solve_out(rhs_alias, factor, out=rhs_alias)
+    res_out = _solve_out_with_gems(rhs_alias, factor, rhs_alias)
     assert res_out is rhs_alias
     _assert_cholesky_solve_close(rhs_alias, ref_out, dtype)
 
@@ -686,7 +672,7 @@ def test_cholesky_solve_empty_input():
     B = torch.empty(0, 0, dtype=torch.float32, device=flag_gems.device)
     L = torch.empty(0, 0, dtype=torch.float32, device=flag_gems.device)
 
-    assert cholesky_solve(B, L) is B
+    assert _solve_with_gems(B, L) is B
 
 
 @pytest.mark.cholesky_solve
@@ -695,20 +681,20 @@ def test_cholesky_solve_invalid_inputs():
     L = torch.randn(2, 3, dtype=torch.float32, device=flag_gems.device)
 
     with pytest.raises(ValueError, match="square matrix"):
-        cholesky_solve(B, L)
+        _solve_with_gems(B, L)
 
     B_bad_n = torch.randn(3, 1, dtype=torch.float32, device=flag_gems.device)
     L_square = torch.eye(2, dtype=torch.float32, device=flag_gems.device)
     with pytest.raises(ValueError, match="second-to-last dimension"):
-        cholesky_solve(B_bad_n, L_square)
+        _solve_with_gems(B_bad_n, L_square)
 
     B_bad_batch = torch.randn(3, 2, 1, dtype=torch.float32, device=flag_gems.device)
     L_bad_batch = torch.eye(2, dtype=torch.float32, device=flag_gems.device).expand(
         2, 2, 2
     )
     with pytest.raises(ValueError, match="not broadcastable"):
-        cholesky_solve(B_bad_batch, L_bad_batch)
+        _solve_with_gems(B_bad_batch, L_bad_batch)
 
     B_bad_dtype = torch.randn(2, 1, dtype=torch.float64, device=flag_gems.device)
     with pytest.raises(AssertionError, match="same dtype"):
-        cholesky_solve(B_bad_dtype, L_square)
+        _solve_with_gems(B_bad_dtype, L_square)
