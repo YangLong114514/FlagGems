@@ -24,6 +24,7 @@ from flag_gems.utils.triton_lang_extension import program_id
 
 logger = logging.getLogger(__name__)
 
+
 def _check_cholesky_solve_out(B: torch.Tensor, out: torch.Tensor) -> None:
     """Match the device and safe-cast checks of aten::cholesky_solve.out."""
     if out.device != B.device:
@@ -80,6 +81,7 @@ def _copy_cholesky_solve_out(result: torch.Tensor, out: torch.Tensor) -> torch.T
         out.resize_(result.shape)
     out.copy_(result)
     return out
+
 
 @libentry()
 @triton.jit
@@ -322,6 +324,7 @@ def cholesky_solve_single_rhs_kernel(
 
 
 # ---------------------------------------------------------------------------
+
 
 @libentry()
 @triton.jit
@@ -1230,6 +1233,7 @@ def _get_portable_complex_blocked_launch_config(dtype, N, min_dot_rhs=16):
         "num_stages": 1,
     }
 
+
 @libentry()
 @triton.jit
 def cholesky_solve_complex_invert_blocks_portable_kernel(
@@ -1360,7 +1364,9 @@ def cholesky_solve_complex_blocked_portable_kernel(
         sv_imag = y_imag * inv_diag[:, None]
 
         t_off = (
-            T_base + k * BLOCK_K * 2 + k_offsets[:, None] * (BLOCK_K * 2)
+            T_base
+            + k * BLOCK_K * 2
+            + k_offsets[:, None] * (BLOCK_K * 2)
             + k_offsets[None, :] * 2
         )
         t_real = tl.load(T_ptr + t_off)
@@ -1407,9 +1413,7 @@ def cholesky_solve_complex_blocked_portable_kernel(
                     + rows_m[None, :] * stride_L_row
                 )
                 tile_real = tl.trans(
-                    tl.load(
-                        L_ptr + tile_offset, mask=rows_m_mask[None, :], other=0.0
-                    )
+                    tl.load(L_ptr + tile_offset, mask=rows_m_mask[None, :], other=0.0)
                 )
                 tile_imag = tl.trans(
                     tl.load(
@@ -1470,7 +1474,9 @@ def cholesky_solve_complex_blocked_portable_kernel(
         inv_diag = inv_diag * (2.0 - diag_real * inv_diag)
 
         t_off = (
-            T_base + k * BLOCK_K * 2 + k_offsets[:, None] * (BLOCK_K * 2)
+            T_base
+            + k * BLOCK_K * 2
+            + k_offsets[:, None] * (BLOCK_K * 2)
             + k_offsets[None, :] * 2
         )
         tt_real = tl.load(Tt_ptr + t_off)
@@ -1508,9 +1514,7 @@ def cholesky_solve_complex_blocked_portable_kernel(
                     + rows_m[None, :] * stride_L_row
                 )
                 tile_real = tl.trans(
-                    tl.load(
-                        L_ptr + tile_offset, mask=rows_m_mask[None, :], other=0.0
-                    )
+                    tl.load(L_ptr + tile_offset, mask=rows_m_mask[None, :], other=0.0)
                 )
                 tile_imag = tl.trans(
                     tl.load(
@@ -1611,7 +1615,9 @@ def cholesky_solve_complex_single_rhs_blocked_portable_kernel(
         sv_imag = y_imag * inv_diag
 
         t_off = (
-            T_base + k * BLOCK_K * 2 + k_offsets[:, None] * (BLOCK_K * 2)
+            T_base
+            + k * BLOCK_K * 2
+            + k_offsets[:, None] * (BLOCK_K * 2)
             + k_offsets[None, :] * 2
         )
         t_real = tl.load(T_ptr + t_off)
@@ -1663,9 +1669,7 @@ def cholesky_solve_complex_single_rhs_blocked_portable_kernel(
                     X_ptr + tail_offset + 1, mask=rows_m_mask, other=0.0
                 )
             tl.store(X_ptr + tail_offset, tail_real - update_real, mask=rows_m_mask)
-            tl.store(
-                X_ptr + tail_offset + 1, tail_imag - update_imag, mask=rows_m_mask
-            )
+            tl.store(X_ptr + tail_offset + 1, tail_imag - update_imag, mask=rows_m_mask)
 
     # Backward blocked TRSV: L^H * X = Y, or U * X = Y.
     for k in range(N - BLOCK_K, -1, -BLOCK_K):
@@ -1682,7 +1686,9 @@ def cholesky_solve_complex_single_rhs_blocked_portable_kernel(
         inv_diag = inv_diag * (2.0 - diag_real * inv_diag)
 
         t_off = (
-            T_base + k * BLOCK_K * 2 + k_offsets[:, None] * (BLOCK_K * 2)
+            T_base
+            + k * BLOCK_K * 2
+            + k_offsets[:, None] * (BLOCK_K * 2)
             + k_offsets[None, :] * 2
         )
         tt_real = tl.load(Tt_ptr + t_off)
@@ -1729,9 +1735,7 @@ def cholesky_solve_complex_single_rhs_blocked_portable_kernel(
             head_real = tl.load(X_ptr + head_offset, mask=rows_m_mask, other=0.0)
             head_imag = tl.load(X_ptr + head_offset + 1, mask=rows_m_mask, other=0.0)
             tl.store(X_ptr + head_offset, head_real - update_real, mask=rows_m_mask)
-            tl.store(
-                X_ptr + head_offset + 1, head_imag - update_imag, mask=rows_m_mask
-            )
+            tl.store(X_ptr + head_offset + 1, head_imag - update_imag, mask=rows_m_mask)
 
 
 @libentry()
@@ -2006,9 +2010,7 @@ def _cholesky_solve_complex(
                 num_warps=1,
                 num_stages=1,
             )
-            cholesky_solve_complex_single_rhs_blocked_portable_kernel[
-                (batch_size,)
-            ](
+            cholesky_solve_complex_single_rhs_blocked_portable_kernel[(batch_size,)](
                 L_real,
                 B_real,
                 X_real,
@@ -2188,9 +2190,7 @@ def cholesky_solve(
                 dot_tile = _get_portable_blocked_launch_config(
                     B.dtype, N, _portable_min_dot_rhs
                 )
-                use_sum_kernel = dtype_flag == 1 or (
-                    nrhs % dot_tile["BLOCK_RHS"] == 0
-                )
+                use_sum_kernel = dtype_flag == 1 or (nrhs % dot_tile["BLOCK_RHS"] == 0)
                 tile = (
                     _get_portable_sum_blocked_launch_config(B.dtype, N)
                     if use_sum_kernel

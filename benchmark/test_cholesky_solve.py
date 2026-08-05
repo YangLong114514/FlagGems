@@ -11,9 +11,7 @@ IS_THEAD = VENDOR_NAME == "thead"
 SUPPORT_FP64 = flag_gems.runtime.device.support_fp64
 
 REAL_DTYPES = [torch.float32] + ([torch.float64] if SUPPORT_FP64 else [])
-COMPLEX_DTYPES = [torch.complex64] + (
-    [torch.complex128] if SUPPORT_FP64 else []
-)
+COMPLEX_DTYPES = [torch.complex64] + ([torch.complex128] if SUPPORT_FP64 else [])
 
 if IS_ASCEND:
     from flag_gems.runtime.backend._ascend.ops.cholesky_solve import (

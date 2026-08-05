@@ -641,7 +641,9 @@ def test_cholesky_solve_out_noncontiguous_and_alias():
 
 
 @pytest.mark.cholesky_solve_out
-@pytest.mark.skipif(not SUPPORT_FP64, reason="fp64 output not supported on this backend")
+@pytest.mark.skipif(
+    not SUPPORT_FP64, reason="fp64 output not supported on this backend"
+)
 def test_cholesky_solve_out_safe_dtype_cast():
     _, factor, rhs = _make_cholesky_solve_inputs((16, 4), torch.float32)
     ref_out = _reference_cholesky_solve(rhs, factor).to(torch.float64)
