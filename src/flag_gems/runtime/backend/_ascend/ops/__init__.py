@@ -59,6 +59,7 @@ from .linalg_lstsq import linalg_lstsq
 from .linalg_lu_factor import linalg_lu_factor, linalg_lu_factor_out
 from .linalg_lu_factor_ex import linalg_lu_factor_ex, linalg_lu_factor_ex_out
 from .linspace import linspace
+from .log_sigmoid_backward import log_sigmoid_backward, log_sigmoid_backward_out
 from .log_softmax import log_softmax, log_softmax_backward, log_softmax_out
 from .masked_fill import masked_fill, masked_fill_
 from .masked_scatter import masked_scatter, masked_scatter_
@@ -163,14 +164,16 @@ __all__ = [
     "index_add_",
     "index_select",
     "isin",
-    "linalg_lstsq",
-    "linalg_lu_factor",
-    "linalg_lu_factor_out",
-    "linalg_lu_factor_ex",
-    "linalg_lu_factor_ex_out",
-    "linspace",
     "linalg_cross",
     "linalg_cross_out",
+    "linalg_lstsq",
+    "linalg_lu_factor",
+    "linalg_lu_factor_ex",
+    "linalg_lu_factor_ex_out",
+    "linalg_lu_factor_out",
+    "linspace",
+    "log_sigmoid_backward",
+    "log_sigmoid_backward_out",
     "log_softmax",
     "log_softmax_backward",
     "log_softmax_out",
