@@ -64,9 +64,9 @@ def test_linalg_lu_factor_ex():
     bench = LinalgLuFactorExBenchmark(
         op_name="linalg_lu_factor_ex",
         torch_op=torch.linalg.lu_factor_ex,
+        gems_op=flag_gems.linalg_lu_factor_ex,
         dtypes=_TEST_DTYPES,
     )
-    bench.set_gems(flag_gems.linalg_lu_factor_ex)
     bench.run()
 
 
@@ -99,6 +99,7 @@ def test_linalg_lu_factor_ex_out():
     bench = LinalgLuFactorExOutBenchmark(
         op_name="linalg_lu_factor_ex_out",
         torch_op=torch.linalg.lu_factor_ex,
+        gems_op=flag_gems.linalg_lu_factor_ex_out,
         dtypes=_TEST_DTYPES,
     )
     bench.run()
