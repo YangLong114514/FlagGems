@@ -364,6 +364,12 @@ from flag_gems.ops.linalg_cholesky import linalg_cholesky
 from flag_gems.ops.linalg_ldl_factor import ldl_factor
 from flag_gems.ops.linalg_ldl_solve import linalg_ldl_solve
 from flag_gems.ops.linalg_lu_factor import linalg_lu_factor, linalg_lu_factor_out
+from flag_gems.ops.linalg_matrix_rank import (
+    linalg_matrix_rank,
+    linalg_matrix_rank_out,
+    linalg_matrix_rank_tol,
+    linalg_matrix_rank_tol_out,
+)
 from flag_gems.ops.linalg_slogdet import linalg_slogdet
 from flag_gems.ops.linalg_svdvals import linalg_svdvals
 from flag_gems.ops.linear import linear
@@ -1127,6 +1133,10 @@ __all__ = [
     "linalg_ldl_solve",
     "linalg_lu_factor",
     "linalg_lu_factor_out",
+    "linalg_matrix_rank",
+    "linalg_matrix_rank_out",
+    "linalg_matrix_rank_tol",
+    "linalg_matrix_rank_tol_out",
     "linalg_slogdet",
     "linalg_svdvals",
     "linear",
