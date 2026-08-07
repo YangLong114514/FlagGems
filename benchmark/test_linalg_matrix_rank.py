@@ -3,42 +3,103 @@ import torch
 
 import flag_gems
 
-from . import base
+from . import base, consts
 
 
-MATRIX_RANK_BENCHMARK_SHAPES = [
+MATRIX_RANK_CORE_SHAPES = [
     (1, 256),
+    (256, 1),
     (2, 256),
+    (256, 2),
     (8, 8),
     (16, 16),
     (17, 17),
     (32, 32),
+    (33, 33),
     (64, 64),
 ]
 
-MATRIX_RANK_HERMITIAN_BENCHMARK_SHAPES = [
+MATRIX_RANK_COMPREHENSIVE_SHAPES = [
+    # Tall and wide matrices exercise both workspace orientations.
+    (8, 256),
+    (256, 8),
+    (16, 512),
+    (512, 16),
+    (32, 1024),
+    (1024, 32),
+    (64, 512),
+    (512, 64),
+    # Medium, large, and current native-support boundaries.
+    (128, 128),
+    (256, 256),
+    (512, 512),
+    (512, 1024),
+    (1024, 512),
+    # Single- and multi-dimensional batches of small/medium matrices.
+    (32, 8, 8),
+    (8, 16, 16),
+    (4, 32, 32),
+    (2, 64, 64),
+    (8, 64, 16),
+    (8, 16, 64),
+    (2, 4, 16, 16),
+]
+
+MATRIX_RANK_HERMITIAN_CORE_SHAPES = [
     (1, 1),
     (2, 2),
     (8, 8),
     (16, 16),
     (17, 17),
     (32, 32),
+    (33, 33),
     (64, 64),
 ]
 
+MATRIX_RANK_HERMITIAN_COMPREHENSIVE_SHAPES = [
+    (128, 128),
+    (256, 256),
+    (512, 512),
+    (32, 8, 8),
+    (8, 16, 16),
+    (4, 32, 32),
+    (2, 64, 64),
+    (2, 4, 16, 16),
+]
 
-class MatrixRankBenchmark(base.GenericBenchmark2DOnly):
+
+def _select_shapes(core_shapes, comprehensive_shapes):
+    shapes = core_shapes.copy()
+    if (
+        not base.Config.query
+        and base.Config.bench_level == consts.BenchLevel.COMPREHENSIVE
+    ):
+        shapes.extend(comprehensive_shapes)
+    return shapes
+
+
+class MatrixRankBenchmark(base.GenericBenchmark):
     """Benchmark for torch.linalg.matrix_rank."""
 
+    DEFAULT_SHAPE_DESC = "*, M, N"
+
     def set_shapes(self, shape_file_path=None):
-        self.shapes = MATRIX_RANK_BENCHMARK_SHAPES.copy()
+        self.shapes = _select_shapes(
+            MATRIX_RANK_CORE_SHAPES,
+            MATRIX_RANK_COMPREHENSIVE_SHAPES,
+        )
 
 
-class MatrixRankHermitianBenchmark(base.GenericBenchmark2DOnly):
+class MatrixRankHermitianBenchmark(base.GenericBenchmark):
     """Benchmark for torch.linalg.matrix_rank with hermitian=True."""
 
+    DEFAULT_SHAPE_DESC = "*, N, N"
+
     def set_shapes(self, shape_file_path=None):
-        self.shapes = MATRIX_RANK_HERMITIAN_BENCHMARK_SHAPES.copy()
+        self.shapes = _select_shapes(
+            MATRIX_RANK_HERMITIAN_CORE_SHAPES,
+            MATRIX_RANK_HERMITIAN_COMPREHENSIVE_SHAPES,
+        )
 
 
 @pytest.mark.linalg_matrix_rank
