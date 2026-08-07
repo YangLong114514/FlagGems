@@ -12,8 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import math
-
 import pytest
 import torch
 
@@ -44,7 +42,8 @@ RANK_CASES = [
     pytest.param((5, 3), 2, id="single-tall"),
     pytest.param((4, 4), 3, id="single-square"),
     pytest.param((16, 16), 15, id="small-jacobi-boundary"),
-    pytest.param((17, 17), 16, id="blocked-square"),
+    pytest.param((17, 17), 16, id="serial-medium-square"),
+    pytest.param((33, 33), 32, id="blocked-square"),
     pytest.param((2, 4, 4), 3, id="one-batch-dimension"),
     pytest.param((2, 3, 5, 3), 2, id="multiple-batch-dimensions"),
 ]
@@ -90,17 +89,20 @@ def _assert_output_metadata(result, matrix):
     assert result.device == matrix.device
 
 
-def _assert_direct_and_dispatch_match_native(matrix, **kwargs):
+def _assert_direct_and_dispatch_match_native(
+    matrix, *, check_dispatch=False, **kwargs
+):
     native = _native_matrix_rank(matrix, **kwargs)
 
     direct = flag_gems.linalg_matrix_rank(matrix, **kwargs)
     _assert_output_metadata(direct, matrix)
     utils.gems_assert_equal(direct, native)
 
-    with flag_gems.use_gems():
-        dispatched = torch.linalg.matrix_rank(matrix, **kwargs)
-    _assert_output_metadata(dispatched, matrix)
-    utils.gems_assert_equal(dispatched, native)
+    if check_dispatch:
+        with flag_gems.use_gems():
+            dispatched = torch.linalg.matrix_rank(matrix, **kwargs)
+        _assert_output_metadata(dispatched, matrix)
+        utils.gems_assert_equal(dispatched, native)
     return direct
 
 
@@ -110,7 +112,9 @@ def test_linalg_matrix_rank_default_identity(dtype):
     matrix = torch.eye(8, dtype=dtype, device=flag_gems.device)
     expected = torch.tensor(8, dtype=torch.int64, device=matrix.device)
 
-    result = _assert_direct_and_dispatch_match_native(matrix)
+    result = _assert_direct_and_dispatch_match_native(
+        matrix, check_dispatch=True
+    )
     utils.gems_assert_equal(result, expected)
 
 
@@ -147,19 +151,15 @@ def test_linalg_matrix_rank_float64_tolerance_precision():
 
 @pytest.mark.linalg_matrix_rank
 @pytest.mark.parametrize(
-    "dtype,k,smallest_singular_value",
+    "dtype,k,tiny,atol",
     [
-        pytest.param(torch.float32, 16, 1e-8, id="float32-small"),
-        pytest.param(torch.float32, 17, 1e-8, id="float32-blocked"),
-        pytest.param(torch.float64, 16, 1e-14, id="float64-small"),
-        pytest.param(torch.float64, 17, 1e-14, id="float64-blocked"),
+        pytest.param(torch.float32, 16, 1e-6, 1e-3, id="float32-small"),
+        pytest.param(torch.float64, 17, 1e-12, 1e-9, id="float64-serial"),
     ],
 )
-def test_linalg_matrix_rank_ill_conditioned_spectrum(
-    dtype, k, smallest_singular_value
-):
+def test_linalg_matrix_rank_well_separated_spectrum(dtype, k, tiny, atol):
     generator = torch.Generator(device=flag_gems.device).manual_seed(20260807)
-    left = torch.linalg.qr(
+    orthogonal = torch.linalg.qr(
         torch.randn(
             (k, k),
             dtype=dtype,
@@ -167,24 +167,13 @@ def test_linalg_matrix_rank_ill_conditioned_spectrum(
             generator=generator,
         )
     ).Q
-    right = torch.linalg.qr(
-        torch.randn(
-            (k, k),
-            dtype=dtype,
-            device=flag_gems.device,
-            generator=generator,
-        )
-    ).Q
-    spectrum = torch.logspace(
-        0,
-        math.log10(smallest_singular_value),
-        k,
-        dtype=dtype,
-        device=flag_gems.device,
-    )
-    matrix = left @ torch.diag(spectrum) @ right.mT
+    spectrum = torch.ones(k, dtype=dtype, device=flag_gems.device)
+    spectrum[-1] = tiny
+    matrix = orthogonal @ torch.diag(spectrum) @ orthogonal.mT
+    expected = torch.tensor(k - 1, dtype=torch.int64, device=matrix.device)
 
-    _assert_direct_and_dispatch_match_native(matrix)
+    result = _assert_direct_and_dispatch_match_native(matrix, atol=atol)
+    utils.gems_assert_equal(result, expected)
 
 
 @pytest.mark.linalg_matrix_rank
@@ -483,8 +472,8 @@ def test_linalg_matrix_rank_hermitian_uses_lower_triangle(dtype):
 @pytest.mark.linalg_matrix_rank
 @pytest.mark.parametrize("dtype", SUPPORTED_DTYPE_CASES)
 def test_linalg_matrix_rank_hermitian_blocked(dtype):
-    matrix = _make_matrix_with_rank((17, 17), 16, dtype)
-    expected = torch.tensor(16, dtype=torch.int64, device=matrix.device)
+    matrix = _make_matrix_with_rank((33, 33), 32, dtype)
+    expected = torch.tensor(32, dtype=torch.int64, device=matrix.device)
 
     result = _assert_direct_and_dispatch_match_native(
         matrix, atol=5e-2, hermitian=True

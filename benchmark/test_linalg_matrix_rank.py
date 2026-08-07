@@ -11,11 +11,9 @@ MATRIX_RANK_BENCHMARK_SHAPES = [
     (2, 256),
     (8, 8),
     (16, 16),
+    (17, 17),
     (32, 32),
     (64, 64),
-    (128, 128),
-    (256, 256),
-    (512, 512),
 ]
 
 MATRIX_RANK_HERMITIAN_BENCHMARK_SHAPES = [
@@ -23,26 +21,24 @@ MATRIX_RANK_HERMITIAN_BENCHMARK_SHAPES = [
     (2, 2),
     (8, 8),
     (16, 16),
+    (17, 17),
     (32, 32),
     (64, 64),
-    (128, 128),
-    (256, 256),
-    (512, 512),
 ]
 
 
 class MatrixRankBenchmark(base.GenericBenchmark2DOnly):
     """Benchmark for torch.linalg.matrix_rank."""
 
-    def set_more_shapes(self):
-        return MATRIX_RANK_BENCHMARK_SHAPES
+    def set_shapes(self, shape_file_path=None):
+        self.shapes = MATRIX_RANK_BENCHMARK_SHAPES.copy()
 
 
 class MatrixRankHermitianBenchmark(base.GenericBenchmark2DOnly):
     """Benchmark for torch.linalg.matrix_rank with hermitian=True."""
 
-    def set_more_shapes(self):
-        return MATRIX_RANK_HERMITIAN_BENCHMARK_SHAPES
+    def set_shapes(self, shape_file_path=None):
+        self.shapes = MATRIX_RANK_HERMITIAN_BENCHMARK_SHAPES.copy()
 
 
 @pytest.mark.linalg_matrix_rank

@@ -25,6 +25,7 @@ from flag_gems.utils import libentry
 logger = logging.getLogger(__name__)
 
 _SMALL_JACOBI_MAX_K = 16
+_SERIAL_JACOBI_MAX_K = 32
 _BLOCKED_JACOBI_MAX_K = 512
 _JACOBI_MAX_ROWS = 1024
 
@@ -144,14 +145,14 @@ def _matrix_rank_small_jacobi_kernel(
     OUT,
     M: tl.constexpr,
     N: tl.constexpr,
-    K: tl.constexpr,
+    K,
     ROWS: tl.constexpr,
     TALL: tl.constexpr,
     HERMITIAN: tl.constexpr,
     IS_FP64: tl.constexpr,
     BLOCK_R: tl.constexpr,
     BLOCK_K: tl.constexpr,
-    SWEEPS: tl.constexpr,
+    SWEEPS,
     REL_EPS: tl.constexpr,
     ABS_EPS: tl.constexpr,
 ):
@@ -162,7 +163,8 @@ def _matrix_rank_small_jacobi_kernel(
     a_base = A + batch * M * N
     work_base = A_WORK + batch * K * ROWS
 
-    for column in tl.static_range(0, K):
+    column = 0
+    while column < K:
         if HERMITIAN:
             source_rows = tl.maximum(rows, column)
             source_columns = tl.minimum(rows, column)
@@ -184,10 +186,16 @@ def _matrix_rank_small_jacobi_kernel(
                 other=0.0,
             )
         tl.store(work_base + column * ROWS + rows, values, mask=row_mask)
+        column += 1
 
-    for _ in tl.static_range(0, SWEEPS):
-        for p in tl.static_range(0, K):
-            for q in tl.static_range(p + 1, K):
+    sweep = 0
+    keep_sweeping = 1
+    while (sweep < SWEEPS) & (keep_sweeping != 0):
+        rotations = 0
+        p = 0
+        while p < K:
+            q = p + 1
+            while q < K:
                 ap = tl.load(
                     work_base + p * ROWS + rows,
                     mask=row_mask,
@@ -205,6 +213,7 @@ def _matrix_rank_small_jacobi_kernel(
                     tl.abs(gamma)
                     > REL_EPS * tl.sqrt(alpha * beta + ABS_EPS)
                 )
+                rotations += active.to(tl.int32)
                 safe_gamma = tl.where(active, gamma, 1.0)
                 tau = (beta - alpha) / (2.0 * safe_gamma)
                 sign_tau = tl.where(tau >= 0.0, 1.0, -1.0)
@@ -228,12 +237,17 @@ def _matrix_rank_small_jacobi_kernel(
                     new_aq,
                     mask=row_mask,
                 )
+                q += 1
+            p += 1
+        keep_sweeping = rotations
+        sweep += 1
 
     accumulator_dtype = tl.float64 if IS_FP64 else tl.float32
     singular_values = tl.full(
         (BLOCK_K,), 0.0, dtype=accumulator_dtype
     )
-    for column in tl.static_range(0, K):
+    column = 0
+    while column < K:
         values = tl.load(
             work_base + column * ROWS + rows,
             mask=row_mask,
@@ -245,6 +259,7 @@ def _matrix_rank_small_jacobi_kernel(
             norm,
             singular_values,
         )
+        column += 1
 
     max_value = tl.max(singular_values, axis=0)
     atol = tl.load(ATOL + batch)
@@ -573,7 +588,7 @@ def _launch_matrix_rank(
                 ABS_EPS=absolute_epsilon,
                 num_warps=num_warps,
             )
-        elif k <= _SMALL_JACOBI_MAX_K:
+        elif k <= _SERIAL_JACOBI_MAX_K:
             work = torch.empty(
                 (batch_count, k, rows),
                 dtype=input.dtype,
@@ -583,7 +598,10 @@ def _launch_matrix_rank(
             # Numerical rank is more sensitive to residual column correlation
             # than returning approximate singular values. Keep a few more
             # sweeps than the general SVD path, especially for float64.
-            sweeps = 12 if is_fp64 else 8
+            if is_fp64:
+                sweeps = 16 if k > _SMALL_JACOBI_MAX_K else 12
+            else:
+                sweeps = 12 if k > _SMALL_JACOBI_MAX_K else 8
             _matrix_rank_small_jacobi_kernel[(batch_count,)](
                 matrix,
                 work,
