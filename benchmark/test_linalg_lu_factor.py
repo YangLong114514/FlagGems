@@ -197,7 +197,8 @@ def test_linalg_lu_factor_out():
     bench = LinalgLuFactorOutBenchmark(
         op_name="linalg_lu_factor_out",
         torch_op=_torch_lu_factor,
-        gems_op=flag_gems.linalg_lu_factor_out,
         dtypes=_TEST_DTYPES,
     )
+    if VENDOR == "ascend":
+        bench.gems_op = flag_gems.linalg_lu_factor_out
     bench.run()
