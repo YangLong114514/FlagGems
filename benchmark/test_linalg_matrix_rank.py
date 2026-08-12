@@ -35,6 +35,7 @@ MATRIX_RANK_COMPREHENSIVE_SHAPES = [
     (512, 512),
     (512, 1024),
     (1024, 512),
+    (1024, 1024),
     # Single- and multi-dimensional batches of small/medium matrices.
     (32, 8, 8),
     (8, 16, 16),
@@ -60,6 +61,7 @@ MATRIX_RANK_HERMITIAN_COMPREHENSIVE_SHAPES = [
     (128, 128),
     (256, 256),
     (512, 512),
+    (1024, 1024),
     (32, 8, 8),
     (8, 16, 16),
     (4, 32, 32),

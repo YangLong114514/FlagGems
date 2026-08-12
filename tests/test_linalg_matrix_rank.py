@@ -483,6 +483,114 @@ def test_linalg_matrix_rank_hermitian_blocked(dtype):
 
 @pytest.mark.linalg_matrix_rank
 @pytest.mark.parametrize("dtype", SUPPORTED_DTYPE_CASES)
+@pytest.mark.parametrize(
+    "shape,expected_rank",
+    [
+        pytest.param((256, 256), 200, id="tridiag-square"),
+        pytest.param((257, 257), 250, id="tridiag-odd-order"),
+        pytest.param((2, 300, 300), 250, id="tridiag-batched"),
+        pytest.param((32, 32), 30, id="tridiag-k32"),
+        pytest.param((33, 33), 30, id="tridiag-k33"),
+        pytest.param((64, 64), 60, id="tridiag-k64"),
+        pytest.param((128, 128), 120, id="tridiag-k128"),
+        pytest.param((4, 32, 32), 30, id="tridiag-batched-small"),
+        pytest.param((1024, 1024), 1000, id="tridiag-k1024"),
+    ],
+)
+def test_linalg_matrix_rank_hermitian_tridiag(dtype, shape, expected_rank):
+    matrix = _make_matrix_with_rank(shape, expected_rank, dtype)
+    expected = torch.full(
+        matrix.shape[:-2],
+        expected_rank,
+        dtype=torch.int64,
+        device=matrix.device,
+    )
+
+    result = _assert_direct_and_dispatch_match_native(
+        matrix, atol=5e-2, hermitian=True
+    )
+    utils.gems_assert_equal(result, expected)
+
+
+@pytest.mark.linalg_matrix_rank
+@pytest.mark.parametrize("dtype", SUPPORTED_DTYPE_CASES)
+@pytest.mark.parametrize(
+    "shape,expected_rank",
+    [
+        pytest.param((513, 513), 500, id="bidiag-k513"),
+        pytest.param((1024, 1024), 1000, id="bidiag-k1024"),
+        pytest.param((600, 700), 550, id="bidiag-wide"),
+        pytest.param((700, 600), 550, id="bidiag-tall"),
+        pytest.param((2, 513, 513), 500, id="bidiag-batched"),
+    ],
+)
+def test_linalg_matrix_rank_bidiag(dtype, shape, expected_rank):
+    matrix = _make_matrix_with_rank(shape, expected_rank, dtype)
+    expected = torch.full(
+        matrix.shape[:-2],
+        expected_rank,
+        dtype=torch.int64,
+        device=matrix.device,
+    )
+
+    result = _assert_direct_and_dispatch_match_native(matrix, atol=5e-2)
+    utils.gems_assert_equal(result, expected)
+
+
+@pytest.mark.linalg_matrix_rank
+@pytest.mark.parametrize("dtype", SUPPORTED_DTYPE_CASES)
+def test_linalg_matrix_rank_bidiag_dense(dtype):
+    # Dense non-hermitian low-rank matrices exercise the two-sided
+    # Householder bidiagonalization + Golub-Kahan Sturm-count path
+    # (min(m, n) > 512) with a clear spectral gap at the tolerance.
+    generator = torch.Generator(device=flag_gems.device).manual_seed(4321)
+    n, rank = 1024, 1000
+    left, _ = torch.linalg.qr(
+        torch.randn(
+            n, n, dtype=dtype, device=flag_gems.device, generator=generator
+        )
+    )
+    right, _ = torch.linalg.qr(
+        torch.randn(
+            n, n, dtype=dtype, device=flag_gems.device, generator=generator
+        )
+    )
+    values = torch.zeros(n, dtype=dtype, device=flag_gems.device)
+    values[:rank] = torch.linspace(
+        rank, 1, rank, dtype=dtype, device=flag_gems.device
+    )
+    matrix = left @ torch.diag(values) @ right.mT
+    expected = torch.tensor(rank, dtype=torch.int64, device=matrix.device)
+
+    result = _assert_direct_and_dispatch_match_native(matrix, atol=5e-2)
+    utils.gems_assert_equal(result, expected)
+
+
+@pytest.mark.linalg_matrix_rank
+@pytest.mark.parametrize("dtype", SUPPORTED_DTYPE_CASES)
+def test_linalg_matrix_rank_hermitian_tridiag_dense(dtype):
+    # Dense symmetric low-rank matrices exercise the Householder
+    # tridiagonalization + Sturm-count path (k >= 256) with a clear
+    # spectral gap at the tolerance.
+    generator = torch.Generator(device=flag_gems.device).manual_seed(1234)
+    n, rank = 300, 250
+    basis = torch.randn(
+        n, rank, dtype=dtype, device=flag_gems.device, generator=generator
+    )
+    weights = torch.linspace(
+        2.0, 1.0, rank, dtype=dtype, device=flag_gems.device
+    )
+    matrix = basis @ torch.diag(weights) @ basis.mT
+    expected = torch.tensor(rank, dtype=torch.int64, device=matrix.device)
+
+    result = _assert_direct_and_dispatch_match_native(
+        matrix, atol=5e-2, hermitian=True
+    )
+    utils.gems_assert_equal(result, expected)
+
+
+@pytest.mark.linalg_matrix_rank
+@pytest.mark.parametrize("dtype", SUPPORTED_DTYPE_CASES)
 @pytest.mark.parametrize("shape", EMPTY_SHAPES)
 def test_linalg_matrix_rank_empty(dtype, shape):
     matrix = torch.empty(shape, dtype=dtype, device=flag_gems.device)
