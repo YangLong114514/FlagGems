@@ -5,6 +5,17 @@ import flag_gems
 
 from . import base, consts
 
+VENDOR_NAME = getattr(flag_gems, "vendor_name", "")
+IS_ASCEND = VENDOR_NAME == "ascend"
+
+# torch.linalg.matrix_rank on Ascend is backed by aclnn svd_npu, which is
+# float32-only ("svd_npu only supported Float, but get double"). Restrict the
+# performance comparison to float32 on Ascend; float64 accuracy is still
+# exercised in tests/ against the CPU reference.
+MATRIX_RANK_DTYPES = (
+    [torch.float32] if IS_ASCEND else [torch.float32, torch.float64]
+)
+
 
 MATRIX_RANK_CORE_SHAPES = [
     (1, 256),
@@ -114,7 +125,7 @@ def test_linalg_matrix_rank():
         input_fn=matrix_rank_input_fn,
         op_name="linalg_matrix_rank",
         torch_op=torch.linalg.matrix_rank,
-        dtypes=[torch.float32, torch.float64],
+        dtypes=MATRIX_RANK_DTYPES,
     )
     bench.set_gems(flag_gems.linalg_matrix_rank)
     bench.run()
@@ -131,7 +142,7 @@ def test_linalg_matrix_rank_hermitian():
         input_fn=matrix_rank_hermitian_input_fn,
         op_name="linalg_matrix_rank_hermitian",
         torch_op=torch.linalg.matrix_rank,
-        dtypes=[torch.float32, torch.float64],
+        dtypes=MATRIX_RANK_DTYPES,
     )
     bench.set_gems(flag_gems.linalg_matrix_rank)
     bench.run()
