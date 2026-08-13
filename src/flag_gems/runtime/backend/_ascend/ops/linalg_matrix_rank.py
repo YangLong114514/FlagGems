@@ -90,6 +90,12 @@ _FUSED_JACOBI_MAX_K_FP64 = 32
 _FUSED_JACOBI_MAX_ROWS = 256
 _FUSED_JACOBI_WIDE_MAX_ROWS = 128
 
+# Gram + tridiagonalization + Sturm path (fp32). The Gram matrix is chunked
+# over the tall dimension, so the only real limits are the tridiagonal tile
+# in UB (k <= 64 -> 16 KB) and the unrolled dot chunk count.
+_TRIDIAG_MAX_K = 64
+_TRIDIAG_MAX_ROWS = 2048
+
 
 def _jacobi_sweeps(k, is_fp64):
     """Worst-case sweep cap; kernels exit early once the Weyl bound holds."""
@@ -283,7 +289,8 @@ def _sv_rank_count_kernel(
     atol = tl.load(atol_ptr + pid)
     rtol = tl.load(rtol_ptr + pid)
     smax = tl.max(s, axis=0)
-    tol = atol + rtol * smax
+    # torch semantics: tol = max(atol, rtol * smax)
+    tol = tl.maximum(atol, rtol * smax)
     count = tl.sum((s > tol).to(tl.int64), axis=0)
     tl.store(out_ptr + pid, count)
 
@@ -562,12 +569,21 @@ def _matrix_rank_fused_jacobi_kernel(
         tl.store(OUT + batch, rank.to(tl.int64))
 
 
-def _svals_rank(matrix, atol_tensor, rtol_tensor, out, m, n, batch_count, input):
-    """Placeholder decomposition path: native svdvals + fused count.
+def _svals_rank(
+    matrix, atol_tensor, rtol_tensor, out, m, n, batch_count, input, hermitian
+):
+    """Native svdvals + fused count (large-k fallback).
 
-    Returns ``out`` filled with the numerical rank for each matrix in the batch.
+    Returns ``out`` filled with the numerical rank for each matrix in the
+    batch. For ``hermitian=True`` the effective matrix is the lower triangle
+    symmetrized, matching torch's semantics, so it is materialized first.
     """
     k = min(m, n)
+    if hermitian:
+        # A_eff = tril(A) with the upper triangle taken as tril(A,-1)^T.
+        eff = torch.tril(matrix)
+        eff = eff + torch.tril(matrix, -1).mT
+        matrix = eff
     s = torch.linalg.svdvals(matrix)  # (batch, k), descending
     block_k = triton.next_power_of_2(k)
     with torch_device_fn.device(input.device):
@@ -581,6 +597,509 @@ def _svals_rank(matrix, atol_tensor, rtol_tensor, out, m, n, batch_count, input)
             num_warps=1,
         )
     return out
+
+
+# ---------------------------------------------------------------------------
+# Medium matrices (k <= 64): Gram via Cube + Householder tridiagonalization +
+# Sturm-sequence eigenvalue counting (non-iterative, one program per batch
+# element).  The trailing matrix stays register/UB-resident for the whole
+# reduction -- there is no global-memory store->load round trip inside it, so
+# the Ascend MTE3(store)/MTE2(load) reordering hazard that made the
+# GM-resident Jacobi sweep flaky under batch concurrency cannot occur, and
+# the batch is fully parallel (grid = batch_count).
+#
+# Toolchain notes (all verified on this machine):
+#  * tl.dot only accepts operands that are direct loads (or dot chains), so
+#    the Gram matrix is built in a separate kernel and reloaded below.
+#  * DSA extract_slice/insert_slice and axis-0 register-tile reductions both
+#    crash or hang the Ascend backend here; everything below is expressed as
+#    full-tile elementwise ops plus axis-1 reductions.
+#  * `tl.arange(...) == const` masks miscompile (device exception); masks are
+#    written as strict-inequality intervals: (x == c) -> (x > c-1) & (x < c+1).
+#  * By symmetry g[j, j+1:] == g[j+1:, j], so the Householder vector is taken
+#    from the COLUMN below the diagonal, which an axis-1 reduction can
+#    extract from a full tile without any gather.
+# ---------------------------------------------------------------------------
+
+
+@libentry()
+@triton.jit
+def _matrix_rank_gram_kernel(
+    A,
+    G,
+    PM: tl.constexpr,
+    PN: tl.constexpr,
+    TALL: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+):
+    """G[b] = A[b]^T A[b] (tall) or A[b] A[b]^T (wide) on the Cube.
+
+    The input is pre-padded by the launcher to (PM, PN) with PM/PN multiples
+    of 32 and the short dimension 64, so every tl.dot operand is a full
+    unpadded block: masked/zero-filled dot operands silently miscompile on
+    this backend (verified: a padded contraction dimension produces a
+    row-shifted wrong Gram), and a mask on the contraction dimension is also
+    unreliable.  The accumulator is summed in plain vector adds (feeding the
+    accumulator back as tl.dot's third argument loses precision), and the
+    transposed operand is a normal load run through tl.trans (stride-swapped
+    loads fed to tl.dot miscompile).  One program per batch element; the
+    long dimension is chunked so the UB footprint stays bounded.
+    """
+    batch = tl.program_id(0)
+    a_base = A + batch * PM * PN
+    rows = tl.arange(0, 64)
+    cols = tl.arange(0, 64)
+    g = tl.zeros((64, 64), dtype=tl.float32)
+    if TALL:
+        # G = A^T A, summing over the rows
+        for m0 in tl.static_range(0, PM, BLOCK_M):
+            mr = m0 + tl.arange(0, BLOCK_M)
+            b = tl.load(a_base + mr[:, None] * PN + cols[None, :])
+            g = g + tl.dot(tl.trans(b), b, input_precision="ieee")
+    else:
+        # G = A A^T, summing over the columns
+        for n0 in tl.static_range(0, PN, BLOCK_M):
+            mc = n0 + tl.arange(0, BLOCK_M)
+            at = tl.load(a_base + rows[:, None] * PN + mc[None, :])
+            g = g + tl.dot(at, tl.trans(at), input_precision="ieee")
+    tl.store(G + batch * 64 * 64 + rows[:, None] * 64 + cols[None, :], g)
+
+
+@triton.jit
+def _sturm_count_less(D, E, base, K: tl.constexpr, x):
+    """Number of eigenvalues of the symmetric tridiagonal T = diag(d) +
+    diag(e, +/-1) that are <= x, via the qd recurrence (LAPACK DLANEG
+    convention: a zero pivot is replaced by a tiny negative value so the
+    count stays consistent for clustered spectra).  Runs in fp32: the qd
+    quotients stay on the scale of (d - x), so no overflow for the matrix
+    magnitudes this path handles."""
+    q = tl.load(D + base) - x
+    q = tl.where(q == 0.0, -1.1754944e-38, q)
+    neg = (q < 0.0).to(tl.int32)
+    i = 1
+    while i < K:
+        di = tl.load(D + base + i)
+        ei = tl.load(E + base + i - 1)
+        q = (di - x) - ei * ei / q
+        q = tl.where(q == 0.0, -1.1754944e-38, q)
+        neg += (q < 0.0).to(tl.int32)
+        i += 1
+    return neg
+
+
+@libentry()
+@triton.jit
+def _matrix_rank_gram_kernel(
+    A,
+    G,
+    PM: tl.constexpr,
+    PN: tl.constexpr,
+    TALL: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+):
+    """G[b] = A[b]^T A[b] (tall) or A[b] A[b]^T (wide) on the Cube.
+
+    Used for long-dimension inputs (rows > 64) whose bidiagonalization
+    would need tiles larger than 64 (which this backend cannot compile).
+    Input is pre-padded by the launcher to (PM, PN) multiples of 32 with the
+    short dimension 64, so every tl.dot operand is a full unpadded block.
+    The accumulator is summed in plain vector adds (the dot-accumulator form
+    loses precision), and the transposed operand is a normal load run
+    through tl.trans (stride-swapped loads fed to tl.dot miscompile).
+    """
+    batch = tl.program_id(0)
+    a_base = A + batch * PM * PN
+    rows = tl.arange(0, 64)
+    cols = tl.arange(0, 64)
+    g = tl.zeros((64, 64), dtype=tl.float32)
+    if TALL:
+        for m0 in tl.static_range(0, PM, BLOCK_M):
+            mr = m0 + tl.arange(0, BLOCK_M)
+            b = tl.load(a_base + mr[:, None] * PN + cols[None, :])
+            g = g + tl.dot(tl.trans(b), b, input_precision="ieee")
+    else:
+        for n0 in tl.static_range(0, PN, BLOCK_M):
+            mc = n0 + tl.arange(0, BLOCK_M)
+            at = tl.load(a_base + rows[:, None] * PN + mc[None, :])
+            g = g + tl.dot(at, tl.trans(at), input_precision="ieee")
+    tl.store(G + batch * 64 * 64 + rows[:, None] * 64 + cols[None, :], g)
+
+
+@libentry()
+@triton.jit
+def _matrix_rank_tridiag_kernel(
+    A,
+    D,
+    E,
+    K: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    # Householder tridiagonalization of the Gram matrix (long-dimension
+    # fallback).  Rank-2 trailing update as one reshape outer product.
+    rows = tl.arange(0, BLOCK)
+    cols = tl.arange(0, BLOCK)
+    g = tl.load(A + rows[:, None] * BLOCK + cols[None, :])
+    d_vec = tl.zeros((BLOCK,), dtype=tl.float32)
+    e_vec = tl.zeros((BLOCK,), dtype=tl.float32)
+    for j in tl.range(0, K - 1):
+        colmask = (cols[None, :] > j - 1) & (cols[None, :] < j + 1)
+        v_vec = tl.sum(tl.where(colmask, g, 0.0), axis=1)
+        m0 = (rows > j) & (rows < j + 2)
+        x0 = tl.sum(v_vec * m0.to(tl.float32), axis=0)
+        v = v_vec * (rows > j).to(tl.float32)
+        sigma = tl.sqrt(tl.sum(v * v, axis=0))
+        alpha = tl.where(x0 >= 0.0, -sigma, sigma)
+        v2 = tl.where(m0, x0 - alpha, v)
+        vnorm2 = 2.0 * sigma * (sigma + tl.abs(x0))
+        tau = tl.where(vnorm2 > 0.0, 2.0 / vnorm2, 0.0)
+        w = tau * tl.sum(g * v2[None, :], axis=1)
+        beta = -0.5 * tau * tl.sum(v2 * w, axis=0)
+        w2 = (w + beta * v2) * (cols > j).to(tl.float32)
+        upd = tl.reshape(v2, (BLOCK, 1)) * tl.reshape(w2, (1, BLOCK))
+        updt = tl.reshape(w2, (BLOCK, 1)) * tl.reshape(v2, (1, BLOCK))
+        g = g - upd - updt
+        dmask = ((rows > j - 1) & (rows < j + 1)).to(tl.float32)
+        d_vec = d_vec + v_vec * dmask
+        e_vec = e_vec + alpha * dmask
+    vlast = tl.sum(tl.where((cols[None, :] > K - 2) & (cols[None, :] < K), g, 0.0), axis=1)
+    d_vec = d_vec + vlast * ((rows > K - 2) & (rows < K)).to(tl.float32)
+    tl.store(D + rows, d_vec)
+    tl.store(E + rows, e_vec)
+
+
+@libentry()
+@triton.jit
+def _matrix_rank_bidiag_kernel(
+    A,
+    D,
+    E,
+    M: tl.constexpr,
+    N: tl.constexpr,
+    K: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    # One program per matrix.  Golub-Kahan bidiagonalization of A (or the
+    # symmetrized hermitian input, which is bidiagonalized as-is) followed
+    # by a Sturm-sequence rank count on B^T B, whose tridiagonal entries are
+    # constructed exactly from the bidiagonal d/e (d_i^2 + e_{i-1}^2 and
+    # d_i e_i), so the smallest singular value keeps LINEAR precision.
+    #
+    # The Gram-square tridiagonalization path loses the smallest lambda
+    # (lambda_min ~ sigma_min^2) to fp32 round-off whenever sigma_min is
+    # small; bidiagonalization keeps sigma_min at machine-epsilon precision,
+    # which is why this path exists.  The two-sided Householder reflections
+    # use reshape-based outer products (the only broadcast form that is
+    # numerically correct on this backend) and only the stable primitives
+    # (axis-1 masked reductions, scalar-blend into vectors via where with a
+    # vector operand, float-mask multiplies instead of scalar-constant-zero
+    # where branches).
+    #
+    # The input is zero-padded to (BLOCK, BLOCK); only the first M rows /
+    # N cols hold data.  D/E round-trip through global memory across the
+    # separate Sturm kernel (kernel boundaries serialize MTE3/MTE2).
+    batch = tl.program_id(0)
+    rows = tl.arange(0, BLOCK)
+    cols = tl.arange(0, BLOCK)
+    kmask = (rows[:, None] < K) & (cols[None, :] < K)
+    g = tl.load(A + batch * BLOCK * BLOCK + rows[:, None] * BLOCK + cols[None, :])
+    d_vec = tl.zeros((BLOCK,), dtype=tl.float32)
+    e_vec = tl.zeros((BLOCK,), dtype=tl.float32)
+    gT = tl.trans(g)
+    for j in tl.range(0, K - 1):
+        # ---- left reflection: zero g[j+1:, j] ----
+        colmask = (cols[None, :] > j - 1) & (cols[None, :] < j + 1)
+        colj = tl.sum(tl.where(colmask, g, 0.0), axis=1)
+        x0 = tl.sum(colj * ((rows > j - 1) & (rows < j + 1)).to(tl.float32), axis=0)
+        x = colj * (rows >= j).to(tl.float32)
+        sigma = tl.sqrt(tl.sum(x * x, axis=0))
+        alpha = tl.where(x0 >= 0.0, -sigma, sigma)
+        v2 = tl.where((rows > j - 1) & (rows < j + 1), x0 - alpha, x)
+        vnorm2 = 2.0 * sigma * (sigma + tl.abs(x0))
+        tau = tl.where(vnorm2 > 0.0, 2.0 / vnorm2, 0.0)
+        # w = tau * (g[j:, :]^T v2) via gT (axis-1 reduce, stable)
+        w = tau * tl.sum(gT * v2[None, :], axis=1)
+        g = g - tl.reshape(v2, (BLOCK, 1)) * tl.reshape(w, (1, BLOCK))
+        gT = tl.trans(g)
+        # D[j] = alpha: the left reflection maps g[j, j] to +/-sigma
+        d_vec = d_vec + alpha * ((rows > j - 1) & (rows < j + 1)).to(tl.float32)
+        # ---- right reflection: zero g[j, j+2:] ----
+        rowmask = (rows[None, :] > j - 1) & (rows[None, :] < j + 1)
+        rowj = tl.sum(tl.where(rowmask, gT, 0.0), axis=0)
+        u0 = tl.sum(rowj * ((cols > j) & (cols < j + 2)).to(tl.float32), axis=0)
+        u = rowj * (cols > j).to(tl.float32)
+        sigma2 = tl.sqrt(tl.sum(u * u, axis=0))
+        alpha2 = tl.where(u0 >= 0.0, -sigma2, sigma2)
+        if j + 2 < N:
+            u2 = tl.where((cols > j) & (cols < j + 2), u0 - alpha2, u)
+            vnorm3 = 2.0 * sigma2 * (sigma2 + tl.abs(u0))
+            tau2 = tl.where(vnorm3 > 0.0, 2.0 / vnorm3, 0.0)
+            # z = tau2 * (g[:, j+1:] u2): axis-1 reduce
+            z = tau2 * tl.sum(g * u2[None, :], axis=1)
+            g = g - tl.reshape(z, (BLOCK, 1)) * tl.reshape(u2, (1, BLOCK))
+            gT = tl.trans(g)
+        if j + 1 < N:
+            # E[j] = alpha2: the right reflection maps g[j, j+1] to +/-sigma
+            e_vec = e_vec + alpha2 * ((rows > j - 1) & (rows < j + 1)).to(tl.float32)
+    # last diagonal
+    dlast = tl.sum(tl.where(
+        (rows[:, None] > K - 2) & (rows[:, None] < K) &
+        (cols[None, :] > K - 2) & (cols[None, :] < K), g, 0.0))
+    d_vec = d_vec + dlast * ((rows > K - 2) & (rows < K)).to(tl.float32)
+    # raw bidiagonal d/e are written to global memory; the Sturm count
+    # runs in a separate kernel (kernel boundaries serialize MTE3/MTE2,
+    # so the D/E store->load round trip cannot race).
+    tl.store(D + batch * BLOCK + rows, d_vec)
+    tl.store(E + batch * BLOCK + rows, e_vec)
+
+
+@libentry()
+@triton.jit
+def _matrix_rank_sturm_kernel(
+    D,
+    E,
+    ATOL,
+    RTOL,
+    OUT,
+    K: tl.constexpr,
+    HERMITIAN: tl.constexpr,
+    BIDIAG: tl.constexpr,
+    BLOCK: tl.constexpr,
+    BISECT_ITERS: tl.constexpr,
+):
+    # Rank of a symmetric tridiagonal (B^T B of a bidiagonalization),
+    # using Gershgorin bounds refined by bisection on the Sturm count only
+    # when the rank actually depends on the refinement.  One program per
+    # batch element; D/E were produced by _matrix_rank_bidiag_kernel /
+    # _matrix_rank_tridiag_kernel, so this kernel only reads global memory
+    # (kernel boundaries serialize the MTE3/MTE2 queues).  For the bidiag
+    # path the inputs are the raw bidiagonal d/e and the B^T B tridiagonal
+    # entries are constructed exactly as d^2 + e_prev^2 and d*e, which
+    # keeps the smallest singular value at linear precision.
+    batch = tl.program_id(0)
+    kidx = tl.arange(0, BLOCK)
+    rows = tl.arange(0, BLOCK)
+    cols = tl.arange(0, BLOCK)
+    base = batch * BLOCK
+    d = tl.load(D + base + kidx, mask=kidx < K, other=0.0)
+    e_cur = tl.load(E + base + kidx, mask=kidx < K - 1, other=0.0)
+    e_prev = tl.load(
+        E + base + kidx - 1, mask=(kidx >= 1) & (kidx < K), other=0.0
+    )
+    if BIDIAG:
+        dd = d * d + e_prev * e_prev
+        ee = d * e_cur
+    else:
+        dd = d
+        ee = e_cur
+    tl.store(D + base + kidx, dd, mask=kidx < K)
+    tl.store(E + base + kidx, ee, mask=kidx < K)
+    shift2d = (cols[None, :] > rows[:, None] - 2) & (cols[None, :] < rows[:, None])
+    e_prev_v = tl.sum(tl.where(shift2d, ee[None, :], 0.0), axis=1)
+    gershgorin = tl.abs(dd) + tl.abs(ee) + tl.abs(e_prev_v)
+    hi = tl.max(gershgorin, axis=0)
+    dmax = tl.max(dd, axis=0)
+    atol = tl.load(ATOL + batch)
+    rtol = tl.load(RTOL + batch)
+
+    if hi == 0.0:
+        # The tridiagonal (and hence the matrix) is exactly zero.
+        tl.store(OUT + batch, tl.zeros((), dtype=tl.int64))
+    else:
+        if HERMITIAN:
+            # eigenvalues themselves; rank = #{lambda > tol} + #{lambda < -tol}
+            sigma_lo = tl.maximum(tl.abs(dmax), tl.abs(tl.min(d, axis=0)))
+            tol_lo = tl.maximum(atol, rtol * sigma_lo)
+            tol_hi = tl.maximum(atol, rtol * hi)
+            cnt_lo = _sturm_count_less(D, E, base, K, tol_lo)
+            cnt_hi = _sturm_count_less(D, E, base, K, tol_hi)
+            rank_lo = (K - cnt_lo) + _sturm_count_less(D, E, base, K, -tol_lo)
+            rank_hi = (K - cnt_hi) + _sturm_count_less(D, E, base, K, -tol_hi)
+        else:
+            # Gram matrix: eigenvalues are sigma^2, threshold is tol^2.
+            sigma_lo = tl.sqrt(tl.maximum(dmax, 0.0))
+            sigma_hi = tl.sqrt(hi)
+            tol_lo = tl.maximum(atol, rtol * sigma_lo)
+            tol_hi = tl.maximum(atol, rtol * sigma_hi)
+            cnt_lo = _sturm_count_less(D, E, base, K, tol_lo * tol_lo)
+            cnt_hi = _sturm_count_less(D, E, base, K, tol_hi * tol_hi)
+            rank_lo = K - cnt_lo
+            rank_hi = K - cnt_hi
+        rank = rank_lo
+        if rank_lo != rank_hi:
+            # The rank depends on sigma_max: refine it by bisection.
+            if HERMITIAN:
+                lo = dmax
+                hi_p = hi * (1.0 + 1e-9) + 1e-30
+                it = 0
+                while it < BISECT_ITERS:
+                    mid = 0.5 * (lo + hi_p)
+                    cnt = _sturm_count_less(D, E, base, K, mid)
+                    if cnt >= K:
+                        hi_p = mid
+                    else:
+                        lo = mid
+                    it += 1
+                lmax = 0.5 * (lo + hi_p)
+                lo = -(hi * (1.0 + 1e-9) + 1e-30)
+                hi_p = tl.min(d, axis=0)
+                it = 0
+                while it < BISECT_ITERS:
+                    mid = 0.5 * (lo + hi_p)
+                    cnt = _sturm_count_less(D, E, base, K, mid)
+                    if cnt > 0:
+                        hi_p = mid
+                    else:
+                        lo = mid
+                    it += 1
+                lmin = 0.5 * (lo + hi_p)
+                sigma_max = tl.maximum(tl.abs(lmax), tl.abs(lmin))
+                tol = tl.maximum(atol, rtol * sigma_max)
+                rank = (K - _sturm_count_less(D, E, base, K, tol)) + (
+                    _sturm_count_less(D, E, base, K, -tol)
+                )
+            else:
+                lo = tl.maximum(dmax, 0.0)
+                hi_p = hi * (1.0 + 1e-9) + 1e-30
+                it = 0
+                while it < BISECT_ITERS:
+                    mid = 0.5 * (lo + hi_p)
+                    cnt = _sturm_count_less(D, E, base, K, mid)
+                    if cnt >= K:
+                        hi_p = mid
+                    else:
+                        lo = mid
+                    it += 1
+                lmax = 0.5 * (lo + hi_p)
+                sigma_max = tl.sqrt(lmax)
+                tol = tl.maximum(atol, rtol * sigma_max)
+                rank = K - _sturm_count_less(D, E, base, K, tol * tol)
+        tl.store(OUT + batch, rank.to(tl.int64))
+
+
+def _launch_tridiag_rank(
+    matrix, atol_tensor, rtol_tensor, out, m, n, batch_count, input, hermitian
+):
+    """Gram + Householder tridiagonalization + Sturm count (k <= 64, fp32).
+
+    Inputs are zero-padded to (batch, BLOCK, BLOCK) with BLOCK = 64: the
+    Gram tl.dot needs unpadded operands (masked/zero-filled operands
+    silently miscompile on this backend), and the tridiagonalization tile
+    is fixed at 64 wide because smaller tiles have unreliable masked
+    reductions.
+    """
+    k = min(m, n)
+    block_m = 32
+    block = 64
+    d = torch.empty((batch_count, block), dtype=torch.float32, device=input.device)
+    e = torch.empty((batch_count, block), dtype=torch.float32, device=input.device)
+    with torch_device_fn.device(input.device):
+        if m <= block and n <= block:
+            # tile size adapts to the matrix: 32-wide tiles are cheaper and
+            # are correct on this backend (verified for K <= 32)
+            block = max(triton.next_power_of_2(max(m, n)), 32)
+            padded = torch.zeros(
+                (batch_count, block, block), dtype=torch.float32, device=input.device
+            )
+            padded[:, :m, :n] = matrix
+            # Bidiagonalize A directly (no Gram squaring): the smallest
+            # singular value keeps linear precision, which the Gram path
+            # loses to fp32 round-off.  Singular values of a symmetric
+            # matrix are |eigenvalues|, so hermitian inputs use the same
+            # path.
+            _matrix_rank_bidiag_kernel[(batch_count,)](
+                padded,
+                d,
+                e,
+                M=m,
+                N=n,
+                K=k,
+                BLOCK=block,
+                num_warps=4,
+                num_stages=1,
+                enable_fp_fusion=True,
+            )
+            _matrix_rank_sturm_kernel[(batch_count,)](
+                d,
+                e,
+                atol_tensor,
+                rtol_tensor,
+                out,
+                K=k,
+                HERMITIAN=hermitian,
+                BIDIAG=True,
+                BLOCK=block,
+                BISECT_ITERS=32,
+                num_warps=4,
+                num_stages=1,
+                enable_fp_fusion=True,
+            )
+        else:
+            # Long dimension > 64: Gram (Cube) + tridiagonalization (the
+            # bidiagonal kernel cannot compile tiles wider than 64).
+            padded = torch.zeros(
+                (batch_count, block, block), dtype=torch.float32, device=input.device
+            )
+            if m >= n:
+                pm = triton.cdiv(m, block_m) * block_m
+                gpad = torch.zeros(
+                    (batch_count, pm, block), dtype=torch.float32, device=input.device
+                )
+                gpad[:, :m, :n] = matrix
+                _matrix_rank_gram_kernel[(batch_count,)](
+                    gpad,
+                    padded,
+                    PM=pm,
+                    PN=block,
+                    TALL=True,
+                    BLOCK_M=block_m,
+                    num_warps=4,
+                    num_stages=1,
+                    enable_fp_fusion=True,
+                )
+            else:
+                pn = triton.cdiv(n, block_m) * block_m
+                gpad = torch.zeros(
+                    (batch_count, block, pn), dtype=torch.float32, device=input.device
+                )
+                gpad[:, :m, :n] = matrix
+                _matrix_rank_gram_kernel[(batch_count,)](
+                    gpad,
+                    padded,
+                    PM=block,
+                    PN=pn,
+                    TALL=False,
+                    BLOCK_M=block_m,
+                    num_warps=4,
+                    num_stages=1,
+                    enable_fp_fusion=True,
+                )
+            _matrix_rank_tridiag_kernel[(batch_count,)](
+                padded,
+                d,
+                e,
+                K=k,
+                BLOCK=block,
+                num_warps=4,
+                num_stages=1,
+                enable_fp_fusion=True,
+            )
+            _matrix_rank_sturm_kernel[(batch_count,)](
+                d,
+                e,
+                atol_tensor,
+                rtol_tensor,
+                out,
+                K=k,
+                HERMITIAN=hermitian,
+                BIDIAG=False,
+                BLOCK=block,
+                BISECT_ITERS=32,
+                num_warps=4,
+                num_stages=1,
+                enable_fp_fusion=True,
+            )
+    return out
+
 
 
 # ---------------------------------------------------------------------------
@@ -632,18 +1151,13 @@ def _launch_matrix_rank(input, atol_tensor, rtol_tensor, hermitian):
                 ABS_EPS=absolute_epsilon,
                 num_warps=num_warps,
             )
-        elif rows <= _FUSED_JACOBI_MAX_ROWS and (
-            (
-                is_fp64
-                and k <= _FUSED_JACOBI_MAX_K_FP64
-                and (k <= 16 or rows <= _FUSED_JACOBI_WIDE_MAX_ROWS)
-            )
-            or (
-                (not is_fp64)
-                and k <= _FUSED_JACOBI_MAX_K
-                and (k <= 32 or rows <= _FUSED_JACOBI_WIDE_MAX_ROWS)
-            )
+        elif is_fp64 and rows <= _FUSED_JACOBI_MAX_ROWS and (
+            k <= _FUSED_JACOBI_MAX_K_FP64
+            and (k <= 16 or rows <= _FUSED_JACOBI_WIDE_MAX_ROWS)
         ):
+            # fp64: the fused Jacobi is the only pure-Triton path available
+            # (the Gram/tridiag kernel is fp32-only, and this toolchain cannot
+            # compile fp64 kernels; see the report).
             block_k = triton.next_power_of_2(k)
             sweeps = _jacobi_sweeps(k, is_fp64)
             work = torch.empty(
@@ -688,13 +1202,36 @@ def _launch_matrix_rank(input, atol_tensor, rtol_tensor, hermitian):
                     num_warps=fused_warps,
                     enable_fp_fusion=not is_fp64,
                 )
+        elif (not is_fp64) and k <= _TRIDIAG_MAX_K and rows <= _TRIDIAG_MAX_ROWS:
+            # fp32 medium matrices: Gram (Cube) + in-register Householder
+            # tridiagonalization + Sturm count. One program per matrix, batch
+            # parallel, no GM round trips inside the reduction.
+            _launch_tridiag_rank(
+                matrix,
+                atol_tensor,
+                rtol_tensor,
+                out,
+                m,
+                n,
+                batch_count,
+                input,
+                hermitian,
+            )
         else:
-            # Large matrices: placeholder native svdvals + fused count (fp32
-            # only on Ascend; blocked/bidiag Triton paths arrive in later
-            # stages). Singular values of a Hermitian matrix equal the absolute
-            # eigenvalues, so this is correct for the hermitian path too.
+            # Large matrices: native svdvals + fused count (fp32 only on
+            # Ascend; blocked/bidiag Triton paths arrive in later stages).
+            # For hermitian inputs the effective lower-triangle matrix is
+            # materialized so svdvals sees the correct spectrum.
             _svals_rank(
-                matrix, atol_tensor, rtol_tensor, out, m, n, batch_count, input
+                matrix,
+                atol_tensor,
+                rtol_tensor,
+                out,
+                m,
+                n,
+                batch_count,
+                input,
+                hermitian,
             )
     return out
 
