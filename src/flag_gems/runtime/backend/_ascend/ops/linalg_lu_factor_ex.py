@@ -370,7 +370,7 @@ def linalg_lu_factor_ex_out(
     info=None,
     out=None,
 ):
-    logger.debug("GEMS_ASCEND LINALG_LU_FACTOR_EX.OUT")
+    logger.debug("GEMS_ASCEND LINALG_LU_FACTOR_EX_OUT")
     _check_linalg_lu_factor_ex_args(pivot, check_errors)
     lu_out, pivots_out, info_out = _resolve_linalg_lu_factor_ex_out_args(
         LU, pivots, info, out
