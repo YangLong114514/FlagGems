@@ -266,35 +266,6 @@ def _matrix_rank_zero_kernel(out, N: tl.constexpr, BLOCK_SIZE: tl.constexpr):
     tl.store(out + offsets, 0, mask=offsets < N)
 
 
-@libentry()
-@triton.jit
-def _sv_rank_count_kernel(
-    S_ptr,
-    atol_ptr,
-    rtol_ptr,
-    out_ptr,
-    K: tl.constexpr,
-    BLOCK_K: tl.constexpr,
-):
-    """Count singular values above the per-batch tolerance.
-
-    One program per batch element. ``tol = atol + rtol * max(S)`` reproduces
-    torch.linalg.matrix_rank semantics; the default tolerance is encoded by
-    ``_prepare_tolerances`` as ``rtol = max(m, n) * eps``.
-    """
-    pid = tl.program_id(0)
-    offs = tl.arange(0, BLOCK_K)
-    mask = offs < K
-    s = tl.load(S_ptr + pid * K + offs, mask=mask, other=0.0)
-    atol = tl.load(atol_ptr + pid)
-    rtol = tl.load(rtol_ptr + pid)
-    smax = tl.max(s, axis=0)
-    # torch semantics: tol = max(atol, rtol * smax)
-    tol = tl.maximum(atol, rtol * smax)
-    count = tl.sum((s > tol).to(tl.int64), axis=0)
-    tl.store(out_ptr + pid, count)
-
-
 # ---------------------------------------------------------------------------
 # rank-1 / rank-2 special cases (single program per matrix, no barrier)
 # ---------------------------------------------------------------------------
@@ -567,36 +538,6 @@ def _matrix_rank_fused_jacobi_kernel(
             axis=0,
         )
         tl.store(OUT + batch, rank.to(tl.int64))
-
-
-def _svals_rank(
-    matrix, atol_tensor, rtol_tensor, out, m, n, batch_count, input, hermitian
-):
-    """Native svdvals + fused count (large-k fallback).
-
-    Returns ``out`` filled with the numerical rank for each matrix in the
-    batch. For ``hermitian=True`` the effective matrix is the lower triangle
-    symmetrized, matching torch's semantics, so it is materialized first.
-    """
-    k = min(m, n)
-    if hermitian:
-        # A_eff = tril(A) with the upper triangle taken as tril(A,-1)^T.
-        eff = torch.tril(matrix)
-        eff = eff + torch.tril(matrix, -1).mT
-        matrix = eff
-    s = torch.linalg.svdvals(matrix)  # (batch, k), descending
-    block_k = triton.next_power_of_2(k)
-    with torch_device_fn.device(input.device):
-        _sv_rank_count_kernel[(batch_count,)](
-            s,
-            atol_tensor.reshape(batch_count),
-            rtol_tensor.reshape(batch_count),
-            out.reshape(batch_count),
-            K=k,
-            BLOCK_K=block_k,
-            num_warps=1,
-        )
-    return out
 
 
 # ---------------------------------------------------------------------------
@@ -1135,7 +1076,6 @@ def _launch_tridiag_rank(
 #  * all cross-program ordering relies on kernel boundaries; within a program
 #    store->load round trips are fenced with tl.debug_barrier.
 # ---------------------------------------------------------------------------
-_RRQR_MAX_ROWS = 2048
 
 
 @triton.jit
@@ -1669,57 +1609,16 @@ def _launch_matrix_rank(input, atol_tensor, rtol_tensor, hermitian):
                 ABS_EPS=absolute_epsilon,
                 num_warps=num_warps,
             )
-        elif is_fp64 and rows <= _FUSED_JACOBI_MAX_ROWS and (
-            k <= _FUSED_JACOBI_MAX_K_FP64
-            and (k <= 16 or rows <= _FUSED_JACOBI_WIDE_MAX_ROWS)
-        ):
-            # fp64: the fused Jacobi is the only pure-Triton path available
-            # (the Gram/tridiag kernel is fp32-only, and this toolchain cannot
-            # compile fp64 kernels; see the report).
-            block_k = triton.next_power_of_2(k)
-            sweeps = _jacobi_sweeps(k, is_fp64)
-            work = torch.empty(
-                (batch_count, k, rows), dtype=input.dtype, device=input.device
+        elif is_fp64:
+            # fp64 is unsupported on this backend end to end: aclnn svd_npu
+            # is fp32-only, and triton-ascend cannot compile fp64 kernels
+            # (the fused-Jacobi path kept here for reference dies with
+            # MLIRCompilationError at kernel compile time). Fail fast with a
+            # clear error instead of a compiler crash.
+            raise NotImplementedError(
+                "FlagGems Ascend linalg_matrix_rank does not support "
+                "float64 inputs (triton-ascend cannot compile fp64 kernels)"
             )
-            round_size = k if k % 2 == 0 else k + 1
-            pairs = round_size // 2
-            block_p = triton.next_power_of_2(pairs)
-            block_c = min(256, block_r)
-            fused_warps = 8 if block_p * block_c >= 8192 else 4
-            # Process one matrix per launch (grid=(1,), BATCH_COUNT=1). The
-            # work-matrix GM round-trip is only deterministic for a single
-            # resident program (inner tl.debug_barrier); the in-kernel batch
-            # loop and multi-program grid both misbehave on this backend, so the
-            # batch is serialized on the host. Trades batch throughput for
-            # correctness.
-            out_flat = out.reshape(batch_count)
-            for b in range(batch_count):
-                _matrix_rank_fused_jacobi_kernel[(1,)](
-                    matrix[b : b + 1],
-                    work[b : b + 1],
-                    atol_tensor[b : b + 1],
-                    rtol_tensor[b : b + 1],
-                    out_flat[b : b + 1],
-                    BATCH_COUNT=1,
-                    M=m,
-                    N=n,
-                    K=k,
-                    ROWS=rows,
-                    TALL=m >= n,
-                    HERMITIAN=hermitian,
-                    IS_FP64=is_fp64,
-                    ROUND=round_size,
-                    PAIRS=pairs,
-                    BLOCK_R=block_r,
-                    BLOCK_P=block_p,
-                    BLOCK_K=block_k,
-                    BLOCK_C=block_c,
-                    SWEEPS=sweeps,
-                    REL_EPS=relative_epsilon,
-                    ABS_EPS=absolute_epsilon,
-                    num_warps=fused_warps,
-                    enable_fp_fusion=not is_fp64,
-                )
         elif (not is_fp64) and k <= _TRIDIAG_MAX_K and rows <= _TRIDIAG_MAX_ROWS:
             # fp32 medium matrices: Gram (Cube) + in-register Householder
             # tridiagonalization + Sturm count. One program per matrix, batch
@@ -1735,10 +1634,10 @@ def _launch_matrix_rank(input, atol_tensor, rtol_tensor, hermitian):
                 input,
                 hermitian,
             )
-        elif (not is_fp64) and rows <= _RRQR_MAX_ROWS:
-            # fp32 large matrices (k > 64): pure-Triton blocked Householder
-            # QR with column pivoting (RRQR); the rank is read off the |R_ii|
-            # pivots. Replaces the aclnn svdvals fallback.
+        elif not is_fp64:
+            # fp32 large matrices (k > 64, or any matrix with rows > 2048):
+            # pure-Triton blocked Householder QR; the rank is read off the
+            # |R_ii| pivots. There is no aclnn fallback anywhere.
             _launch_rrqr_rank(
                 matrix,
                 atol_tensor,
@@ -1753,19 +1652,12 @@ def _launch_matrix_rank(input, atol_tensor, rtol_tensor, hermitian):
                 hermitian,
             )
         else:
-            # Remaining cases (fp64 k > 32, or rows > 2048): native svdvals +
-            # fused count. For hermitian inputs the effective lower-triangle
-            # matrix is materialized so svdvals sees the correct spectrum.
-            _svals_rank(
-                matrix,
-                atol_tensor,
-                rtol_tensor,
-                out,
-                m,
-                n,
-                batch_count,
-                input,
-                hermitian,
+            # fp64 beyond the fused-Jacobi limits: aclnn svd_npu is
+            # float32-only, so there is no fallback to offer.
+            raise NotImplementedError(
+                "FlagGems Ascend linalg_matrix_rank: float64 is supported "
+                f"only for min(m, n) <= {_FUSED_JACOBI_MAX_K_FP64} and "
+                f"max(m, n) <= {_FUSED_JACOBI_MAX_ROWS}; got ({m}, {n})"
             )
     return out
 
