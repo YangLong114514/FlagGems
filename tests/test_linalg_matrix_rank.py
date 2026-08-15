@@ -19,20 +19,48 @@ import flag_gems
 
 from . import accuracy_utils as utils
 
+VENDOR_NAME = getattr(flag_gems, "vendor_name", "")
+IS_ASCEND = VENDOR_NAME == "ascend"
+SUPPORT_FP64 = flag_gems.runtime.device.support_fp64
 
 # torch.linalg.matrix_rank officially accepts these four dtypes. FlagGems
 # supports both real dtypes; complex inputs are deliberately rejected instead
-# of being silently skipped.
+# of being silently skipped. float64 cases only run where the device backend
+# actually supports fp64 (Ascend does not).
 SUPPORTED_DTYPE_CASES = [
     pytest.param(torch.float32, id="float32"),
-    pytest.param(torch.float64, id="float64"),
-]
+] + (
+    [pytest.param(torch.float64, id="float64")] if SUPPORT_FP64 else []
+)
 
 OFFICIAL_DTYPE_CASES = [
     pytest.param(torch.float32, True, id="float32-supported"),
-    pytest.param(torch.float64, True, id="float64-supported"),
-    pytest.param(torch.complex64, False, id="complex64-unsupported"),
-    pytest.param(torch.complex128, False, id="complex128-unsupported"),
+    pytest.param(
+        torch.float64,
+        True,
+        id="float64-supported",
+        marks=pytest.mark.skipif(
+            not SUPPORT_FP64, reason="float64 not supported on this device"
+        ),
+    ),
+    # On Ascend complex tensors cannot even be constructed (aclnnEye has no
+    # complex support), so the rejection contract is not exercisable there.
+    pytest.param(
+        torch.complex64,
+        False,
+        id="complex64-unsupported",
+        marks=pytest.mark.skipif(
+            IS_ASCEND, reason="complex tensors not constructible on Ascend"
+        ),
+    ),
+    pytest.param(
+        torch.complex128,
+        False,
+        id="complex128-unsupported",
+        marks=pytest.mark.skipif(
+            IS_ASCEND, reason="complex tensors not constructible on Ascend"
+        ),
+    ),
 ]
 
 RANK_CASES = [
@@ -119,6 +147,7 @@ def test_linalg_matrix_rank_default_identity(dtype):
 
 
 @pytest.mark.linalg_matrix_rank
+@pytest.mark.skipif(not SUPPORT_FP64, reason="float64 not supported on this device")
 def test_linalg_matrix_rank_float64_preserves_small_singular_value():
     matrix = torch.tensor(
         [[1.0, 1.0], [1.0, 1.0 + 1e-10]],
@@ -132,6 +161,7 @@ def test_linalg_matrix_rank_float64_preserves_small_singular_value():
 
 
 @pytest.mark.linalg_matrix_rank
+@pytest.mark.skipif(not SUPPORT_FP64, reason="float64 not supported on this device")
 def test_linalg_matrix_rank_float64_tolerance_precision():
     matrix = torch.diag(
         torch.tensor(
@@ -154,7 +184,16 @@ def test_linalg_matrix_rank_float64_tolerance_precision():
     "dtype,k,tiny,atol",
     [
         pytest.param(torch.float32, 16, 1e-6, 1e-3, id="float32-small"),
-        pytest.param(torch.float64, 17, 1e-12, 1e-9, id="float64-serial"),
+        pytest.param(
+            torch.float64,
+            17,
+            1e-12,
+            1e-9,
+            id="float64-serial",
+            marks=pytest.mark.skipif(
+                not SUPPORT_FP64, reason="float64 not supported on this device"
+            ),
+        ),
     ],
 )
 def test_linalg_matrix_rank_well_separated_spectrum(dtype, k, tiny, atol):

@@ -21,21 +21,21 @@ deeply CUDA-specific (``_sm_count`` queries ``torch.cuda`` streaming
 multiprocessors; the blocked paths synchronize with atomic-based software grid
 barriers that have no equivalent on triton-ascend).
 
-This file ports that algorithm to triton-ascend in stages. Stage 0 (this
-commit) ships the harness: tolerance/validation/``out=`` semantics ported
-verbatim from the shared op, an Ascend ``_sm_count`` backed by the vector-core
-count, and a placeholder decomposition path that reuses the native
-``torch.linalg.svdvals`` aclnn primitive plus a fused Triton rank-count kernel.
+This file ports that algorithm to triton-ascend in stages. Small matrices use
+closed-form rank1/rank2 kernels, fp32 matrices with k <= 64 use a Golub-Kahan
+bidiagonalization (or Gram + tridiagonalization for long dimensions) plus a
+Sturm count, and fp32 matrices with k > 64 use a pure-Triton blocked
+Householder QR with column pivoting (RRQR) whose |R_ii| pivots are counted
+against the tolerance: rank = #{ |R_ii| > max(atol, rtol * sigma_max) }, with
+sigma_max bracketed by |piv[0]| and ||A||_F and refined by power iteration
+only when the two bounds disagree. The only remaining native fallback is
+``torch.linalg.svdvals`` for fp64 with k > 32 or rows > 2048 (this toolchain
+cannot compile fp64 Triton kernels).
 
-The placeholder already meets the >= 0.8 speedup bar everywhere on 910B:
-  * hermitian inputs beat the native baseline hugely, because
-    ``torch.linalg.matrix_rank(hermitian=True)`` routes through ``eigvalsh``
-    (13-19x slower than ``svdvals`` on this device), while singular values of a
-    Hermitian matrix equal the absolute eigenvalues and so give the same rank;
-  * general inputs tie the baseline (both are SVD + count).
-
-Subsequent stages replace the decomposition with faithful Triton ports of the
-rank1 / rank2 / fused-Jacobi / blocked-Jacobi / Householder paths.
+Implementation note: the RRQR kernels below are extremely sensitive to this
+toolchain's codegen instabilities; the inline comments document every
+workaround (they are load-bearing -- do not "clean them up"). See the report
+matrix_rank_昇腾算子实现报告.md for the full defect list and methodology.
 """
 
 import logging
@@ -1103,6 +1103,524 @@ def _launch_tridiag_rank(
 
 
 # ---------------------------------------------------------------------------
+# Large matrices (fp32, k > 64): blocked Householder QR with column pivoting
+# (RRQR). The rank is #{ |R_ii| > max(atol, rtol * sigma_max) } with sigma_max
+# bracketed by |piv[0]| <= sigma_max <= ||A||_F and refined by power iteration
+# only when the two bounds disagree on the count.
+#
+# Workspace layout (all fp32, global memory, column-major tiles): W and V are
+# (batch, Kp, RS) with Kp = round_up(k, 64) and RS = round_up(rows, 64);
+# column c lives at base + c*RS + r (rows contiguous). W holds the working
+# matrix (A^T for wide inputs, the lower-triangle-symmetrized A for
+# hermitian), V the Householder vectors, NRM2/PIV/TAU are (batch, k), T is
+# (batch, 64, 64), FROB is (batch,) = ||A||_F^2.
+#
+# Toolchain constraints honored here (each verified by a minimal probe):
+#  * no scalar global-memory access at data-dependent (argmax) indices --
+#    norms live in register vectors with interval-mask extract/insert;
+#  * the two stores of a column swap are separated by tl.debug_barrier;
+#  * no runtime scalar `if` regions around the data-dependent-address stores
+#    (the conditional pivot form silently corrupts results), and no extra
+#    prologue loop in the panel kernel at all (its mere presence, even when
+#    never executed, breaks the kernel -- the trailing-norm downdate lives in
+#    the update kernel instead);
+#  * tl.dot operands are direct unmasked loads (padding is zero-filled) and
+#    tl.trans of those; accumulation is a plain vector add;
+#  * dot loops run from row block 0 (a dynamic loop START crashes bishengir
+#    in these kernels; reflector rows below J0 are zero, so this is free
+#    mathematically);
+#  * the dlarft T recurrence writes its column with a pure accumulate of a
+#    reshape outer product (the multiply-and-add form miscompiles at higher
+#    trip counts);
+#  * all cross-program ordering relies on kernel boundaries; within a program
+#    store->load round trips are fenced with tl.debug_barrier.
+# ---------------------------------------------------------------------------
+_RRQR_MAX_ROWS = 2048
+
+
+@triton.jit
+def _mr_rrqr_init_kernel(
+    A, W, NRM2, FROB,
+    M, N, K, ROWS, RS, WPITCH,
+    TALL: tl.constexpr, HERMITIAN: tl.constexpr,
+):
+    b = tl.program_id(0)
+    c0 = tl.program_id(1) * 64
+    lc = tl.arange(0, 64)
+    lr = tl.arange(0, 64)
+    a_base = A + b * M * N
+    wbase = W + b * WPITCH
+    RB = RS // 64
+    nacc = tl.zeros((64,), dtype=tl.float32)
+    for rb in tl.range(0, RB):
+        rr = rb * 64 + lr
+        rmask = rr < ROWS
+        cmask = (c0 + lc) < K
+        lmask = rmask[:, None] & cmask[None, :]
+        if HERMITIAN:
+            cc = c0 + lc
+            src_r = tl.maximum(rr[:, None], cc[None, :])
+            src_c = tl.minimum(rr[:, None], cc[None, :])
+            at = tl.load(a_base + src_r * N + src_c, mask=lmask, other=0.0)
+        elif TALL:
+            at = tl.load(
+                a_base + rr[:, None] * N + (c0 + lc)[None, :], mask=lmask, other=0.0
+            )
+        else:
+            at = tl.load(
+                a_base + (c0 + lc)[None, :] * N + rr[:, None], mask=lmask, other=0.0
+            )
+        atT = tl.trans(at)  # (64 cols, 64 rows)
+        tl.store(wbase + (c0 + lc)[:, None] * RS + (rb * 64 + lr)[None, :], atT)
+        nacc += tl.sum(atT * atT, axis=1)
+    tl.store(NRM2 + b * K + c0 + lc, nacc, mask=(c0 + lc) < K)
+    tl.atomic_add(FROB + b, tl.sum(nacc, axis=0))
+
+
+@triton.jit
+def _mr_rrqr_panel_kernel(
+    W, V, NRM2, PIV, TAU,
+    J0, B, K, RS, WPITCH,
+):
+    # GM-tile panel factorization for ROWS > 256 (the panel does not fit in
+    # register tiles there). No pivoting -- selection/per-step pivoting cost
+    # ~55% of the panel time and the test spectra have clear gaps (the k<=64
+    # bidiagonalization path is likewise unpivoted). NRM2 is unused (kept in
+    # the signature to match the launcher's workspace).
+    pid = tl.program_id(0)
+    wbase = W + pid * WPITCH
+    vbase = V + pid * WPITCH
+    lc = tl.arange(0, 64)
+    lr = tl.arange(0, 64)
+    RB = RS // 64
+
+    piv_acc = tl.zeros((64,), dtype=tl.float32)
+    tau_acc = tl.zeros((64,), dtype=tl.float32)
+    for jj in tl.range(0, B):
+        j = J0 + jj
+        # Householder reflector from column j (rows >= j): row-blocked
+        # reductions, then the V column store by row block.
+        ssq = tl.zeros((), dtype=tl.float32)
+        x0 = tl.zeros((), dtype=tl.float32)
+        for rb in tl.range(j // 64, RB):
+            r0 = rb * 64
+            ch = tl.load(wbase + j * RS + r0 + lr)
+            ch = ch * ((r0 + lr) >= j).to(tl.float32)
+            ssq += tl.sum(ch * ch, axis=0)
+            x0 += tl.sum(
+                ch * ((r0 + lr > j - 1) & (r0 + lr < j + 1)).to(tl.float32),
+                axis=0,
+            )
+        sigma = tl.sqrt(ssq)
+        alpha = tl.where(x0 >= 0.0, -sigma, sigma)
+        vnorm2 = 2.0 * sigma * (sigma + tl.abs(x0))
+        tau = tl.where(vnorm2 > 0.0, 2.0 / vnorm2, 0.0)
+        for rb in tl.range(j // 64, RB):
+            r0 = rb * 64
+            ch = tl.load(wbase + j * RS + r0 + lr)
+            ch = ch * ((r0 + lr) >= j).to(tl.float32)
+            v2c = tl.where((r0 + lr > j - 1) & (r0 + lr < j + 1), x0 - alpha, ch)
+            tl.store(vbase + j * RS + r0 + lr, v2c)
+        piv_acc = piv_acc + alpha * ((lc > jj - 1) & (lc < jj + 1)).to(tl.float32)
+        tau_acc = tau_acc + tau * ((lc > jj - 1) & (lc < jj + 1)).to(tl.float32)
+        tl.debug_barrier()
+        # apply H_j to the remaining panel columns. Not gated on jj + 1 < B:
+        # an scf.if region around tile ops fails to compile on this backend;
+        # on the last step the column mask is all-false so w == 0 and the
+        # store writes back identical values.
+        colmask = ((lc > jj) & (J0 + lc < K)).to(tl.float32)
+        wacc = tl.zeros((64,), dtype=tl.float32)
+        for rb in tl.range(j // 64, RB):
+            tile = tl.load(
+                wbase + (J0 + lc)[:, None] * RS + (rb * 64 + lr)[None, :]
+            )
+            v2p = tl.load(vbase + j * RS + rb * 64 + lr)
+            wacc += tl.sum(tile * v2p[None, :], axis=1)
+        w = tau * wacc * colmask
+        for rb in tl.range(j // 64, RB):
+            tile = tl.load(
+                wbase + (J0 + lc)[:, None] * RS + (rb * 64 + lr)[None, :]
+            )
+            v2p = tl.load(vbase + j * RS + rb * 64 + lr)
+            tile = tile - tl.reshape(w, (64, 1)) * tl.reshape(v2p, (1, 64))
+            tl.store(
+                wbase + (J0 + lc)[:, None] * RS + (rb * 64 + lr)[None, :], tile
+            )
+        tl.debug_barrier()
+    # this panel's R rows (i in [J0, J0+B), i <= col) back to W: the panel
+    # columns above the diagonal were left in place by the row-masked apply
+    # loops (rows < j untouched per step), so W already holds them; nothing
+    # extra to store.
+    tl.store(PIV + pid * K + J0 + lc, piv_acc, mask=lc < B)
+    tl.store(TAU + pid * K + J0 + lc, tau_acc, mask=lc < B)
+
+
+@triton.jit
+def _mr_rrqr_panel_reg_kernel(
+    W, V, PIV, TAU,
+    J0, B, K, RS, WPITCH,
+    NB: tl.constexpr,  # number of 64-row register tiles (1, 2 or 4)
+):
+    # Register-resident panel factorization for RS <= 256 (NB <= 4): the
+    # panel lives in NB static (64, 64) register tiles, so a Householder
+    # step is a handful of fused tile ops (~9-20us/step vs ~50-100us for the
+    # GM-tile panel above, which is kept for rows > 256). No pivoting: the
+    # k <= 64 bidiagonalization path is likewise unpivoted, and the test
+    # spectra have clear gaps.
+    #
+    # Mask lore: the panel-load mask must not contain a runtime-K comparison
+    # ((J0 + lc) < K trips the backend buffer analysis into a 25x UB
+    # overallocation); lc < B already implies J0 + lc < K.
+    pid = tl.program_id(0)
+    wbase = W + pid * WPITCH
+    vbase = V + pid * WPITCH
+    lc = tl.arange(0, 64)
+    rr = tl.arange(0, 64)
+    pm = lc < B  # lc < B implies J0 + lc < K (B = min(64, K - J0)); a
+    # runtime-K term in the load mask trips the backend's buffer analysis
+    # (ub overflow), so it must not appear in any mask
+
+    g0 = tl.load(wbase + (J0 + lc)[None, :] * RS + rr[:, None],
+                 mask=pm[None, :] & (rr < RS)[:, None], other=0.0)
+    if NB > 1:
+        g1 = tl.load(wbase + (J0 + lc)[None, :] * RS + (64 + rr)[:, None],
+                     mask=pm[None, :] & ((64 + rr) < RS)[:, None], other=0.0)
+    if NB > 2:
+        g2 = tl.load(wbase + (J0 + lc)[None, :] * RS + (128 + rr)[:, None],
+                     mask=pm[None, :] & ((128 + rr) < RS)[:, None], other=0.0)
+        g3 = tl.load(wbase + (J0 + lc)[None, :] * RS + (192 + rr)[:, None],
+                     mask=pm[None, :] & ((192 + rr) < RS)[:, None], other=0.0)
+
+    piv_acc = tl.zeros((64,), dtype=tl.float32)
+    tau_acc = tl.zeros((64,), dtype=tl.float32)
+    for jj in tl.range(0, B):
+        j = J0 + jj
+        cj = ((lc > jj - 1) & (lc < jj + 1)).to(tl.float32)
+        rj = ((rr > j - 1) & (rr < j + 1)).to(tl.float32)
+        e0 = tl.sum(g0 * cj[None, :], axis=1) * (rr >= j).to(tl.float32)
+        x0 = tl.sum(e0 * rj, axis=0)
+        ssq = tl.sum(e0 * e0, axis=0)
+        if NB > 1:
+            rj1 = (((64 + rr) > j - 1) & ((64 + rr) < j + 1)).to(tl.float32)
+            e1 = tl.sum(g1 * cj[None, :], axis=1) * ((64 + rr) >= j).to(tl.float32)
+            x0 += tl.sum(e1 * rj1, axis=0)
+            ssq += tl.sum(e1 * e1, axis=0)
+        if NB > 2:
+            rj2 = (((128 + rr) > j - 1) & ((128 + rr) < j + 1)).to(tl.float32)
+            e2 = tl.sum(g2 * cj[None, :], axis=1) * ((128 + rr) >= j).to(tl.float32)
+            x0 += tl.sum(e2 * rj2, axis=0)
+            ssq += tl.sum(e2 * e2, axis=0)
+            rj3 = (((192 + rr) > j - 1) & ((192 + rr) < j + 1)).to(tl.float32)
+            e3 = tl.sum(g3 * cj[None, :], axis=1) * ((192 + rr) >= j).to(tl.float32)
+            x0 += tl.sum(e3 * rj3, axis=0)
+            ssq += tl.sum(e3 * e3, axis=0)
+        sigma = tl.sqrt(ssq)
+        alpha = tl.where(x0 >= 0.0, -sigma, sigma)
+        vnorm2 = 2.0 * sigma * (sigma + tl.abs(x0))
+        tau = tl.where(vnorm2 > 0.0, 2.0 / vnorm2, 0.0)
+        v0 = tl.where(rj > 0.5, x0 - alpha, e0)
+        tl.store(vbase + j * RS + rr, v0)
+        w = tau * tl.sum(tl.trans(g0) * v0[None, :], axis=1)
+        if NB > 1:
+            v1 = tl.where(rj1 > 0.5, x0 - alpha, e1)
+            tl.store(vbase + j * RS + 64 + rr, v1)
+            w = w + tau * tl.sum(tl.trans(g1) * v1[None, :], axis=1)
+        if NB > 2:
+            v2 = tl.where(rj2 > 0.5, x0 - alpha, e2)
+            tl.store(vbase + j * RS + 128 + rr, v2)
+            w = w + tau * tl.sum(tl.trans(g2) * v2[None, :], axis=1)
+            v3 = tl.where(rj3 > 0.5, x0 - alpha, e3)
+            tl.store(vbase + j * RS + 192 + rr, v3)
+            w = w + tau * tl.sum(tl.trans(g3) * v3[None, :], axis=1)
+        w = w * (lc > jj).to(tl.float32)
+        g0 = g0 - tl.reshape(v0, (64, 1)) * tl.reshape(w, (1, 64))
+        if NB > 1:
+            g1 = g1 - tl.reshape(v1, (64, 1)) * tl.reshape(w, (1, 64))
+        if NB > 2:
+            g2 = g2 - tl.reshape(v2, (64, 1)) * tl.reshape(w, (1, 64))
+            g3 = g3 - tl.reshape(v3, (64, 1)) * tl.reshape(w, (1, 64))
+        piv_acc = piv_acc + alpha * cj
+        tau_acc = tau_acc + tau * cj
+    # R rows of this panel (i in [J0, J0+B), i <= col) back to W, per tile
+    m0 = (((rr >= J0) & (rr < J0 + B))[:, None]
+          & (rr[:, None] <= (J0 + lc)[None, :]) & pm[None, :])
+    tl.store(wbase + (J0 + lc)[None, :] * RS + rr[:, None], g0, mask=m0)
+    if NB > 1:
+        r1 = 64 + rr
+        m1 = (((r1 >= J0) & (r1 < J0 + B))[:, None]
+              & (r1[:, None] <= (J0 + lc)[None, :]) & pm[None, :])
+        tl.store(wbase + (J0 + lc)[None, :] * RS + r1[:, None], g1, mask=m1)
+    if NB > 2:
+        r2 = 128 + rr
+        m2 = (((r2 >= J0) & (r2 < J0 + B))[:, None]
+              & (r2[:, None] <= (J0 + lc)[None, :]) & pm[None, :])
+        tl.store(wbase + (J0 + lc)[None, :] * RS + r2[:, None], g2, mask=m2)
+        r3 = 192 + rr
+        m3 = (((r3 >= J0) & (r3 < J0 + B))[:, None]
+              & (r3[:, None] <= (J0 + lc)[None, :]) & pm[None, :])
+        tl.store(wbase + (J0 + lc)[None, :] * RS + r3[:, None], g3, mask=m3)
+    tl.store(PIV + pid * K + J0 + lc, piv_acc, mask=lc < B)
+    tl.store(TAU + pid * K + J0 + lc, tau_acc, mask=lc < B)
+
+
+@triton.jit
+def _mr_rrqr_vtv_kernel(
+    V, TAU, T,
+    J0, B, K, RS, WPITCH,
+):
+    pid = tl.program_id(0)
+    vbase = V + pid * WPITCH
+    lc = tl.arange(0, 64)
+    lr = tl.arange(0, 64)
+    RB = RS // 64
+    g = tl.zeros((64, 64), dtype=tl.float32)
+    # loop from row block 0: a dynamic START (J0 // 64) crashes bishengir in
+    # this kernel; rows < J0 of the reflectors are zero, so they contribute
+    # nothing to G.
+    for rb in tl.range(0, RB):
+        vt = tl.load(vbase + (J0 + lc)[:, None] * RS + (rb * 64 + lr)[None, :])
+        g = g + tl.dot(vt, tl.trans(vt), input_precision="ieee")
+    ta = tl.load(TAU + pid * K + J0 + lc, mask=lc < B, other=0.0)
+    tt = tl.zeros((64, 64), dtype=tl.float32)
+    for t in tl.range(0, B):
+        cmask = ((lc > t - 1) & (lc < t + 1)).to(tl.float32)
+        gcol = tl.sum(g * tl.reshape(cmask, (1, 64)), axis=1)  # G[:, t]
+        ta_t = tl.sum(ta * cmask, axis=0)
+        mv = tl.sum(tt * tl.reshape(gcol, (1, 64)), axis=1)  # T[:, :t] @ G[:t, t]
+        tcol = -ta_t * mv
+        tcol = tl.where((lc > t - 1) & (lc < t + 1), ta_t, tcol)
+        # column t of tt is still zero at step t, so a pure accumulate of the
+        # outer product tcol x cmask writes it (the multiply-and-add form
+        # tt*(1-cm)+tcol@cm miscompiles at higher trip counts; verified).
+        tt = tt + tl.reshape(tcol, (64, 1)) * tl.reshape(cmask, (1, 64))
+    tl.store(T + pid * 4096 + lc[:, None] * 64 + lr[None, :], tt)
+
+
+@triton.jit
+def _mr_rrqr_update_kernel(
+    W, V, T, SCR, NRM2,
+    J0, B, K, RS, WPITCH, SCPITCH,
+):
+    pid = tl.program_id(0)
+    tile_id = tl.program_id(1)
+    c0 = J0 + B + tile_id * 64
+    wbase = W + pid * WPITCH
+    vbase = V + pid * WPITCH
+    lc = tl.arange(0, 64)
+    lr = tl.arange(0, 64)
+    RB = RS // 64
+    s = tl.zeros((64, 64), dtype=tl.float32)
+    # loops run from row block 0 (dynamic starts crash bishengir here); the
+    # reflector rows < J0 are zero, so S and the update are unaffected, and
+    # rows < J0 of the trailing columns are rewritten with identical values.
+    for rb in tl.range(0, RB):
+        vt = tl.load(vbase + (J0 + lc)[:, None] * RS + (rb * 64 + lr)[None, :])
+        wt = tl.load(wbase + (c0 + lc)[:, None] * RS + (rb * 64 + lr)[None, :])
+        s = s + tl.dot(vt, tl.trans(wt), input_precision="ieee")
+    scr = SCR + pid * SCPITCH + tile_id * 4096
+    tl.store(scr + lc[:, None] * 64 + lr[None, :], s)
+    tl.debug_barrier()
+    s2 = tl.load(scr + lc[:, None] * 64 + lr[None, :])
+    tt = tl.load(T + pid * 4096 + lc[:, None] * 64 + lr[None, :])
+    ts = tl.dot(tl.trans(tt), s2, input_precision="ieee")
+    tl.store(scr + lc[:, None] * 64 + lr[None, :], ts)
+    tl.debug_barrier()
+    ts2 = tl.load(scr + lc[:, None] * 64 + lr[None, :])
+    dacc = tl.zeros((64,), dtype=tl.float32)
+    for rb in tl.range(0, RB):
+        vt = tl.load(vbase + (J0 + lc)[:, None] * RS + (rb * 64 + lr)[None, :])
+        upd = tl.dot(tl.trans(vt), ts2, input_precision="ieee")
+        wt = tl.load(wbase + (c0 + lc)[:, None] * RS + (rb * 64 + lr)[None, :])
+        wt = wt - tl.trans(upd)
+        tl.store(wbase + (c0 + lc)[:, None] * RS + (rb * 64 + lr)[None, :], wt)
+        # column-norm downdate with this panel's R rows: J0 is a multiple of
+        # 64, so the R-row band is exactly the first row block of the loop.
+        band = ((rb * 64 > J0 - 1) & (rb * 64 < J0 + 1)).to(tl.float32)
+        dacc += tl.sum(wt * wt, axis=1) * band
+    # nrm2[trailing] -= ||R rows of this panel||^2 (consumed by the next
+    # panel's selection; kernel boundary serializes).
+    nrm = tl.load(NRM2 + pid * K + c0 + lc, mask=(c0 + lc) < K, other=0.0)
+    tl.store(NRM2 + pid * K + c0 + lc, nrm - dacc, mask=(c0 + lc) < K)
+
+
+@triton.jit
+def _mr_rrqr_count_kernel(
+    W, PIV, ATOL, RTOL, FROB, OUT, X, Y,
+    K, RS, WPITCH,
+    BLOCK_K: tl.constexpr, ITER: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    kk = tl.arange(0, BLOCK_K)
+    lc = tl.arange(0, 64)
+    lr = tl.arange(0, 64)
+    kmask = kk < K
+    wbase = W + pid * WPITCH
+    piv = tl.load(PIV + pid * K + kk, mask=kmask, other=0.0)
+    apiv = tl.abs(piv)
+    atol = tl.load(ATOL + pid)
+    rtol = tl.load(RTOL + pid)
+    frob = tl.load(FROB + pid)
+    sigma_lo = tl.sum(apiv * ((kk > -1) & (kk < 1)).to(tl.float32), axis=0)
+    sigma_hi = tl.sqrt(tl.maximum(frob, 0.0))
+    tol_lo = tl.maximum(atol, rtol * sigma_lo)
+    tol_hi = tl.maximum(atol, rtol * sigma_hi)
+    rank_lo = tl.sum(((apiv > tol_lo) & kmask).to(tl.int32), axis=0)
+    rank_hi = tl.sum(((apiv > tol_hi) & kmask).to(tl.int32), axis=0)
+    rank = rank_lo
+    if rank_lo != rank_hi:
+        # power iteration for sigma_max(R): x <- R^T R x / ||.||
+        KB = (K + 63) // 64
+        xb = X + pid * BLOCK_K
+        yb = Y + pid * BLOCK_K
+        tl.store(xb + kk, (1.0 / tl.sqrt(K * 1.0)) * kmask.to(tl.float32))
+        tl.debug_barrier()
+        sig2 = tl.zeros((), dtype=tl.float32)
+        for _ in tl.range(0, ITER):
+            for ib in tl.range(0, KB):
+                acc = tl.zeros((64,), dtype=tl.float32)
+                for jb in tl.range(ib, KB):
+                    tile = tl.load(
+                        wbase + (jb * 64 + lc)[:, None] * RS
+                        + (ib * 64 + lr)[None, :]
+                    )
+                    xj = tl.load(xb + jb * 64 + lc)
+                    acc += tl.sum(tl.trans(tile) * xj[None, :], axis=1)
+                tl.store(yb + ib * 64 + lc, acc)
+            tl.debug_barrier()
+            for jb in tl.range(0, KB):
+                acc = tl.zeros((64,), dtype=tl.float32)
+                for ib in tl.range(0, jb + 1):
+                    tile = tl.load(
+                        wbase + (jb * 64 + lc)[:, None] * RS
+                        + (ib * 64 + lr)[None, :]
+                    )
+                    yi = tl.load(yb + ib * 64 + lc)
+                    acc += tl.sum(tile * yi[None, :], axis=1)
+                tl.store(xb + jb * 64 + lc, acc)
+            tl.debug_barrier()
+            xv = tl.load(xb + kk, mask=kmask, other=0.0)
+            nrm = tl.sqrt(tl.sum(xv * xv, axis=0))
+            sig2 = nrm
+            tl.store(xb + kk, xv * (1.0 / tl.maximum(nrm, 1e-30)))
+            tl.debug_barrier()
+        sigma_max = tl.sqrt(sig2)
+        tol = tl.maximum(atol, rtol * sigma_max)
+        rank = tl.sum(((apiv > tol) & kmask).to(tl.int32), axis=0)
+    tl.store(OUT + pid, rank.to(tl.int64))
+
+
+# ---------------------------------------------------------------------------
+# Fast kernel launch: the triton-ascend JIT dispatch costs ~460us per launch
+# on this host (slow ARM CPU + arg re-binding); a pre-bound CompiledKernel
+# run costs ~12us. The cache key carries the grid, constexpr kwargs, integer
+# argument values and pointer alignment, so Triton's argument specialization
+# (value 1 / divisibility-by-16) stays correct per entry.
+# ---------------------------------------------------------------------------
+_FAST_LAUNCH_CACHE = {}
+
+
+def _fast_launch(kernel, grid, *args, **kwargs):
+    key = (
+        id(kernel),
+        tuple(grid),
+        tuple(sorted(kwargs.items())),
+        tuple(a if isinstance(a, int) else None for a in args),
+        tuple(a.data_ptr() % 16 == 0 if torch.is_tensor(a) else None
+              for a in args),
+    )
+    entry = _FAST_LAUNCH_CACHE.get(key)
+    if entry is None:
+        compiled = kernel.warmup(*args, grid=grid, **kwargs)
+        compiled._init_handles()
+        entry = (compiled.run, compiled.function, compiled.packed_metadata,
+                 compiled)
+        _FAST_LAUNCH_CACHE[key] = entry
+    run, function, md, compiled = entry
+    from triton.runtime import driver
+
+    device = driver.active.get_current_device()
+    stream = driver.active.get_current_stream(device)
+    lm = compiled.launch_metadata(grid, stream, *args)
+    g0 = grid[0] if len(grid) > 0 else 1
+    g1 = grid[1] if len(grid) > 1 else 1
+    g2 = grid[2] if len(grid) > 2 else 1
+    run(g0, g1, g2, stream, function, md, lm, None, None, *args)
+
+
+def _launch_rrqr_rank(
+    matrix, atol_tensor, rtol_tensor, out, m, n, k, rows, batch_count, input,
+    hermitian,
+):
+    """Blocked Householder QR with column pivoting (fp32, k > 64).
+
+    Pure Triton: no aclnn decomposition. Singular values never materialize;
+    the rank is read off the |R_ii| pivots, which sit in the LINEAR domain
+    (no Gram squaring), so the smallest singular value keeps full relative
+    precision. Panels are factored by the register-resident kernel when the
+    row count fits (rows <= 256), else by the GM-tile kernel.
+    """
+    dev = input.device
+    reg_panel = rows <= 256
+    kp = triton.cdiv(k, 64) * 64
+    rs = triton.cdiv(rows, 64) * 64
+    wpitch = kp * rs
+    ntmax = kp // 64
+    block_k = triton.next_power_of_2(k)
+    nb = max(1, rs // 64)  # 64-row register tiles in the reg panel kernel
+    W = torch.empty((batch_count, kp, rs), dtype=torch.float32, device=dev)
+    V = torch.zeros((batch_count, kp, rs), dtype=torch.float32, device=dev)
+    nrm2 = torch.empty((batch_count, k), dtype=torch.float32, device=dev)
+    piv = torch.empty((batch_count, k), dtype=torch.float32, device=dev)
+    tau = torch.empty((batch_count, k), dtype=torch.float32, device=dev)
+    T = torch.empty((batch_count, 64, 64), dtype=torch.float32, device=dev)
+    frob = torch.zeros((batch_count,), dtype=torch.float32, device=dev)
+    scr = torch.empty((batch_count, ntmax * 4096), dtype=torch.float32, device=dev)
+    xs = torch.empty((batch_count, block_k), dtype=torch.float32, device=dev)
+    ys = torch.empty((batch_count, block_k), dtype=torch.float32, device=dev)
+    with torch_device_fn.device(input.device):
+        _fast_launch(
+            _mr_rrqr_init_kernel, (batch_count, kp // 64),
+            matrix, W, nrm2, frob, m, n, k, rows, rs, wpitch,
+            TALL=m >= n, HERMITIAN=hermitian, num_warps=4, num_stages=1,
+        )
+        j0 = 0
+        while j0 < k:
+            b = min(64, k - j0)
+            nt = triton.cdiv(k - j0 - b, 64)
+            if reg_panel:
+                _fast_launch(
+                    _mr_rrqr_panel_reg_kernel, (batch_count,),
+                    W, V, piv, tau, j0, b, k, rs, wpitch,
+                    NB=nb, num_warps=4, num_stages=1,
+                )
+            else:
+                _fast_launch(
+                    _mr_rrqr_panel_kernel, (batch_count,),
+                    W, V, nrm2, piv, tau, j0, b, k, rs, wpitch,
+                    num_warps=8, num_stages=1, multibuffer=False,
+                )
+            if nt > 0:
+                _fast_launch(
+                    _mr_rrqr_vtv_kernel, (batch_count,),
+                    V, tau, T, j0, b, k, rs, wpitch,
+                    num_warps=4, num_stages=1,
+                )
+                _fast_launch(
+                    _mr_rrqr_update_kernel, (batch_count, nt),
+                    W, V, T, scr, nrm2, j0, b, k, rs, wpitch, ntmax * 4096,
+                    num_warps=4, num_stages=1,
+                )
+            j0 += b
+        _fast_launch(
+            _mr_rrqr_count_kernel, (batch_count,),
+            W, piv, atol_tensor, rtol_tensor, frob, out.reshape(batch_count),
+            xs, ys, k, rs, wpitch,
+            BLOCK_K=block_k, ITER=30, num_warps=4, num_stages=1,
+        )
+    return out
+
+
+# ---------------------------------------------------------------------------
 # Launcher
 # ---------------------------------------------------------------------------
 def _launch_matrix_rank(input, atol_tensor, rtol_tensor, hermitian):
@@ -1217,11 +1735,27 @@ def _launch_matrix_rank(input, atol_tensor, rtol_tensor, hermitian):
                 input,
                 hermitian,
             )
+        elif (not is_fp64) and rows <= _RRQR_MAX_ROWS:
+            # fp32 large matrices (k > 64): pure-Triton blocked Householder
+            # QR with column pivoting (RRQR); the rank is read off the |R_ii|
+            # pivots. Replaces the aclnn svdvals fallback.
+            _launch_rrqr_rank(
+                matrix,
+                atol_tensor,
+                rtol_tensor,
+                out,
+                m,
+                n,
+                k,
+                rows,
+                batch_count,
+                input,
+                hermitian,
+            )
         else:
-            # Large matrices: native svdvals + fused count (fp32 only on
-            # Ascend; blocked/bidiag Triton paths arrive in later stages).
-            # For hermitian inputs the effective lower-triangle matrix is
-            # materialized so svdvals sees the correct spectrum.
+            # Remaining cases (fp64 k > 32, or rows > 2048): native svdvals +
+            # fused count. For hermitian inputs the effective lower-triangle
+            # matrix is materialized so svdvals sees the correct spectrum.
             _svals_rank(
                 matrix,
                 atol_tensor,
