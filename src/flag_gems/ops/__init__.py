@@ -413,6 +413,7 @@ from flag_gems.ops.linalg_cross import linalg_cross, linalg_cross_out
 from flag_gems.ops.linalg_ldl_factor import ldl_factor
 from flag_gems.ops.linalg_ldl_solve import linalg_ldl_solve
 from flag_gems.ops.linalg_lstsq import linalg_lstsq
+from flag_gems.ops.linalg_lu import linalg_lu, linalg_lu_out
 from flag_gems.ops.linalg_lu_factor import linalg_lu_factor, linalg_lu_factor_out
 from flag_gems.ops.linalg_lu_factor_ex import (
     linalg_lu_factor_ex,
@@ -1262,10 +1263,12 @@ __all__ = [
     "linalg_cross_out",
     "linalg_ldl_solve",
     "linalg_lstsq",
+    "linalg_lu",
     "linalg_lu_factor",
     "linalg_lu_factor_ex",
     "linalg_lu_factor_ex_out",
     "linalg_lu_factor_out",
+    "linalg_lu_out",
     "linalg_slogdet",
     "linalg_solve_triangular",
     "linalg_solve_triangular_out",
