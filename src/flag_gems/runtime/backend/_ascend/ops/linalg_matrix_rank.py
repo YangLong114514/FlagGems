@@ -39,6 +39,7 @@ matrix_rank_昇腾算子实现报告.md for the full defect list and methodology
 """
 
 import logging
+import os
 import warnings
 
 import torch
@@ -94,6 +95,9 @@ _FUSED_JACOBI_WIDE_MAX_ROWS = 128
 # over the tall dimension, so the only real limits are the tridiagonal tile
 # in UB (k <= 64 -> 16 KB) and the unrolled dot chunk count.
 _TRIDIAG_MAX_K = 64
+_BIDIAG_MIN_K = 513  # k >= 513: exact bidiag+Sturm. 64 < k <= 512 stays on the
+# faster RRQR path (the 0.8 perf bar excludes it there; the near-tolerance
+# exactness guarantee of the bidiagonal path is documented in the report).
 _TRIDIAG_MAX_ROWS = 2048
 
 
@@ -866,7 +870,9 @@ def _matrix_rank_sturm_kernel(
             rank_lo = K - cnt_lo
             rank_hi = K - cnt_hi
         rank = rank_lo
-        if rank_lo != rank_hi:
+        refine = rank_lo != rank_hi
+        tol2 = tol_lo * tol_lo
+        if refine:
             # The rank depends on sigma_max: refine it by bisection.
             if HERMITIAN:
                 lo = dmax
@@ -1563,6 +1569,394 @@ def _launch_rrqr_rank(
 # ---------------------------------------------------------------------------
 # Launcher
 # ---------------------------------------------------------------------------
+@triton.jit
+def _mr_bidiag_lstep_kernel(W, V, D, TAU, ACC, J, K, RS, WPITCH, APITCH):
+    pid = tl.program_id(0)
+    wbase = W + pid * WPITCH
+    lr = tl.arange(0, 64)
+    ssq = tl.zeros((), dtype=tl.float32)
+    x0 = tl.zeros((), dtype=tl.float32)
+    for rb in tl.range(J // 64, RS // 64):
+        r0 = rb * 64
+        ch = tl.load(wbase + J * RS + r0 + lr)
+        ch = ch * ((r0 + lr) >= J).to(tl.float32)
+        ssq += tl.sum(ch * ch, axis=0)
+        x0 += tl.sum(ch * ((r0 + lr > J - 1) & (r0 + lr < J + 1)).to(tl.float32), axis=0)
+    sigma = tl.sqrt(ssq)
+    alpha = tl.where(x0 >= 0.0, -sigma, sigma)
+    vnorm2 = 2.0 * sigma * (sigma + tl.abs(x0))
+    tau = tl.where(vnorm2 > 0.0, 2.0 / vnorm2, 0.0)
+    for rb in tl.range(J // 64, RS // 64):
+        r0 = rb * 64
+        ch = tl.load(wbase + J * RS + r0 + lr)
+        ch = ch * ((r0 + lr) >= J).to(tl.float32)
+        v2c = tl.where((r0 + lr > J - 1) & (r0 + lr < J + 1), x0 - alpha, ch)
+        tl.store(V + pid * WPITCH + J * RS + r0 + lr, v2c)
+    tl.store(D + pid * K + J, alpha)
+    tl.store(TAU + pid * K + J, tau)
+    for cb in tl.range(0, APITCH // 64):
+        tl.store(ACC + pid * APITCH + cb * 64 + lr, tl.zeros((64,), dtype=tl.float32))
+
+
+@triton.jit
+def _mr_bidiag_lmat_kernel(W, V, ACC, J, K, RS, WPITCH, APITCH, NRC):
+    # NOTE: 3D grids miscompute on this backend past small sizes (verified:
+    # (1,8,8) silently wrong, flat 2D exact), so tiles are flattened.
+    pid = tl.program_id(0)
+    flat = tl.program_id(1)
+    ct = flat // NRC
+    rc = flat % NRC
+    c0 = J + 1 + ct * 64
+    lc = tl.arange(0, 64)
+    lr = tl.arange(0, 64)
+    r0 = rc * 64
+    wbase = W + pid * WPITCH
+    tile = tl.load(wbase + (c0 + lc)[:, None] * RS + (r0 + lr)[None, :])
+    v2p = tl.load(V + pid * WPITCH + J * RS + r0 + lr)
+    part = tl.sum(tile * v2p[None, :], axis=1)
+    tl.atomic_add(ACC + pid * APITCH + c0 + lc, part)
+
+
+@triton.jit
+def _mr_bidiag_lapply_kernel(W, V, TAU, ACC, J, K, RS, WPITCH, APITCH, NRC):
+    pid = tl.program_id(0)
+    flat = tl.program_id(1)
+    ct = flat // NRC
+    rc = flat % NRC
+    c0 = J + 1 + ct * 64
+    lc = tl.arange(0, 64)
+    lr = tl.arange(0, 64)
+    r0 = rc * 64
+    wbase = W + pid * WPITCH
+    tau = tl.load(TAU + pid * K + J)
+    w = tl.load(ACC + pid * APITCH + c0 + lc) * tau
+    v2p = tl.load(V + pid * WPITCH + J * RS + r0 + lr)
+    tile = tl.load(wbase + (c0 + lc)[:, None] * RS + (r0 + lr)[None, :])
+    tile = tile - tl.reshape(w, (64, 1)) * tl.reshape(v2p, (1, 64))
+    tl.store(wbase + (c0 + lc)[:, None] * RS + (r0 + lr)[None, :], tile)
+
+
+@triton.jit
+def _mr_bidiag_rstep_kernel(W, U, E, TAU, ACC, J, K, RS, WPITCH, UPITCH, APITCH):
+    pid = tl.program_id(0)
+    wbase = W + pid * WPITCH
+    lc = tl.arange(0, 64)
+    ssq = tl.zeros((), dtype=tl.float32)
+    x0 = tl.zeros((), dtype=tl.float32)
+    for cb in tl.range(0, (K + 63) // 64):
+        c0 = cb * 64
+        ch = tl.load(wbase + (c0 + lc) * RS + J, mask=(c0 + lc) < K, other=0.0)
+        ch = ch * ((c0 + lc) > J).to(tl.float32)
+        ssq += tl.sum(ch * ch, axis=0)
+        x0 += tl.sum(ch * ((c0 + lc > J) & (c0 + lc < J + 2)).to(tl.float32), axis=0)
+    sigma = tl.sqrt(ssq)
+    alpha = tl.where(x0 >= 0.0, -sigma, sigma)
+    vnorm2 = 2.0 * sigma * (sigma + tl.abs(x0))
+    tau = tl.where(vnorm2 > 0.0, 2.0 / vnorm2, 0.0)
+    for cb in tl.range(0, (K + 63) // 64):
+        c0 = cb * 64
+        ch = tl.load(wbase + (c0 + lc) * RS + J, mask=(c0 + lc) < K, other=0.0)
+        ch = ch * ((c0 + lc) > J).to(tl.float32)
+        u2c = tl.where(((c0 + lc) > J) & ((c0 + lc) < J + 2), x0 - alpha, ch)
+        tl.store(U + pid * UPITCH + J * K + c0 + lc, u2c, mask=(c0 + lc) < K)
+    tl.store(E + pid * K + J, alpha)
+    tl.store(TAU + pid * K + J, tau)
+    for cb in tl.range(0, APITCH // 64):
+        tl.store(ACC + pid * APITCH + cb * 64 + lc, tl.zeros((64,), dtype=tl.float32))
+
+
+@triton.jit
+def _mr_bidiag_rmat_kernel(W, U, ACC, J, K, RS, WPITCH, UPITCH, APITCH, NCC):
+    pid = tl.program_id(0)
+    flat = tl.program_id(1)
+    rt = flat // NCC
+    cc = flat % NCC
+    r0 = J + 1 + rt * 64
+    lc = tl.arange(0, 64)
+    lr = tl.arange(0, 64)
+    c0 = cc * 64
+    wbase = W + pid * WPITCH
+    # the J+1-aligned row grid is not 64-aligned, so the last tile straddles
+    # the RS row pitch; mask it (the wrapped-around address is the NEXT
+    # column's row 0 -- an out-of-bounds read/write otherwise)
+    rmask = (r0 + lr) < RS
+    tile = tl.load(wbase + (c0 + lc)[:, None] * RS + (r0 + lr)[None, :],
+                   mask=rmask[None, :], other=0.0)
+    up = tl.load(U + pid * UPITCH + J * K + c0 + lc, mask=(c0 + lc) < K, other=0.0)
+    part = tl.sum(tl.trans(tile) * up[None, :], axis=1)
+    tl.atomic_add(ACC + pid * APITCH + r0 + lr, part)
+
+
+@triton.jit
+def _mr_bidiag_rapply_kernel(W, U, TAU, ACC, J, K, RS, WPITCH, UPITCH, APITCH, NRC, NTR):
+    pid = tl.program_id(0)
+    flat = tl.program_id(1)
+    ct = flat // NTR
+    rc = flat % NTR
+    c0 = J + 1 + ct * 64
+    r0 = J + 1 + rc * 64
+    lc = tl.arange(0, 64)
+    lr = tl.arange(0, 64)
+    wbase = W + pid * WPITCH
+    tau = tl.load(TAU + pid * K + J)
+    rmask = (r0 + lr) < RS
+    wu = tl.load(ACC + pid * APITCH + r0 + lr, mask=rmask, other=0.0) * tau
+    up = tl.load(U + pid * UPITCH + J * K + c0 + lc, mask=(c0 + lc) < K, other=0.0)
+    tile = tl.load(wbase + (c0 + lc)[:, None] * RS + (r0 + lr)[None, :],
+                   mask=rmask[None, :], other=0.0)
+    tile = tile - tl.reshape(up, (64, 1)) * tl.reshape(wu, (1, 64))
+    tl.store(wbase + (c0 + lc)[:, None] * RS + (r0 + lr)[None, :], tile,
+             mask=rmask[None, :])
+
+
+@triton.jit
+def _mr_sturm_big_kernel(
+    D,
+    E,
+    ATOL,
+    RTOL,
+    OUT,
+    TOL2,
+    FLAG,
+    K,
+    BLOCK: tl.constexpr,
+    BISECT_ITERS: tl.constexpr,
+):
+    # Large-K variant of the bidiagonal Sturm count (no 2D tiles: those do
+    # not compile past 64 wide). Counts #{sigma > max(atol, rtol*sigma_max)}
+    # with sigma_max bracketed by sqrt(max dd) / sqrt(Gershgorin) and refined
+    # by bisection only when the two bounds give different ranks.
+    batch = tl.program_id(0)
+    kidx = tl.arange(0, BLOCK)
+    base = batch * K
+    kmask = kidx < K
+    d = tl.load(D + base + kidx, mask=kmask, other=0.0)
+    e_cur = tl.load(E + base + kidx, mask=kidx < K - 1, other=0.0)
+    e_prev = tl.load(E + base + kidx - 1, mask=(kidx >= 1) & kmask, other=0.0)
+    dd = d * d + e_prev * e_prev
+    ee = d * e_cur
+    tl.store(D + base + kidx, dd, mask=kmask)
+    tl.store(E + base + kidx, ee, mask=kmask)
+    d_prev = tl.load(D + base + kidx - 1, mask=(kidx >= 1) & kmask, other=0.0)
+    e_prev_v = d_prev * e_prev  # ee[i-1]
+    gershgorin = tl.abs(dd) + tl.abs(ee) + tl.abs(e_prev_v)
+    hi = tl.max(gershgorin, axis=0)
+    dmax = tl.max(dd, axis=0)
+    atol = tl.load(ATOL + batch)
+    rtol = tl.load(RTOL + batch)
+    if hi == 0.0:
+        tl.store(OUT + batch, tl.zeros((), dtype=tl.int64))
+    else:
+        sigma_lo = tl.sqrt(tl.maximum(dmax, 0.0))
+        sigma_hi = tl.sqrt(hi)
+        tol_lo = tl.maximum(atol, rtol * sigma_lo)
+        tol_hi = tl.maximum(atol, rtol * sigma_hi)
+        cnt_lo = _sturm_count_less(D, E, base, K, tol_lo * tol_lo)
+        cnt_hi = _sturm_count_less(D, E, base, K, tol_hi * tol_hi)
+        rank_lo = K - cnt_lo
+        rank_hi = K - cnt_hi
+        rank = rank_lo
+        refine = rank_lo != rank_hi
+        tol2 = tol_lo * tol_lo
+        if refine:
+            lo = tl.maximum(dmax, 0.0)
+            hi_p = hi * (1.0 + 1e-9) + 1e-30
+            it = 0
+            while it < BISECT_ITERS:
+                mid = 0.5 * (lo + hi_p)
+                cnt = _sturm_count_less(D, E, base, K, mid)
+                if cnt >= K:
+                    hi_p = mid
+                else:
+                    lo = mid
+                it += 1
+            lmax = 0.5 * (lo + hi_p)
+            sigma_max = tl.sqrt(lmax)
+            tol2 = tl.maximum(atol, rtol * sigma_max)
+            tol2 = tol2 * tol2
+        # The final Sturm count runs in a separate kernel: a while-loop count
+        # directly after the bisection while-loop miscomputes on this backend
+        # (verified: wrong pivot signs). tol2/flag hand off through GM.
+        tl.store(OUT + batch, rank.to(tl.int64))
+        tl.store(TOL2 + batch, tol2)
+        tl.store(FLAG + batch, refine.to(tl.int64))
+
+
+@triton.jit
+def _df64_add(h1, l1, h2, l2):
+    # Error-free addition of two double-single numbers (Knuth TwoSum on the
+    # hi parts, lo parts gathered afterwards, then one renormalization).
+    s = h1 + h2
+    z = s - h1
+    e = (h1 - (s - z)) + (h2 - z)
+    lo = l1 + l2 + e
+    h = s + lo
+    e2 = lo - (h - s)
+    return h, e2
+
+
+@triton.jit
+def _df64_mul_ds(a_h, a_l, b_h, b_l):
+    # Double-single product: TwoProd on the hi parts plus the cross terms.
+    p = a_h * b_h
+    e = tl.fma(a_h, b_h, -p) + a_h * b_l + a_l * b_h
+    h = p + e
+    l = e - (h - p)
+    return h, l
+
+
+@triton.jit
+def _df64_div_ds(a_h, a_l, b_h, b_l):
+    # Double-single division: fp32 quotient plus one df64 correction step.
+    q1 = a_h / b_h
+    p = q1 * b_h
+    pe = tl.fma(q1, b_h, -p)
+    r_h, r_l = _df64_add(a_h, a_l, -p, -(pe + q1 * b_l))
+    q2 = r_h / b_h
+    h = q1 + q2
+    l = q2 - (h - q1)
+    return h, l
+
+
+@triton.jit
+def _mr_sturm_final_kernel(D, E, TOL2, FLAG, OUT, K):
+    # The decisive count, in double-single (df64) arithmetic: at near-critical
+    # thresholds the qd recurrence has intermediates passing within ~1 ulp of
+    # zero, and fp32 implementations diverge from each other there (verified:
+    # CPU fp32 and this kernel disagreed with <1ulp input differences). df64
+    # makes the recurrence fp64-accurate. Requires enable_fp_fusion=False
+    # (fma contraction breaks the TwoSum/TwoProd error-free transforms).
+    batch = tl.program_id(0)
+    tol2 = tl.load(TOL2 + batch)
+    refine = tl.load(FLAG + batch)
+    rank_a = tl.load(OUT + batch)
+    base = batch * K
+    d0 = tl.load(D + base)
+    q_h, q_l = _df64_add(d0, 0.0, -tol2, 0.0)
+    zero = (q_h == 0.0) & (q_l == 0.0)
+    q_h = tl.where(zero, -1.1754944e-38, q_h)
+    q_l = tl.where(zero, 0.0, q_l)
+    neg = ((q_h < 0.0) | ((q_h == 0.0) & (q_l < 0.0))).to(tl.int32)
+    i = 1
+    while i < K:
+        di = tl.load(D + base + i)
+        ei = tl.load(E + base + i - 1)
+        t_h, t_l = _df64_mul_ds(ei, 0.0, ei, 0.0)
+        qd_h, qd_l = _df64_div_ds(t_h, t_l, q_h, q_l)
+        s_h, s_l = _df64_add(di, 0.0, -tol2, 0.0)
+        q_h, q_l = _df64_add(s_h, s_l, -qd_h, -qd_l)
+        zero = (q_h == 0.0) & (q_l == 0.0)
+        q_h = tl.where(zero, -1.1754944e-38, q_h)
+        q_l = tl.where(zero, 0.0, q_l)
+        neg += ((q_h < 0.0) | ((q_h == 0.0) & (q_l < 0.0))).to(tl.int32)
+        i += 1
+    rank_b = (K - neg).to(tl.int64)
+    # always take the df64 count: the fp32 bracket counts in kernel A are only
+    # used to bound sigma_max / trigger the bisection, never for the answer.
+    tl.store(OUT + batch, rank_b)
+
+
+def _launch_bidiag_rank(
+    matrix, atol_tensor, rtol_tensor, out, m, n, k, rows, batch_count, input,
+    hermitian,
+):
+    """Unblocked Golub-Kahan bidiagonalization + Sturm count (fp32, k >= 512).
+
+    SVD-accurate rank: unlike the RRQR path (|R_ii| only approximate sigma_i),
+    the bidiagonal d/e keep every singular value at linear precision and the
+    Sturm count is exact, so borderline tolerances are resolved correctly.
+    Per step: six kernel launches (reflector / matvec / apply, left then
+    right); cross-program reductions use atomic accumulation and kernel
+    boundaries provide all ordering. Slower per step than the RRQR path but
+    exact -- used only where the QR pivot gap is a risk (large k).
+    """
+    dev = input.device
+    kp = triton.cdiv(k, 64) * 64 + 64  # one slack tile: tile accesses are
+    rs = triton.cdiv(rows, 64) * 64 + 64  # unmasked and must not run off
+    wpitch = kp * rs
+    upitch = kp * (k + 64)
+    block_k = max(triton.next_power_of_2(k), 64)
+    W = torch.zeros((batch_count, kp, rs), dtype=torch.float32, device=dev)
+    V = torch.zeros((batch_count, kp, rs), dtype=torch.float32, device=dev)
+    U = torch.zeros((batch_count, upitch), dtype=torch.float32, device=dev)
+    dbuf = torch.zeros((batch_count, k), dtype=torch.float32, device=dev)
+    ebuf = torch.zeros((batch_count, k), dtype=torch.float32, device=dev)
+    taul = torch.zeros((batch_count, k), dtype=torch.float32, device=dev)
+    taur = torch.zeros((batch_count, k), dtype=torch.float32, device=dev)
+    nrm2 = torch.empty((batch_count, k), dtype=torch.float32, device=dev)
+    frob = torch.zeros((batch_count,), dtype=torch.float32, device=dev)
+    # One extra tile of slack: the right matvec's atomic accumulation index
+    # r0 + 63 can reach rs (pad-row tiles are updated but never read).
+    acc = torch.zeros((batch_count, kp + 64), dtype=torch.float32, device=dev)
+    uacc = torch.zeros((batch_count, rs + 64), dtype=torch.float32, device=dev)
+    tol2_buf = torch.empty((batch_count,), dtype=torch.float32, device=dev)
+    flag_buf = torch.empty((batch_count,), dtype=torch.int64, device=dev)
+    # TRITON_ALL_BLOCKS_PARALLEL (set globally by the fused sparse-attention
+    # module at import) miscompiles the bidiag matvec/apply kernels (verified:
+    # wrong atomic-accumulated sums). It is read at kernel COMPILE time only,
+    # so pop it for the duration of this launcher (compiles happen here via
+    # _fast_launch warmups) and restore it afterwards.
+    saved_all_blocks = os.environ.pop("TRITON_ALL_BLOCKS_PARALLEL", None)
+    try:
+        with torch_device_fn.device(input.device):
+            _fast_launch(
+                _mr_rrqr_init_kernel, (batch_count, (kp - 64) // 64),
+                matrix, W, nrm2, frob, m, n, k, rows, rs, wpitch,
+                TALL=m >= n, HERMITIAN=hermitian, num_warps=4, num_stages=1,
+            )
+            for j in range(k):
+                ntl = triton.cdiv(k - 1 - j, 64)
+                _fast_launch(
+                    _mr_bidiag_lstep_kernel, (batch_count,),
+                    W, V, dbuf, taul, acc, j, k, rs, wpitch, kp,
+                    num_warps=4, num_stages=1,
+                )
+                if ntl > 0:
+                    _fast_launch(
+                        _mr_bidiag_lmat_kernel, (batch_count, ntl * ((rs - 64) // 64)),
+                        W, V, acc, j, k, rs, wpitch, kp, (rs - 64) // 64,
+                        num_warps=4, num_stages=1,
+                    )
+                    _fast_launch(
+                        _mr_bidiag_lapply_kernel, (batch_count, ntl * ((rs - 64) // 64)),
+                        W, V, taul, acc, j, k, rs, wpitch, kp, (rs - 64) // 64,
+                        num_warps=4, num_stages=1,
+                    )
+                if j + 1 < k:
+                    ntr = triton.cdiv(rs - 1 - j, 64)
+                    _fast_launch(
+                        _mr_bidiag_rstep_kernel, (batch_count,),
+                        W, U, ebuf, taur, uacc, j, k, rs, wpitch, upitch, rs,
+                        num_warps=4, num_stages=1,
+                    )
+                    _fast_launch(
+                        _mr_bidiag_rmat_kernel, (batch_count, ntr * ((kp - 64) // 64)),
+                        W, U, uacc, j, k, rs, wpitch, upitch, rs, (kp - 64) // 64,
+                        num_warps=4, num_stages=1,
+                    )
+                    _fast_launch(
+                        _mr_bidiag_rapply_kernel, (batch_count, ntl * ntr),
+                        W, U, taur, uacc, j, k, rs, wpitch, upitch, rs,
+                        (rs - 64) // 64, ntr,
+                        num_warps=4, num_stages=1,
+                    )
+            _fast_launch(
+                _mr_sturm_big_kernel, (batch_count,),
+                dbuf, ebuf, atol_tensor, rtol_tensor, out.reshape(batch_count),
+                tol2_buf, flag_buf,
+                k, BLOCK=block_k, BISECT_ITERS=32, num_warps=1, num_stages=1,
+            )
+            _fast_launch(
+                _mr_sturm_final_kernel, (batch_count,),
+                dbuf, ebuf, tol2_buf, flag_buf, out.reshape(batch_count), k,
+                num_warps=1, num_stages=1, enable_fp_fusion=False,
+            )
+    finally:
+        if saved_all_blocks is not None:
+            os.environ["TRITON_ALL_BLOCKS_PARALLEL"] = saved_all_blocks
+    return out
+
+
 def _launch_matrix_rank(input, atol_tensor, rtol_tensor, hermitian):
     output_shape = input.shape[:-2]
     m, n = input.shape[-2:]
@@ -1634,10 +2028,27 @@ def _launch_matrix_rank(input, atol_tensor, rtol_tensor, hermitian):
                 input,
                 hermitian,
             )
+        elif not is_fp64 and k >= _BIDIAG_MIN_K:
+            # fp32 large matrices: unblocked Golub-Kahan bidiagonalization +
+            # Sturm count. SVD-accurate (linear-precision d/e), unlike the
+            # RRQR pivots, so borderline tolerances are exact here.
+            _launch_bidiag_rank(
+                matrix,
+                atol_tensor,
+                rtol_tensor,
+                out,
+                m,
+                n,
+                k,
+                rows,
+                batch_count,
+                input,
+                hermitian,
+            )
         elif not is_fp64:
-            # fp32 large matrices (k > 64, or any matrix with rows > 2048):
-            # pure-Triton blocked Householder QR; the rank is read off the
-            # |R_ii| pivots. There is no aclnn fallback anywhere.
+            # fp32 medium matrices (64 < k < 512): pure-Triton blocked
+            # Householder QR; the rank is read off the |R_ii| pivots. There
+            # is no aclnn fallback anywhere.
             _launch_rrqr_rank(
                 matrix,
                 atol_tensor,
