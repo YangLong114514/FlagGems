@@ -56,6 +56,7 @@ from .index_select import index_select
 from .isin import isin
 from .linalg_cross import linalg_cross, linalg_cross_out
 from .linalg_lstsq import linalg_lstsq
+from .linalg_lu import linalg_lu, linalg_lu_out
 from .linalg_lu_factor import linalg_lu_factor, linalg_lu_factor_out
 from .linalg_lu_factor_ex import linalg_lu_factor_ex, linalg_lu_factor_ex_out
 from .linspace import linspace
@@ -164,6 +165,8 @@ __all__ = [
     "index_select",
     "isin",
     "linalg_lstsq",
+    "linalg_lu",
+    "linalg_lu_out",
     "linalg_lu_factor",
     "linalg_lu_factor_out",
     "linalg_lu_factor_ex",

@@ -116,7 +116,12 @@ def _lu_factor_no_pivot(lu, m, n, k):
 
 
 def _unpack_lu_manual(lu, pivots, m, n, k, pivot):
-    """Manual unpack of (lu, pivots) into (P, L, U)."""
+    """Manual unpack of (lu, pivots) into (P, L, U).
+
+    P is built by applying the row swaps to the identity in REVERSE order
+    (i = k-1 .. 0), matching torch.linalg.lu semantics (see
+    tests/test_linalg_lu.py for details).
+    """
     device = lu.device
     dtype = lu.dtype
     batch_shape = lu.shape[:-2]
@@ -132,7 +137,7 @@ def _unpack_lu_manual(lu, pivots, m, n, k, pivot):
     P = torch.zeros((*batch_shape, m, m), device=device, dtype=dtype)
     diag_m = torch.arange(m, device=device)
     P[..., diag_m, diag_m] = 1
-    for i in range(k):
+    for i in range(k - 1, -1, -1):
         P = _swap_rows(P, i, (pivots[..., i] - 1).to(torch.int64))
     return P, ll, u
 
