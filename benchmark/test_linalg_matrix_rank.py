@@ -115,6 +115,28 @@ class MatrixRankHermitianBenchmark(base.GenericBenchmark):
         )
 
 
+def _composed_matrix_rank(matrix, atol=None, rtol=None, hermitian=False):
+    """matrix_rank composed from native NPU ops (svdvals + reduction).
+
+    torch.linalg.matrix_rank(hermitian=True) dispatches to
+    aten::_linalg_eigh.eigenvalues, which has no NPU implementation and falls
+    back to the CPU. This composed version keeps the reference latency on the
+    NPU: singular values of a Hermitian matrix are the absolute eigenvalues,
+    so svdvals (native aclnn) plus a threshold count reproduces the semantics.
+    """
+    if hermitian:
+        # eigh reads only the lower triangle; mirror that before the SVD.
+        matrix = torch.tril(matrix) + torch.tril(matrix, -1).mT
+    svals = torch.linalg.svdvals(matrix)
+    if atol is None:
+        atol = 0.0
+    if rtol is None:
+        rtol = max(matrix.shape[-2], matrix.shape[-1]) * torch.finfo(matrix.dtype).eps
+    smax = svals.amax(dim=-1, keepdim=True)
+    tol = torch.clamp_min(smax * rtol, atol)
+    return (svals > tol).sum(dim=-1)
+
+
 @pytest.mark.linalg_matrix_rank
 def test_linalg_matrix_rank():
     def matrix_rank_input_fn(shape, cur_dtype, device):
@@ -138,10 +160,19 @@ def test_linalg_matrix_rank_hermitian():
         matrix = matrix + matrix.mT
         yield matrix, {"hermitian": True}
 
+    if IS_ASCEND:
+        # torch.linalg.matrix_rank(hermitian=True) falls back to the CPU on
+        # Ascend (aten::_linalg_eigh.eigenvalues has no NPU kernel). Use a
+        # baseline composed of native NPU ops instead, mirroring the
+        # cholesky_solve benchmark.
+        torch_op = _composed_matrix_rank
+    else:
+        torch_op = torch.linalg.matrix_rank
+
     bench = MatrixRankHermitianBenchmark(
         input_fn=matrix_rank_hermitian_input_fn,
         op_name="linalg_matrix_rank_hermitian",
-        torch_op=torch.linalg.matrix_rank,
+        torch_op=torch_op,
         dtypes=MATRIX_RANK_DTYPES,
     )
     bench.set_gems(flag_gems.linalg_matrix_rank)
