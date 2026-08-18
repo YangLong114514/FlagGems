@@ -257,11 +257,23 @@ def test_linalg_matrix_rank_rank_deficient(dtype):
 
 @pytest.mark.linalg_matrix_rank
 @pytest.mark.parametrize("dtype", SUPPORTED_DTYPE_CASES)
-def test_linalg_matrix_rank_nonempty_zero_matrix(dtype):
-    matrix = torch.zeros(
-        (2, 4, 6), dtype=dtype, device=flag_gems.device
+@pytest.mark.parametrize(
+    "shape",
+    [
+        pytest.param((2, 4, 6), id="batched-small"),
+        pytest.param((513, 513), id="bidiag-k513"),
+        pytest.param((1024, 1024), id="bidiag-k1024"),
+        pytest.param((2, 513, 513), id="bidiag-batched"),
+    ],
+)
+def test_linalg_matrix_rank_nonempty_zero_matrix(dtype, shape):
+    # The k >= 513 shapes exercise the unblocked bidiagonalization path,
+    # whose zero-matrix shortcut must still hand defined state to the
+    # (unconditionally launched) final Sturm kernel.
+    matrix = torch.zeros(shape, dtype=dtype, device=flag_gems.device)
+    expected = torch.zeros(
+        shape[:-2], dtype=torch.int64, device=matrix.device
     )
-    expected = torch.zeros((2,), dtype=torch.int64, device=matrix.device)
 
     result = _assert_direct_and_dispatch_match_native(
         matrix, hermitian=False
@@ -510,6 +522,39 @@ def test_linalg_matrix_rank_hermitian_uses_lower_triangle(dtype):
 
 @pytest.mark.linalg_matrix_rank
 @pytest.mark.parametrize("dtype", SUPPORTED_DTYPE_CASES)
+@pytest.mark.parametrize(
+    "order,rank",
+    [
+        pytest.param(3, 2, id="fused-k3"),
+        pytest.param(32, 28, id="fused-k32"),
+        pytest.param(33, 29, id="padded-k33"),
+        pytest.param(64, 60, id="padded-k64"),
+    ],
+)
+def test_linalg_matrix_rank_hermitian_ignores_strict_upper(dtype, order, rank):
+    # torch hermitian semantics: only the LOWER triangle of the input is
+    # read.  Filling the strict upper triangle with huge garbage must not
+    # change the rank.  Covers the fused (k <= 32) and padded (33..64)
+    # tridiagonalization paths; the 2x2 closed form is covered above.
+    generator = torch.Generator(device=flag_gems.device).manual_seed(7)
+    basis = torch.randn(
+        order, rank, dtype=dtype, device=flag_gems.device, generator=generator
+    )
+    matrix = basis @ basis.mT
+    upper_rows, upper_cols = torch.triu_indices(
+        order, order, offset=1, device=matrix.device
+    )
+    matrix[upper_rows, upper_cols] = 1.0e6
+    expected = torch.tensor(rank, dtype=torch.int64, device=matrix.device)
+
+    result = _assert_direct_and_dispatch_match_native(
+        matrix, atol=5e-2, hermitian=True
+    )
+    utils.gems_assert_equal(result, expected)
+
+
+@pytest.mark.linalg_matrix_rank
+@pytest.mark.parametrize("dtype", SUPPORTED_DTYPE_CASES)
 def test_linalg_matrix_rank_hermitian_blocked(dtype):
     matrix = _make_matrix_with_rank((33, 33), 32, dtype)
     expected = torch.tensor(32, dtype=torch.int64, device=matrix.device)
@@ -716,6 +761,30 @@ def test_linalg_matrix_rank_official_dtype_contract(dtype, is_supported):
             NotImplementedError, match="float32 and float64"
         ):
             flag_gems.linalg_matrix_rank(matrix)
+
+
+@pytest.mark.linalg_matrix_rank
+@pytest.mark.skipif(
+    not IS_ASCEND, reason="fp64 rejection is specific to the Ascend backend"
+)
+@pytest.mark.parametrize(
+    "shape",
+    [
+        pytest.param((5, 1), id="k1"),
+        pytest.param((5, 2), id="k2"),
+        pytest.param((5, 5), id="fused"),
+        pytest.param((40, 40), id="padded"),
+        pytest.param((600, 600), id="bidiag"),
+    ],
+)
+def test_linalg_matrix_rank_fp64_rejected(shape):
+    # fp64 must fail fast with a clear error for EVERY shape class, before
+    # any shape dispatch (k=1/2 used to slip past the check and die inside
+    # the Triton compiler with MLIRCompilationError).
+    matrix = torch.randn(shape, dtype=torch.float64, device=flag_gems.device)
+
+    with pytest.raises(NotImplementedError, match="float64"):
+        flag_gems.linalg_matrix_rank(matrix)
 
 
 @pytest.mark.linalg_matrix_rank
