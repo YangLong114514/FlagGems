@@ -46,7 +46,7 @@ def _native_copy_(out, src):
 
 
 @libentry()
-@triton.jit(debug=True)
+@triton.jit
 def index_fill_kernel(
     out,
     index,
@@ -102,16 +102,18 @@ def index_fill_kernel(
             valid_index = (raw_index >= -dim_size) & (raw_index < dim_size)
             coord = tl.where(raw_index < 0, raw_index + dim_size, raw_index)
         out_offsets += coord * strides[i]
-    tl.device_assert(valid_index, "index out of bounds", mask=mask)
     if VALUE_IS_TENSOR:
         fill_value = tl.load(value)
     else:
         fill_value = value
+    # Out-of-range index entries are skipped silently by the store mask.
+    # (PyTorch reports them as an error, but tl.device_assert fails to
+    # compile on non-CUDA FlagGems backends, so the check is omitted.)
     tl.store(out + out_offsets, fill_value, mask=mask & valid_index)
 
 
 @libentry()
-@triton.jit(debug=True)
+@triton.jit
 def index_fill_contiguous_kernel(
     out,
     index,
@@ -134,7 +136,6 @@ def index_fill_contiguous_kernel(
     outer_coord = m_offsets // index_len
     raw_index = tl.load(index + index_coord, mask=m_mask, other=0).to(tl.int64)
     valid_index = (raw_index >= -dim_size) & (raw_index < dim_size)
-    tl.device_assert(valid_index, "index out of bounds", mask=m_mask)
     normalized_index = tl.where(raw_index < 0, raw_index + dim_size, raw_index)
     out_offsets = outer_coord[:, None] * dim_size * inner_size
     out_offsets += normalized_index[:, None] * inner_size
@@ -145,11 +146,14 @@ def index_fill_contiguous_kernel(
         fill_value = tl.load(value)
     else:
         fill_value = value
+    # Out-of-range index entries are skipped silently by the store mask.
+    # (PyTorch reports them as an error, but tl.device_assert fails to
+    # compile on non-CUDA FlagGems backends, so the check is omitted.)
     tl.store(out + out_offsets, fill_value, mask=store_mask)
 
 
 @libentry()
-@triton.jit(debug=True)
+@triton.jit
 def index_fill_copy_kernel(out, inp, N, BLOCK_SIZE: tl.constexpr):
     # Flat copy for the out-of-place fast path. Inside a fully registered
     # FlagGems context, a native clone routes its internal copy_ to the
