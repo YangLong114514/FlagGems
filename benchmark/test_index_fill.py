@@ -136,6 +136,5 @@ def test_index_fill_():
         input_fn=index_fill_input_fn,
         torch_op=torch.Tensor.index_fill_,
         dtypes=INDEX_FILL_DTYPES,
-        is_inplace=True,
     )
     bench.run()
