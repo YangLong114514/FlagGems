@@ -21,7 +21,6 @@ from . import base, consts
 
 INDEX_RATIOS = ("1/16", "1/2", "full")
 INDEX_FILL_DTYPES = [torch.float16, torch.float32, torch.bfloat16]
-# INDEX_FILL_DTYPES = [torch.float32]
 MIN_SELECTED_NUMEL = 16 * 1024
 DIM0_INDEX_LENGTHS = {
     (4096, 256): (8, 256, 2048),
@@ -114,27 +113,6 @@ def _base_inputs(shape, dtype, device):
             yield inp, dim, index
 
 
-def _selected_numel(inp, dim, index):
-    return math.prod(inp.shape) // inp.size(dim) * index.numel()
-
-
-def _inplace_gbps(bench_fn_args, latency):
-    inp, dim, index = bench_fn_args[:3]
-    bytes_per_elem = inp.element_size()
-    io_amount = index.numel() * index.element_size()
-    io_amount += _selected_numel(inp, dim, index) * bytes_per_elem
-    return io_amount * 1e-9 / (latency * 1e-3)
-
-
-def _out_of_place_gbps(bench_fn_args, latency):
-    inp, dim, index = bench_fn_args[:3]
-    bytes_per_elem = inp.element_size()
-    io_amount = inp.numel() * bytes_per_elem * 2
-    io_amount += index.numel() * index.element_size()
-    io_amount += _selected_numel(inp, dim, index) * bytes_per_elem
-    return io_amount * 1e-9 / (latency * 1e-3)
-
-
 def index_fill_input_fn(shape, dtype, device):
     for inp, dim, index in _base_inputs(shape, dtype, device):
         yield inp, dim, index, _scalar_value(dtype)
@@ -147,7 +125,6 @@ def test_index_fill():
         input_fn=index_fill_input_fn,
         torch_op=torch.index_fill,
         dtypes=INDEX_FILL_DTYPES,
-        # get_gbps=_out_of_place_gbps,
     )
     bench.run()
 
@@ -160,6 +137,5 @@ def test_index_fill_():
         torch_op=torch.Tensor.index_fill_,
         dtypes=INDEX_FILL_DTYPES,
         is_inplace=True,
-        # get_gbps=_inplace_gbps,
     )
     bench.run()
