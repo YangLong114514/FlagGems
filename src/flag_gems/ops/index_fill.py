@@ -318,8 +318,8 @@ def index_fill(inp, dim, index, value):
                 out, inp, out.numel(), BLOCK_SIZE=_COPY_BLOCK_SIZE
             )
         return _index_fill_impl(out, dim, index, value, value_is_tensor)
-    # out = _native_clone(inp)
-    # return _index_fill_impl(out, dim, index, value, value_is_tensor)
+    out = _native_clone(inp)
+    return _index_fill_impl(out, dim, index, value, value_is_tensor)
 
 
 def index_fill_(inp, dim, index, value):

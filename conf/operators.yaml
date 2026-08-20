@@ -5282,7 +5282,7 @@ ops:
     kind:
       - Tensor
     stages:
-      - beta: '5.4'
+      - alpha: '5.4'
   - id: index_fill_
     description: The in-place version of `index_fill()`.
     for:
@@ -5293,7 +5293,7 @@ ops:
     kind:
       - Tensor
     stages:
-      - beta: '5.4'
+      - alpha: '5.4'
   - id: index_put
     description: |
       Puts values from the tensor `values` into the tensor `input` using the indices specified

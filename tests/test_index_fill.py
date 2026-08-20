@@ -159,3 +159,23 @@ def test_index_fill_duplicate_index():
         inp.index_fill_(1, index, -7.0)
 
     gems_assert_equal(inp, ref_inp)
+
+
+@pytest.mark.index_fill_
+def test_index_fill_noncontiguous():
+    # Inplace fill on a transposed view exercises the generic strided kernel
+    # (the functional entry has no strided path).
+    base = torch.arange(12, dtype=torch.float32, device=flag_gems.device).reshape(3, 4)
+    ref_base = to_reference(base.clone(), False)
+    res_base = base.clone()
+    ref_view = ref_base.t()
+    res_view = res_base.t()
+    index = torch.tensor([0, -1], dtype=torch.long, device=flag_gems.device)
+    ref_index = to_reference(index, False)
+
+    ref_view.index_fill_(1, ref_index, -8.0)
+    with flag_gems.use_gems(include=INDEX_FILL_OPS):
+        res = res_view.index_fill_(1, index, -8.0)
+
+    assert res is res_view
+    gems_assert_equal(res_base, ref_base)
