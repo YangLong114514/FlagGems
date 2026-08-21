@@ -1,10 +1,12 @@
 # `linalg_matrix_rank` 昇腾 910B 后端实现与优化报告(详细版)
 
 > 分支:`ascend-matrix-rank-triton`(已推送 `github.com:YangLong114514/FlagGems`)
-> 提交:`19e7efed`
+> 提交:`12074011`
 > 硬件:昇腾 910B4(20 AI Core × 2 Vector = 40 Vector 核,UB 192KB)
 > 软件:CANN 8.5.0、triton-ascend 3.2.0(BiShengIR)、torch 2.6.0+cpu / torch_npu 2.6.0rc1
 > 目标:`torch.linalg.matrix_rank` 在 NPU 上的 speedup ≥ 0.8
+>
+> **阅读指引**:第一至三章是设计/优化的主体内容,其中 §1.4 已更新为**当前最终 dispatch**;第一阶段的原始结构保留在附录 C。第二至第五阶段是按时间顺序的演进记录(RRQR → 精确大矩阵路径 → hermitian 基线修正与小矩阵优化 → 评审修复与工具链退化处置),各阶段内的"当前状态"描述以写作时为准,最终以 §1.4 + 第五阶段为准。
 
 ---
 
@@ -17,6 +19,10 @@
 5. [目前的机器瓶颈](#5-目前的机器瓶颈)
 6. [验证结果](#6-验证结果)
 7. [遗留问题与展望](#7-遗留问题与展望)
+8. [第二阶段:k>64 纯 Triton 路径(RRQR)](#第二阶段k64-纯-triton-路径rrqraclnn-兜底已全部移除)
+9. [第四阶段:hermitian 基线修正 + 小矩阵优化](#第四阶段hermitian-基线修正npu-散算子-小矩阵路径性能优化)
+10. [第五阶段:评审驱动的 correctness 修复](#第五阶段外部代码评审驱动的-correctness-修复--3364-频段工具链退化处置)
+11. [附录 A/B/C](#附录-a改动文件清单)
 
 ---
 
@@ -71,6 +77,7 @@ hermitian=True:   rank = #{ |λᵢ| > tol }, tol = max(atol, rtol·|λ|max)
 | (1024,1024) | ~4.8e5 | ~6.3e6 |
 
 > 注:小矩阵(≤64)的 baseline 受 aclnn 启动开销主导(约 400-600μs),这是我们必须超越的目标。
+> 注(第四阶段起):benchmark 的 hermitian 基线已改为 NPU 散算子 `_composed_matrix_rank`(torch 原生 hermitian 路径在 NPU 上 CPU fallback,倍数虚高),本表 hermitian 列为历史数据,性能结论以第四阶段 §5 / 第五阶段 §3 为准。
 
 ## 1.3 算法选型:三个候选的完整评估
 
@@ -121,34 +128,42 @@ for j in 0..K-2:
 2. **性能可行**:2K 步 × 每步 2 个全 tile 外积 = O(K) 个 tile 操作。
 3. **无矩阵平方**:不需要 tl.dot 构造 Gram(避开 Cube 操作数限制)。
 
-## 1.4 最终实现结构
+## 1.4 最终实现结构(当前 HEAD,已与代码同步)
+
+> 本节描述**当前代码**的真实 dispatch;第一阶段的原始结构(k≤64 统一双对角化 + svdvals 兜底)保留在附录 C 供溯源。
+
+全局原则:**所有秩计算都由本文件的 Triton kernel 完成,没有任何 aclnn/native 分解兜底**(svdvals 兜底已于第二阶段删除)。唯一的 host 侧 aten 调用是 hermitian 33~64 路径的 padding 与下三角对称化(zeros/where/arange,不做分解)。fp64 在所有 shape dispatch 之前 fail-fast(`NotImplementedError`:triton-ascend 无法编译 fp64 kernel,aclnn svd_npu 也仅支持 fp32)。
 
 ```
 linalg_matrix_rank(input, *, atol, rtol, hermitian)
-  ├─ _check_input:ndim≥2、dtype∈{fp32,fp64}、hermitian 需方阵
-  ├─ _prepare_tolerances:atol/rtol 展平为 (batch_count,) 张量
-  │    └─ 修复:默认 rtol = max(m,n)·eps;atol 显式设置时 rtol 归零
-  └─ _launch_matrix_rank:
-       k = min(m,n), rows = max(m,n), batch_count = numel/(m·n)
+  ├─ _check_input:ndim≥2、hermitian 需方阵
+  ├─ fp64 → NotImplementedError(先于一切 shape dispatch,第五阶段前移)
+  ├─ 标量 tol 快路径:atol/rtol 非 tensor 时直接作为 kernel 标量参数
+  │   (不物化 (batch,) 张量,省 2 次 aten launch);tensor tol 走 _prepare_tolerances
+  └─ _launch_matrix_rank: k = min(m,n), rows = max(m,n), batch_count = numel/(m·n)
        ├─ k == 1 → _matrix_rank_rank1_kernel(单奇异值闭式)
        ├─ k == 2 → _matrix_rank_rank2_kernel(2×2 旋转解析)
-       ├─ fp64 且 k≤32 → _matrix_rank_fused_jacobi_kernel(结构保留)
-       ├─ fp32 且 k≤64 且 rows≤2048:
-       │    ├─ m≤64 且 n≤64(短维可装 tile):
-       │    │    BLOCK = max(next_pow2(max(m,n)), 32)
-       │    │    padded = zeros(batch, BLOCK, BLOCK); padded[:, :m, :n] = matrix
-       │    │    _matrix_rank_bidiag_kernel[(batch_count,)](padded, d, e, ...)
-       │    │    _matrix_rank_sturm_kernel[(batch_count,)](d, e, atol, rtol, out, BIDIAG=True)
-       │    └─ 长维 > 64(如 64×512):
-       │         _matrix_rank_gram_kernel(Cube 算 Gram,pad 到 32 倍数无 mask)
-       │         _matrix_rank_tridiag_kernel(外积版三对角化)
-       │         _matrix_rank_sturm_kernel(BIDIAG=False, hermitian 双侧计数)
-       └─ k > 64 → _svals_rank(aclnn svdvals + 融合计数;工具链限制,见 §5.2)
+       ├─ fp32 且 k ≤ 64 且 rows ≤ 2048 → _launch_tridiag_rank:
+       │    ├─ m,n ≤ 32 → _matrix_rank_small_fused_kernel(单 launch:
+       │    │    寄存器内 Golub-Kahan 双对角化 + Sturm 计数;hermitian 走单边
+       │    │    三对角化分支,load 后寄存器内按下三角对称化)
+       │    ├─ 33 ≤ k ≤ 64 且 hermitian → host 侧 cached-mask torch.where
+       │    │    对称化(只读下三角)+ padded 单边三对角化 + Sturm(两 kernel)
+       │    └─ 其余(33 ≤ k ≤ 64 非 herm、长维如 64×512)→
+       │         Gram(Cube tl.dot)+ 三对角化 + Sturm(三 kernel)
+       │        ※ 原 BLOCK=64 独立双对角化 kernel 在当前工具链下误编译
+       │          (e_vec 垃圾/NaN,HEAD 同病),该频段已改走 Gram 健康通路,
+       │          代价是继承 Gram σ² 域的已知精度限制(见第五阶段 §2)
+       ├─ fp32 且 64 < k ≤ 512 → 分块 Householder QR(无主元),rank 由
+       │    |R_ii| 对角读出;σmax 用 |R_00|/‖A‖_F 双界,不一致时幂迭代精化
+       └─ fp32 且 k ≥ 513 → 非分块 Golub-Kahan 双对角化 + 独立 BᵀB 构造
+            kernel + Sturm 计数(决定性计数用 df64 双单精度算术 +
+            enable_fp_fusion=False,SVD 级精度)
 ```
 
-**关键设计点:为什么双对角化和 Sturm 拆成两个 kernel**
+**关键设计点:为什么分解和 Sturm 计数拆成独立 kernel**
 
-昇腾的 MTE3(store)与 MTE2(load)是**两条独立的硬件队列,不自动保序**。若在同一个 kernel 内把 D/E 写到 GM 再读回,batch 并发时读可能越过写,读到陈旧数据。实测:寄存器版 D/E(batch=8)2/8 错;拆成两个 kernel 后 kernel 边界强制保序,问题消失。这个约束贯穿整个设计(cholesky_solve 的 UB 驻留方案是同一问题的另一种解法,但我们的工作矩阵无法完全驻留 UB 的同时保证 O(K) 步)。
+昇腾的 MTE3(store)与 MTE2(load)是**两条独立的硬件队列,不自动保序**。若在同一 kernel 内把 D/E 写到 GM 再读回,batch 并发时读可能越过写,读到陈旧数据。实测:寄存器版 D/E(batch=8)2/8 错;拆成两个 kernel 后 kernel 边界强制保序,问题消失。这个约束贯穿整个设计(cholesky_solve 的 UB 驻留方案是同一问题的另一种解法,但我们的工作矩阵无法完全驻留 UB 的同时保证 O(K) 步)。第五阶段进一步把"同 kernel 写后读"从架构上彻底消除:大路径的 BᵀB 三对角由独立构造 kernel 产出(load 全在 store 前),Sturm kernel 纯读;小路径的回写改为幂等(写入值 = 读出值,顺序无关)。`tl.debug_barrier` 不是可用方案——插入本身即是源码扰动,会重新触发 BLOCK=64 的误编译(第五阶段 §2/§4)。
 
 ---
 
@@ -307,7 +322,9 @@ for m0 in tl.static_range(0, PM, BLOCK_M):
     g = g + tl.dot(tl.trans(b), b, input_precision="ieee")  # 独立累加
 ```
 
-### 手段 7:hermitian 输入走同一双对角化路径
+### 手段 7:hermitian 输入走同一双对角化路径(第一阶段结论,已被第四阶段取代)
+
+> **注(当前状态)**:第四阶段起 hermitian 改走更快的单边三对角化直路径(Sturm 在特征值域直接计数);第五阶段补上了"只读下三角"语义(k≤32 寄存器内对称化,33~64 host 侧 `torch.where` 对称化)。此处保留第一阶段的原始叙述。
 
 hermitian=True 时 σ = |λ|,双对角化同样适用(对称矩阵的双对角化保奇异值)。因此 hermitian 不再需要物化 tril 对称化矩阵 + 独立路径,**统一走双对角化**。这带来 hermitian 的巨大加速(基线走 eigvalsh,慢 13-19 倍):
 
@@ -322,7 +339,9 @@ hermitian=True 时 σ = |λ|,双对角化同样适用(对称矩阵的双对角�
 
 k=1(单奇异值 = Frobenius 范数)和 k=2(2×2 旋转解析解)用纯 Triton 闭式,零迭代、零循环,几个 μs 级。这两个路径还承担"no-decomposition 测试"的兜底(该测试 monkeypatch 掉 torch 的 svd/svdvals/eigh/eigvalsh,(4,4) 走闭式完全不触分解)。
 
-## 3.3 最终性能(事件计时,L2 flush,中位数,44 shape)
+## 3.3 第一阶段性能(事件计时,L2 flush,中位数,44 shape)
+
+> 注:本表为第一阶段数据(hermitian 基线还是 torch 原生 CPU fallback)。当前性能口径:第四阶段 §5(`--mode operator`,hermitian 基线为 NPU 散算子)和第五阶段 §3(评审修复后的最终干净单跑:general 全部 ≥ 0.94,hermitian 除两个历史边际 shape 外 ≥ 0.81)。
 
 完整表格:
 
@@ -478,7 +497,7 @@ LAPACK DGEBD2 的精确约定:
 
 ### 陷阱 5:hermitian 的三角语义
 
-`hermitian=True` 时 torch 只用下三角(上三角按对称取)。svdvals 兜底路径直接对原始矩阵做 SVD 会把上三角的垃圾数据算进谱。修复:物化 `tril(A) + tril(A,-1)ᵀ`。(最终版 hermitian 走双对角化,天然规避;兜底路径仍保留此修复。)
+`hermitian=True` 时 torch 只用下三角(上三角按对称取)。svdvals 兜底路径直接对原始矩阵做 SVD 会把上三角的垃圾数据算进谱。修复:物化 `tril(A) + tril(A,-1)ᵀ`。(当前状态:svdvals 兜底已于第二阶段删除;hermitian 下三角语义在第五阶段补齐——k≤32 融合 kernel 寄存器内对称化、33~64 host 侧 `torch.where` 对称化、k≥513 init kernel 按 max/min 寻址只读下三角。见第五阶段 §1 问题 2。)
 
 ### 陷阱 6:双对角化 d/e 提取的边界
 
@@ -528,7 +547,7 @@ BLOCK=128 的 tile(128²×4B = 64KB)+ 中间体超 UB 预算,编译失败("ub ov
 
 ### 瓶颈 1:无网格屏障原语 → 大矩阵无法纯 Triton
 
-GPU 版的 blocked Jacobi/Householder(大矩阵路径)依赖跨 program 的软件网格屏障(原子计数器自旋)。triton-ascend 没有对应原语,仓内所有昇腾算子都是"单 program 一片"。**k>64 的纯 Triton 分解(需要多 program 协作的 panel 更新)不可行**——这是 k>64 保留 svdvals 兜底的根本原因。
+GPU 版的 blocked Jacobi/Householder(大矩阵路径)依赖跨 program 的软件网格屏障(原子计数器自旋)。triton-ascend 没有对应原语,仓内所有昇腾算子都是"单 program 一片"。(第一阶段时因此保留了 svdvals 兜底;**该兜底已在第二阶段删除**——k>64 改由"每 panel 一次 launch 的分块 QR"(64<k≤512)和"单 program 非分块 Golub-Kahan 双对角化"(k≥513)覆盖,同步只走 kernel 边界。)
 
 ### 瓶颈 2:大 tile/3D 编译失败
 
@@ -545,7 +564,7 @@ fp64 测试(52 项)在输入构造阶段就失败,任何实现都无法通过。
 
 并发编译导致 TBE fork-server 崩溃、bishengir 挂起、编译产物偶发"串味"(§4.1 缺陷 10)。开发期大量时间消耗在重试上。
 
-## 5.3 当前性能余量分析
+## 5.3 第一阶段性能余量分析(当前口径见第四/第五阶段)
 
 - **事件计时(含 host)**:44/44 ≥ 0.8,最低 0.947。小矩阵(≤64)的 gems 耗时 ~420-700μs,其中 kernel 启动 + host 调度 ~100μs(2-3 个 kernel × 35μs),设备时间 ~300-600μs。
 - **官方 do_bench_npu(纯设备时间)**:K=64 约 0.5-0.7×——**两种口径下接近 0.8 边界**。
@@ -558,6 +577,8 @@ fp64 测试(52 项)在输入构造阶段就失败,任何实现都无法通过。
 ---
 
 # 6. 验证结果
+
+> 注:本表为**第一阶段**的验收口径。当前最终验证结果见第五阶段 §5(官方套件 73 passed / 6 skipped,366 例全路径扫描仅余文档化已知限制)。
 
 | 验证项 | 结果 |
 |---|---|
@@ -578,10 +599,10 @@ fp64 测试(52 项)在输入构造阶段就失败,任何实现都无法通过。
 
 ---
 
-## 附录 A:改动文件清单
+## 附录 A:改动文件清单(第一阶段;`_svals_rank` 已于第二阶段删除)
 
 - `src/flag_gems/runtime/backend/_ascend/ops/linalg_matrix_rank.py`(+557/−20)
-  - 新增 `_matrix_rank_bidiag_kernel`(Golub-Kahan 双对角化,主路径)
+  - 新增 `_matrix_rank_bidiag_kernel`(Golub-Kahan 双对角化,主路径;**第五阶段因工具链误编译删除**,33~64 非 herm 改走 Gram 通路)
   - 新增 `_matrix_rank_sturm_kernel`(BᵀB 三对角构造 + Sturm 计数 + Gershgorin/bisection)
   - 新增 `_matrix_rank_gram_kernel`、`_matrix_rank_tridiag_kernel`(长维 fallback)
   - 新增 `_launch_tridiag_rank`(dispatch 编排)
@@ -601,6 +622,33 @@ fp64 测试(52 项)在输入构造阶段就失败,任何实现都无法通过。
 | `/tmp/bidiag_rank_test.py` | 双对角化算法的 CPU 模拟(100/100) |
 | `/tmp/stress_test.py` | 最终版随机 stress(260/260) |
 | `/tmp/bench_mr_event.py` | 事件计时 benchmark(44/44 ≥ 0.8) |
+
+## 附录 C:第一阶段原始实现结构(历史,已被 §1.4 的当前结构取代)
+
+```
+linalg_matrix_rank(input, *, atol, rtol, hermitian)
+  ├─ _check_input:ndim≥2、dtype∈{fp32,fp64}、hermitian 需方阵
+  ├─ _prepare_tolerances:atol/rtol 展平为 (batch_count,) 张量
+  │    └─ 修复:默认 rtol = max(m,n)·eps;atol 显式设置时 rtol 归零
+  └─ _launch_matrix_rank:
+       k = min(m,n), rows = max(m,n), batch_count = numel/(m·n)
+       ├─ k == 1 → _matrix_rank_rank1_kernel(单奇异值闭式)
+       ├─ k == 2 → _matrix_rank_rank2_kernel(2×2 旋转解析)
+       ├─ fp64 且 k≤32 → _matrix_rank_fused_jacobi_kernel(结构保留)
+       ├─ fp32 且 k≤64 且 rows≤2048:
+       │    ├─ m≤64 且 n≤64(短维可装 tile):
+       │    │    BLOCK = max(next_pow2(max(m,n)), 32)
+       │    │    padded = zeros(batch, BLOCK, BLOCK); padded[:, :m, :n] = matrix
+       │    │    _matrix_rank_bidiag_kernel[(batch_count,)](padded, d, e, ...)
+       │    │    _matrix_rank_sturm_kernel[(batch_count,)](d, e, atol, rtol, out, BIDIAG=True)
+       │    └─ 长维 > 64(如 64×512):
+       │         _matrix_rank_gram_kernel(Cube 算 Gram,pad 到 32 倍数无 mask)
+       │         _matrix_rank_tridiag_kernel(外积版三对角化)
+       │         _matrix_rank_sturm_kernel(BIDIAG=False, hermitian 双侧计数)
+       └─ k > 64 → _svals_rank(aclnn svdvals + 融合计数;工具链限制,见 §5.2)
+```
+
+后续阶段的关键变化:第二阶段删除 `_svals_rank`(RRQR 覆盖 k>64)→ 第三阶段 k≥513 改非分块双对角化 + df64 Sturm → 第四阶段小矩阵单 launch 融合 kernel + hermitian 三对角化直路径 → 第五阶段 hermitian 下三角语义、fp64 fail-fast 前移、33~64 非 herm 改走 Gram 通路(原 BLOCK=64 双对角化 kernel 误编译,删除)。
 
 ---
 

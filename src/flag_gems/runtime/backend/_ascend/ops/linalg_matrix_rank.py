@@ -35,7 +35,11 @@ power iteration only when the two bounds disagree; and fp32 matrices with
 k >= 513 use an unblocked Golub-Kahan bidiagonalization plus a Sturm count
 whose decisive pass runs in double-single (df64) arithmetic (SVD-accurate).
 fp64 is rejected with NotImplementedError (this toolchain cannot compile
-fp64 Triton kernels); there is no aclnn/native fallback anywhere.
+fp64 Triton kernels); there is no aclnn/native decomposition fallback
+anywhere -- every rank is computed by the Triton kernels in this file (the
+hermitian 32 < k <= 64 path only uses host-side aten ops -- zeros / where /
+arange -- for padding and lower-triangle symmetrization, never for the
+decomposition itself).
 
 Implementation note: the RRQR kernels below are extremely sensitive to this
 toolchain's codegen instabilities; the inline comments document every
@@ -2464,7 +2468,8 @@ def _launch_matrix_rank(input, atol, rtol, hermitian):
         else:
             # fp32 medium matrices (64 < k <= 512): pure-Triton blocked
             # Householder QR (unpivoted); the rank is read off the |R_ii|
-            # diagonal. There is no aclnn fallback anywhere.
+            # diagonal. There is no aclnn/native decomposition fallback
+            # anywhere.
             if atol_tensor is None:
                 atol_tensor, rtol_tensor = _prepare_tolerances(input, atol, rtol)
             _launch_rrqr_rank(
