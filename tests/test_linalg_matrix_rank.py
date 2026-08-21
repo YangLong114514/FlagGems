@@ -857,3 +857,73 @@ def test_linalg_matrix_rank_exact_path(shape, rank, hermitian, monkeypatch):
     result = flag_gems.linalg_matrix_rank(matrix, hermitian=hermitian)
     _assert_output_metadata(result, matrix)
     utils.gems_assert_equal(result, reference.to(device=matrix.device))
+
+
+@pytest.mark.linalg_matrix_rank
+@pytest.mark.parametrize("dtype", SUPPORTED_DTYPE_CASES)
+@pytest.mark.parametrize(
+    "shape,fill_row,fill_col",
+    [
+        pytest.param((16, 5), 15, 4, id="tall-fused-band"),
+        pytest.param((5, 16), 4, 15, id="wide-fused-band"),
+        pytest.param((50, 40), 49, 39, id="tall-bidiag64-band"),
+        pytest.param((40, 50), 39, 49, id="wide-bidiag64-band"),
+    ],
+)
+def test_linalg_matrix_rank_nonsquare_tail_energy(dtype, shape, fill_row, fill_col):
+    # GK bidiagonalization of a tall matrix needs K left reflections (the
+    # last one folds the column K-1 tail into d[K-1]); a wide matrix is
+    # handled by transposing to the tall form.  Putting the last column's
+    # (resp. row's) energy beyond the diagonal band exposes a missing final
+    # reflection: the rank comes out one short.  The fused (k <= 32) kernel
+    # had exactly this latent bug -- random full-rank inputs mask it
+    # because the lost energy stays below the tolerance.
+    m, n = shape
+    matrix = torch.zeros(shape, dtype=dtype, device=flag_gems.device)
+    diagonal = torch.arange(min(m, n) - 1, device=matrix.device)
+    matrix[diagonal, diagonal] = 1.0
+    matrix[fill_row, fill_col] = 5.0
+    expected = torch.tensor(min(m, n), dtype=torch.int64, device=matrix.device)
+
+    result = _assert_direct_and_dispatch_match_native(matrix)
+    utils.gems_assert_equal(result, expected)
+
+
+@pytest.mark.linalg_matrix_rank
+@pytest.mark.parametrize("dtype", SUPPORTED_DTYPE_CASES)
+@pytest.mark.parametrize(
+    "shape,rank",
+    [
+        pytest.param((16, 5), 3, id="tall-fused-band"),
+        pytest.param((5, 16), 3, id="wide-fused-band"),
+        pytest.param((32, 8), 4, id="tall-fused-band-k8"),
+        pytest.param((8, 32), 4, id="wide-fused-band-k8"),
+        pytest.param((33, 64), 16, id="wide-bidiag64-band"),
+        pytest.param((64, 33), 16, id="tall-bidiag64-band"),
+        pytest.param((48, 60), 24, id="wide-bidiag64-band-2"),
+    ],
+)
+def test_linalg_matrix_rank_nonsquare_lowrank(dtype, shape, rank):
+    # Random non-square low-rank matrices (slowly-decaying spectrum, sigma
+    # from 1 down to 1e-4) across the fused and bidiag64 bands.  Constructed
+    # in fp64 and rounded once, so the fp64 reference with fp32-semantics
+    # tolerance is exact.
+    generator = torch.Generator().manual_seed(17)
+    m, n = shape
+    left = torch.linalg.qr(
+        torch.randn(m, rank, generator=generator, dtype=torch.float64)
+    )[0]
+    right = torch.linalg.qr(
+        torch.randn(n, rank, generator=generator, dtype=torch.float64)
+    )[0]
+    values = torch.logspace(0, -4, rank, dtype=torch.float64)
+    matrix = ((left * values) @ right.mT).to(dtype).to(flag_gems.device)
+
+    rtol = max(m, n) * torch.finfo(torch.float32).eps
+    reference = torch.linalg.matrix_rank(
+        matrix.to(torch.float64).cpu(), atol=0.0, rtol=rtol
+    )
+
+    result = flag_gems.linalg_matrix_rank(matrix)
+    _assert_output_metadata(result, matrix)
+    utils.gems_assert_equal(result, reference.to(device=matrix.device))

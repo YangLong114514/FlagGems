@@ -22,7 +22,8 @@
 8. [第二阶段:k>64 纯 Triton 路径(RRQR)](#第二阶段k64-纯-triton-路径rrqraclnn-兜底已全部移除)
 9. [第四阶段:hermitian 基线修正 + 小矩阵优化](#第四阶段hermitian-基线修正npu-散算子-小矩阵路径性能优化)
 10. [第五阶段:评审驱动的 correctness 修复](#第五阶段外部代码评审驱动的-correctness-修复--3364-频段工具链退化处置)
-11. [附录 A/B/C](#附录-a改动文件清单)
+11. [第六阶段:精确路径推广](#第六阶段精确路径推广bidiag64--非方阵修复--df64-地板修复--qr-压缩--npugraph)
+12. [附录 A/B/C](#附录-a改动文件清单)
 
 ---
 
@@ -143,22 +144,29 @@ linalg_matrix_rank(input, *, atol, rtol, hermitian)
   └─ _launch_matrix_rank: k = min(m,n), rows = max(m,n), batch_count = numel/(m·n)
        ├─ k == 1 → _matrix_rank_rank1_kernel(单奇异值闭式)
        ├─ k == 2 → _matrix_rank_rank2_kernel(2×2 旋转解析)
-       ├─ fp32 且 k ≤ 64 且 rows ≤ 2048 → _launch_tridiag_rank:
+       ├─ fp32 且 k ≤ 64 → _launch_tridiag_rank:
        │    ├─ m,n ≤ 32 → _matrix_rank_small_fused_kernel(单 launch:
        │    │    寄存器内 Golub-Kahan 双对角化 + Sturm 计数;hermitian 走单边
-       │    │    三对角化分支,load 后寄存器内按下三角对称化)
+       │    │    三对角化分支,load 后寄存器内按下三角对称化;宽矩阵经
+       │    │    "正常 load + 寄存器 trans" 转置为长形)
        │    ├─ 33 ≤ k ≤ 64 且 hermitian → host 侧 cached-mask torch.where
        │    │    对称化(只读下三角)+ padded 单边三对角化 + Sturm(两 kernel)
-       │    └─ 其余(33 ≤ k ≤ 64 非 herm、长维如 64×512)→
-       │         Gram(Cube tl.dot)+ 三对角化 + Sturm(三 kernel)
-       │        ※ 原 BLOCK=64 独立双对角化 kernel 在当前工具链下误编译
-       │          (e_vec 垃圾/NaN,HEAD 同病),该频段已改走 Gram 健康通路,
-       │          代价是继承 Gram σ² 域的已知精度限制(见第五阶段 §2)
+       │    ├─ 33 ≤ k ≤ 64 非 herm(m,n ≤ 64)→ _matrix_rank_bidiag64_kernel
+       │    │    (单 program GK 双对角化,原始 d/e)+ 共享 Sturm 尾巴
+       │    │    (to_tridiag + sturm_big + df64 sturm_final)——第六阶段新增,
+       │    │    取代 Gram(rand/diag/lowrank 全谱精确)
+       │    └─ 长维(有一维 > 64)→ 默认 Gram(Cube)+ 三对角化 + Sturm;
+       │         FLAGGEMS_MR_EXACT_PATH=1 时切换为 QR 压缩(Householder QR
+       │         得 k×k R,σ(R)=σ(A) 线性域)+ bidiag64 + df64 尾巴
+       │         (精确但慢,见第六阶段 §3 的性能墙分析)
        ├─ fp32 且 64 < k ≤ 512 → 分块 Householder QR(无主元),rank 由
-       │    |R_ii| 对角读出;σmax 用 |R_00|/‖A‖_F 双界,不一致时幂迭代精化
+       │    |R_ii| 对角读出;σmax 用 |R_00|/‖A‖_F 双界,不一致时幂迭代精化;
+       │    FLAGGEMS_MR_EXACT_PATH=1 时切换为下面的精确路径
        └─ fp32 且 k ≥ 513 → 非分块 Golub-Kahan 双对角化 + 独立 BᵀB 构造
-            kernel + Sturm 计数(决定性计数用 df64 双单精度算术 +
-            enable_fp_fusion=False,SVD 级精度)
+            kernel + Sturm 计数(决定性计数用 df64 从**原始 d/e** 构造平方项,
+            enable_fp_fusion=False,SVD 级精度);整条 launch 序列按 shape
+            做 NPUGraph 捕获重放(host enqueue ~80μs/launch 是主瓶颈,
+            重放后 ~1μs;FLAGGEMS_MR_NO_GRAPH=1 可回退直接发射)
 ```
 
 **关键设计点:为什么分解和 Sturm 计数拆成独立 kernel**
@@ -882,3 +890,64 @@ benchmark `--mode operator`(最终干净单跑):**general 全部 ≥ 0.94**(小�
 - k≥513 大路径(含重构后的独立构造 kernel):官方 bidiag 测试(513/1024/batch/dense)+ 零矩阵大 shape 全过
 - fp64:五种 shape 类全部干净抛 NotImplementedError
 - benchmark `--mode operator`(最终干净单跑):general ≥ 0.94;hermitian ≥ 0.81(历史边际的 33×33/17×17 除外,多轮中位数 ≈ 0.79/0.81,与 HEAD 同水平 flap)
+
+---
+
+# 第六阶段:精确路径推广(bidiag64 + 非方阵修复 + df64 地板修复 + QR 压缩 + NPUGraph)
+
+> 目标(依 `next_step.txt` 规划):消除两类已知语义缺口——Gram 路径对缓衰减低秩谱的高估、无主元 QR 的近阈值 ±1——让所有非 herm 输入在奇异值**线性域**完成判定。
+> 结果:**部分达成**。33~64 方阵频段已默认切换到精确路径且性能提升;长维 k≤64 与 65~512 的精确路径已建成并验证正确,但因硬件/launch 开销达不到 0.8× 性能底线,默认分发保留 Gram/RRQR,精确路径经 `FLAGGEMS_MR_EXACT_PATH=1` 全局可选。过程中修复了两个真实的生产路径缺陷(fp32 dd/ee 平方域地板、fused kernel 非方阵丢尾能量)。
+
+## 1. 关键精度缺陷修复:fp32 dd/ee 的平方域地板(影响 k≥513 生产路径)
+
+第五阶段的决定性 df64 计数读的是 fp32 的 dd/ee(BᵀB 三对角)。dd_i = d_i²+e²_{i-1} 的 fp32 元素舍入是相对误差,但 dd 的元素本身都是 O(σmax²),小特征值靠递推对消产生——**绝对舍入 ~eps·σmax² 直接淹没 tol² ~ (k·eps·σmax)² 附近的 λ**,即在 σ 域重新引入 √eps·σmax ≈ 3.5e-4·σmax 的地板(比默认容差粗两个数量级)。实测复现:(1024,8) 低秩 r=4(σ4=1e-4 vs tol=1.22e-4)报 4 应为 3;512² 随机矩阵近阈值判错。
+
+修复:`_mr_bidiag_to_tridiag_kernel` 改为写**独立** dd/ee 缓冲(仅供 fp32 bracket 双界用);`_mr_sturm_final_kernel` 改为从**原始 d/e** 在 df64 算术内构造 dd/ee(d_i²、e²、d_i·e_i 全部 TwoProd),递推全程 df64——线性域精度端到端闭合。修复后上述用例全部与 fp64 参考一致。
+
+教训:线性域原则必须贯彻到**最后一个标量递推**;"d/e 是线性域所以最后平方一下没关系"是错觉——只要矩阵元素在 fp32 里被平方并混加,地板就回来了。
+
+## 2. bidiag64:非 herm 33~64 默认切换到线性域
+
+新 kernel `_matrix_rank_bidiag64_kernel`(单 program/矩阵,寄存器 GK 双对角化,写原始 d/e 到 GM,接共享 Sturm 尾巴)。针对 BLOCK=64 误编译簇的结构选择(全部对照第五阶段缺陷清单):
+
+| 结构选择 | 规避的缺陷 |
+|---|---|
+| M/N/K 全部 runtime(单一编译覆盖整个频段) | 每 K 一张误编译彩票(缺陷 24) |
+| 边界掩码直接 load(无 staging buffer) | 额外 aten launch + 无掩码 load 变量 |
+| 循环内**无 tl.trans**:gT 用同一外积的转置形式增量维护 | 64×64 trans 慢路径(~68μs)+ 相关误编译 |
+| 右反射的末步跳过用 tau2 乘浮点掩码,不用 scf.if | tile op 外的运行时 if 区(§4.1) |
+| E[j] 无条件记录 alpha2(符号翻转是 ±1 对角相似,不影响 σ) | 分支不一致风险 |
+
+验证:**σ(B) vs σ(A) 直接对比**(rank 对比会掩盖坏 d/e——第五阶段教训),K=33..64 全值 × 3 次 + 非方阵 + 低秩/对角/零 + batch = **121/121,max 误差 ~6e-8(fp32 机器精度)**。性能:(33,33) 1.23~1.35×、(64,64) 1.84~2.11×——**比原 Gram 通路还快**。
+
+## 3. 潜在 bug:fused kernel 非方阵丢尾能量(预存,官方测试从未抓到)
+
+GK 循环 `for j in 0..K-2` + 末尾 dlast 读对角元的结构,对**方阵**正确,但对长矩阵缺最后一次左反射(K-1 列对角元以下的能量丢失),对宽矩阵缺最后一次右反射(K-1 行尾丢失)。构造探针(16,5) 只有 (15,4)=5 的尾能量:改前 got=4,want=5——**实锤**;随机满秩测试全部"通过"是因为丢失能量在默认 tol 以下。官方套件的非方阵用例全是对角矩阵(天然双对角,反射全为恒等),所以从未覆盖。
+
+修复(两处同构):宽矩阵经"正常 load + 寄存器 trans"转置为长形(σ(Aᵀ)=σ(A);跨步长转置 load 实测慢 10×,不用),GK 循环改为完整 K 次左反射,删掉 dlast。 fused kernel(k≤32)与 bidiag64 同步修复,新增 11 个非方阵回归测试(尾能量探针 + 随机低秩)。
+
+## 4. 长维 k≤64:QR 压缩精确路径(正确但性能不达标,保留为 opt-in)
+
+路线:Householder QR 把 (rows,k) 压成 k×k 的 R(后向稳定,**线性域**——σ(R)=σ(A) 误差 ~k·eps·‖A‖),再 bidiag64 + df64 尾巴。复用 RRQR 的 init/panel kernel(k≤64 单 panel,无 VTV/update),新增 `_mr_extract_upper_kernel` 提取 R。
+
+**发现的约定坑**:panel kernel 的 W 只在**严格上三角**持有 R;对角元在 PIV(反射 alpha)里,W 的对角是反射前残值,下三角是反射向量边带。直接用 W 对角导致系统性低估(64,512) got=60/want=64。修复:R 对角从 PIV 取。
+
+正确性 20/20(含全部 Gram 地板复现器)。但性能分解((512,64)):panel 4175μs(82%)+ bidiag64 659 + extract 209 + tail 156——**panel 的 O(k) 步串行 GM 往返是墙**,整条 0.26~0.6×,达不到 0.8 底线。评估过的替代:多 program 拆分(≈0.7×)、块树 TSQR(估 0.86~1.1×,工程量大且边际)、fp64 Gram+Cholesky(秩亏时 Cholesky 报错;且 fp32 三对角化会把精度再打回平方域地板)、df64 模拟点积(tl.dot 只接受直接 load 操作数,缺陷 4①)。**结论:长维默认保留 Gram(0.9~3.6×),精确路径 `FLAGGEMS_MR_EXACT_PATH=1` 可选。**
+
+## 5. NPUGraph:消灭 host enqueue 瓶颈(bidiag 大路径 2~4.4×)
+
+分解测量发现精确大路径是**纯 host 瓶颈**:(65,65) host enqueue 22.3ms vs 设备执行 0.07ms;_fast_launch 实测 ~80μs/launch(共享 ARM 主机,比第二阶段测量时的 12μs 更慢)。`torch.npu.NPUGraph` 捕获 Triton launch 序列:300 次 kernel 重放 286μs vs 直接 124ms(**434×**)。
+
+`_launch_bidiag_rank` 重构为 workspace + `_bidiag_run`(纯 kernel 序列)+ 按 (m,n,batch,herm,device) 缓存的 graph:首次调用先正常跑一遍(编译+预热 _fast_launch 缓存)再捕获;之后每次调用只做 staging 拷贝 + tol 缓冲填充 + replay + 结果拷贝。捕获失败回退直接发射;`FLAGGEMS_MR_NO_GRAPH=1 关闭`。效果:(65,65) 21.2→4.8ms,512² 172→117ms,1024² 460→460ms(设备 bound 不变)。k≥513 生产路径同步受益。
+
+## 6. 65~512 频段:graph 化后仍 0.28~0.74×,默认保持 RRQR
+
+graph 化消掉 host 瓶颈后,设备侧 ~12μs/kernel 的固定开销成为新地板(每步 6 kernel × 65 步 ≈ 4.8ms@(65,65),baseline 1.35ms)。合并为 2 kernel/步估算 ~0.67~0.84×(边际);DGEBRD 式块双对角化(面板内延迟更新 + tl.dot 尾随)估算 0.7~1.2×,工作量数天且每版都要重摇误编译彩票。**结论:该频段默认保持 RRQR(1.5~3.8×),精确路径 env 可选;QR 的 |R_ii|≈σ 近阈值 ±1 限制维持文档化。**这是"精确性 vs 0.8× 性能底线"在此硬件/工具链代际上的真实冲突点,后续若重做,方向是 DGEBRD 或减少每步 kernel 数。
+
+## 7. 验证(第六阶段最终态)
+
+- 官方套件:**92 passed / 6 skipped**(新增:8 个精确路径测试 + 11 个非方阵回归测试)
+- 366 例扫描(默认 dispatch):48 失败 = 47 长维 Gram lowrank(已知地板,env 精确路径下全消)+ (7,7) fp32 噪声区
+- bidiag64 σ 直验:121/121(~6e-8);长维精确路径 20/20;QR 频段对抗(近阈值 atol/缓衰减/广播 tol)22/22
+- benchmark `--mode operator`:48 项全过;general ≥ 0.92;herm 小 shape 0.73~0.90(历史边际 shape,共享机器噪声,多轮中位数口径 ~0.8)
+- NPUGraph 路径:k≥513 全谱正确(含零矩阵/batch/herm/低秩),replay 与直接发射结果一致
