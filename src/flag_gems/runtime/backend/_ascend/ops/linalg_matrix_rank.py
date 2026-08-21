@@ -113,9 +113,14 @@ _FUSED_JACOBI_WIDE_MAX_ROWS = 128
 # tridiagonalization for hermitian 33..64, QR-compression to the k x k R
 # factor + bidiag64 for long dimensions.
 _TRIDIAG_MAX_K = 64
-_BIDIAG_MIN_K = 513  # k >= 513: exact bidiag+Sturm. 64 < k <= 512 stays on the
-# faster RRQR path (the 0.8 perf bar excludes it there; the near-tolerance
-# exactness guarantee of the bidiagonal path is documented in the report).
+_RRQR_MAX_K = 128  # general 65..128 defaults to RRQR: the exact unblocked
+# bidiag path measures 0.47..0.85x torch there (per-step GM tile-op floor;
+# the register-resident 128-wide kernel is impossible -- UB overflow, see
+# the report stage 6).  General k > 128 measures 0.85..1.75x on the exact
+# path, so the default dispatch IS the exact bidiagonalization there;
+# FLAGGEMS_MR_EXACT_PATH=1 forces the exact path for 65..128 (validation).
+# hermitian k > 64 always uses the one-sided tridiagonalization (exact and
+# faster than RRQR at every measured size).
 
 
 def _jacobi_sweeps(k, is_fp64):
@@ -3185,46 +3190,6 @@ def _launch_matrix_rank(input, atol, rtol, hermitian):
                 TOL_TENSOR=tol_tensor,
                 num_warps=num_warps,
             )
-        elif (
-            _TRIDIAG_MAX_K < k < _BIDIAG_MIN_K
-            and os.environ.get("FLAGGEMS_MR_EXACT_PATH") == "1"
-        ):
-            # Opt-in exact reference path (validation only -- NOT the default
-            # dispatch). Routes the RRQR band (|R_ii| != sigma_i, +-1 near
-            # the tolerance) through the SVD-accurate unblocked Golub-Kahan
-            # bidiagonalization (hermitian: one-sided tridiagonalization,
-            # half the reflectors), so extended sweeps can compare it against
-            # the incumbent path before it becomes the default.  (The k <= 64
-            # bands have their exact variants inside _launch_tridiag_rank.)
-            if atol_tensor is None:
-                atol_tensor, rtol_tensor = _prepare_tolerances(input, atol, rtol)
-            if hermitian:
-                _launch_tridiag_big_rank(
-                    matrix,
-                    atol_tensor,
-                    rtol_tensor,
-                    out,
-                    m,
-                    n,
-                    k,
-                    rows,
-                    batch_count,
-                    input,
-                )
-            else:
-                _launch_bidiag_rank(
-                    matrix,
-                    atol_tensor,
-                    rtol_tensor,
-                    out,
-                    m,
-                    n,
-                    k,
-                    rows,
-                    batch_count,
-                    input,
-                    hermitian,
-                )
         elif k <= _TRIDIAG_MAX_K:
             # fp32 small/medium matrices (any row count): fused kernel /
             # bidiag64 / hermitian padded tridiagonalization / QR-compress
@@ -3242,46 +3207,51 @@ def _launch_matrix_rank(input, atol, rtol, hermitian):
                 input,
                 hermitian,
             )
-        elif k >= _BIDIAG_MIN_K:
-            # fp32 large matrices: unblocked Golub-Kahan bidiagonalization +
-            # Sturm count (hermitian: one-sided tridiagonalization + the
-            # eigenvalue-domain Sturm tail -- half the reflectors).
-            # SVD-accurate (linear-precision d/e), unlike the RRQR pivots,
-            # so borderline tolerances are exact here.
+        elif hermitian:
+            # hermitian k > 64: one-sided Householder tridiagonalization +
+            # eigenvalue-domain Sturm count (|lambda| > tol via +/-tol qd
+            # chains, decisive pass in df64).  Exact AND faster than RRQR
+            # at every measured size -- the default for all large
+            # hermitian inputs.
             if atol_tensor is None:
                 atol_tensor, rtol_tensor = _prepare_tolerances(input, atol, rtol)
-            if hermitian:
-                _launch_tridiag_big_rank(
-                    matrix,
-                    atol_tensor,
-                    rtol_tensor,
-                    out,
-                    m,
-                    n,
-                    k,
-                    rows,
-                    batch_count,
-                    input,
-                )
-            else:
-                _launch_bidiag_rank(
-                    matrix,
-                    atol_tensor,
-                    rtol_tensor,
-                    out,
-                    m,
-                    n,
-                    k,
-                    rows,
-                    batch_count,
-                    input,
-                    hermitian,
-                )
+            _launch_tridiag_big_rank(
+                matrix,
+                atol_tensor,
+                rtol_tensor,
+                out,
+                m,
+                n,
+                k,
+                rows,
+                batch_count,
+                input,
+            )
+        elif k > _RRQR_MAX_K or os.environ.get("FLAGGEMS_MR_EXACT_PATH") == "1":
+            # general k > 128: unblocked Golub-Kahan bidiagonalization +
+            # df64 Sturm count -- SVD-accurate and >= 0.8x torch at every
+            # measured size (0.85x at 128^2 borderline excluded by the
+            # threshold, 1.1x/1.75x at 256^2/512^2, 2.6x at 1024^2).  The
+            # env var forces this path for general 65..128 (validation).
+            if atol_tensor is None:
+                atol_tensor, rtol_tensor = _prepare_tolerances(input, atol, rtol)
+            _launch_bidiag_rank(
+                matrix,
+                atol_tensor,
+                rtol_tensor,
+                out,
+                m,
+                n,
+                k,
+                rows,
+                batch_count,
+                input,
+                hermitian,
+            )
         else:
-            # fp32 medium matrices (64 < k <= 512): pure-Triton blocked
-            # Householder QR (unpivoted); the rank is read off the |R_ii|
-            # diagonal. There is no aclnn/native decomposition fallback
-            # anywhere.
+            # general 65..128: pure-Triton blocked Householder QR
+            # (unpivoted); the rank is read off the |R_ii| diagonal.
+            # There is no aclnn/native decomposition fallback anywhere.
             if atol_tensor is None:
                 atol_tensor, rtol_tensor = _prepare_tolerances(input, atol, rtol)
             _launch_rrqr_rank(
@@ -3297,6 +3267,7 @@ def _launch_matrix_rank(input, atol, rtol, hermitian):
                 input,
                 hermitian,
             )
+
     return out
 
 

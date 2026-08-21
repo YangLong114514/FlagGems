@@ -1,7 +1,7 @@
 # `linalg_matrix_rank` 昇腾 910B 后端实现与优化报告(详细版)
 
 > 分支:`ascend-matrix-rank-triton`(已推送 `github.com:YangLong114514/FlagGems`)
-> 提交:`be42c91c`(功能实现到 `21270bb8` 为止,之后为文档同步)
+> 提交:`dcd1d541`+ 阶段 4 切换提交(见文末)
 > 硬件:昇腾 910B4(20 AI Core × 2 Vector = 40 Vector 核,UB 192KB)
 > 软件:CANN 8.5.0、triton-ascend 3.2.0(BiShengIR)、torch 2.6.0+cpu / torch_npu 2.6.0rc1
 > 目标:`torch.linalg.matrix_rank` 在 NPU 上的 speedup ≥ 0.8
@@ -14,22 +14,32 @@
 
 **交付物**:`torch.linalg.matrix_rank` 的昇腾 910B 纯 Triton 后端,无任何 aclnn/native 分解兜底,覆盖 fp32 全部 shape(k=1 到 4096+,含 batch/非方阵/hermitian/逐 batch atol/rtol)。
 
-**性能(验收口径 `benchmark --mode operator`,48 项全部 SUCCESS)**:
-- general 全部 ≥ 0.92;hermitian 除两个历史边际 shape(33×33 ≈ 0.79、17×17 ≈ 0.81,多轮中位数口径,共享机器噪声 ±0.1)外 ≥ 0.81。
-- 典型值:小矩阵 1.1~3×,batched 2.2~7×,大矩阵 1024² ≈ 1.1×(general)/3.3×(hermitian),512² ≈ 3.7×。
+**默认分发(第六阶段后,全部精确线性域,除两段文档化例外)**:
+
+| 频段 | 默认路径 | 说明 |
+|---|---|---|
+| k = 1/2 | 闭式 kernel | — |
+| k ≤ 32(任意长宽) | 寄存器融合 GK + Sturm | herm 走单边三对角分支 |
+| 33~64 方阵 | bidiag64(GK 线性域)| 第六阶段替代 Gram |
+| 33~64 herm | padded 单边三对角化 | — |
+| 长维 k≤64(如 64×512) | **Gram**(例外①)| σ² 域地板 √eps·σmax;精确 QR 压缩路径 env 可选(0.26~0.6× 不达标)|
+| 65~128 非 herm | **RRQR**(例外②)| 精确路径 0.47~0.85× 不达 0.8 底线;|R_ii| 近阈值 ±1 文档化,env 可选精确路径 |
+| herm k > 64 | **单边三对角化 + ±tol df64 Sturm**(精确)| 1.3~7.1× |
+| 非 herm k > 128 | **非分块 GK 双对角化 + df64 Sturm**(精确)| 0.85~2.7× |
+
+**性能(验收口径 `benchmark --mode operator`,默认分发,48 项全部 SUCCESS)**:general 全部 ≥ 0.93;hermitian 除两个历史边际 shape(33×33、17×17,多轮 0.71~0.98 波动,共享机器噪声)外 ≥ 0.89。大矩阵:general 1024² 2.68×、512² 1.77×;herm 1024² 6.94×、512² 3.92×。
 
 **正确性(最终态)**:
-- 官方套件 92 passed / 6 skipped(fp64 与 complex 按环境跳过)。
-- 366 例全路径扫描(默认 dispatch):48 例失败**全部**落入文档化已知限制——47 例长维 k≤64 的 Gram σ² 域地板(缓衰减低秩谱高估 rank)+ 1 例 (7,7) fp32 噪声区边界;无任何清晰谱失败。
-- 默认精确(线性域)频段:33~64 方阵(bidiag64,σ 直验 121/121 误差 ~6e-8)、k≥513(非分块 GK 双对角化 + df64 Sturm,近阈值场景与 fp64 参考一致)。
+- 官方套件 92 passed / 6 skipped(fp64 与 complex 按环境跳过),默认/exact 双模式一致。
+- 366 例全路径扫描:默认 48 例失败**全部**是例外①的 Gram σ² 域地板(缓衰减低秩谱高估,文档化);exact 模式 2 例((3,3)/(7,7) fp32 噪声区边界,fp32 参考自身即与 fp64 不一致)。
+- herm 专项压力 34/34(近阈值 ±tol 双符号簇、低秩、缓衰减、零矩阵、垃圾上三角、batch)。
+- bidiag64 σ 直验 121/121(~6e-8);QR 频段对抗 22/22;非方阵回归 11 例。
 
-**两个已知精度限制(均有 opt-in 精确路径,`FLAGGEMS_MR_EXACT_PATH=1`)**:
-1. 长维 k≤64(如 64×512):默认 Gram 路径有 σ² 域地板(√eps·σmax ≈ 3.5e-4·σmax);精确路径(QR 压缩 + bidiag64)正确性 20/20,但性能 0.26~0.6×(panel 的 O(k) 步串行 GM 往返是墙),未达 0.8 底线故非默认。
-2. 65~512 频段:默认无主元 QR,|R_ii| 近阈值 ±1(清晰谱无影响);精确路径(双对角化 + NPUGraph 重放)正确,但 graph 化后设备侧 ~12μs/kernel 固定开销成为地板(0.28~0.74×),达到 0.8× 需要 DGEBRD 式块双对角化或每步 kernel 合并(6→2),估算收益 0.7~1.2×、工作量数天、且每版需重摇 BLOCK=64 误编译彩票——**是否投入留作决策点**。
+**过程中修复的四个真实生产缺陷**:① fp32 dd/ee 把平方域地板带回决定性计数(k≥513,近阈值判错);② fused kernel 非方阵丢尾能量(预存,官方测试从未覆盖);③ 评审指出的零矩阵未初始化读取 / hermitian 未守下三角语义 / Sturm 同 kernel 写后读 / fp64 fail-fast 顺序;④ 大路径 host enqueue 瓶颈(NPUGraph 化,replay ~1μs/launch)。
 
-**过程中修复的三个真实生产缺陷**:① fp32 dd/ee 把平方域地板带回了决定性计数(k≥513 路径,近阈值判错);② fused kernel 对非方阵丢尾能量(预存 bug,官方测试从未覆盖);③ 评审指出的零矩阵未初始化读取 / hermitian 未守下三角语义 / Sturm 同 kernel 写后读 / fp64 fail-fast 顺序。
+**阶段 6 优化侧的死路记录(防止重复尝试)**:① 128 宽寄存器驻留 GK kernel —— UB 溢出(8 tile 双缓冲 ~360KB > 192KB);② 每步 6→4 kernel 条带合并 —— 性能中性偏负(graph 重放下 launch 仅 ~1μs,地板是每 tile 操作 ~2.4μs,合并损失 grid 并行度);③ herm 大矩阵走 GK —— 浪费一半反射(已由单边三对角化根治)。
 
-**核心工程教训**(详见 §4/§5 与各阶段):该后端上 tile 指令发射是唯一稀缺资源(~2.4μs/64×64 op);MTE3/MTE2 不保序要求中间量跨 kernel 传递;kernel 复杂度有隐形上限,BLOCK=64 的 blend/extract 是误编译高发区,任何源码扰动都可能重新摇彩票——因此所有正确性结论只对验证时的环境代际有效,改动必须重跑全 K 扫描。
+**核心工程教训**(详见 §4/§5 与各阶段):该后端上 tile 指令发射是唯一稀缺资源;MTE3/MTE2 不保序要求中间量跨 kernel 传递;kernel 复杂度有隐形上限,任何源码扰动都可能重摇误编译彩票——所有正确性结论只对验证时的环境代际有效,改动必须重跑全 K 扫描。
 
 ---
 
@@ -185,14 +195,20 @@ linalg_matrix_rank(input, *, atol, rtol, hermitian)
        │         FLAGGEMS_MR_EXACT_PATH=1 时切换为 QR 压缩(Householder QR
        │         得 k×k R,σ(R)=σ(A) 线性域)+ bidiag64 + df64 尾巴
        │         (精确但慢,见第六阶段 §3 的性能墙分析)
-       ├─ fp32 且 64 < k ≤ 512 → 分块 Householder QR(无主元),rank 由
-       │    |R_ii| 对角读出;σmax 用 |R_00|/‖A‖_F 双界,不一致时幂迭代精化;
-       │    FLAGGEMS_MR_EXACT_PATH=1 时切换为下面的精确路径
-       └─ fp32 且 k ≥ 513 → 非分块 Golub-Kahan 双对角化 + 独立 BᵀB 构造
-            kernel + Sturm 计数(决定性计数用 df64 从**原始 d/e** 构造平方项,
-            enable_fp_fusion=False,SVD 级精度);整条 launch 序列按 shape
-            做 NPUGraph 捕获重放(host enqueue ~80μs/launch 是主瓶颈,
-            重放后 ~1μs;FLAGGEMS_MR_NO_GRAPH=1 可回退直接发射)
+       ├─ hermitian 且 k > 64 → _launch_tridiag_big_rank(默认,精确):
+       │    单边 Householder 三对角化(3 kernel/步:step/mat/apply,K 裁剪
+       │    尾随 grid)+ 特征值域 ±tol Sturm(bracket + df64 决定性双链),
+       │    整条 launch 序列按 shape NPUGraph 捕获重放——比 RRQR 更快且
+       │    精确(herm 128² 1.34 / 256² 2.04 / 512² 3.97 / 1024² 7.11)
+       ├─ 非 herm 且 k > 128 → _launch_bidiag_rank(默认,精确):
+       │    非分块 Golub-Kahan 双对角化(尾随裁剪 grid + 单遍 step)+
+       │    独立 BᵀB 构造 kernel + df64 Sturm;NPUGraph 捕获
+       │    (129~512 实测 0.85~1.75×,1024² 2.6×);general 65~128 经
+       │    FLAGGEMS_MR_EXACT_PATH=1 也走这里(验证用)
+       └─ 非 herm 且 65 ≤ k ≤ 128 → 分块 Householder QR(无主元,RRQR):
+            rank 由 |R_ii| 对角读出(精确路径在该区间 0.47~0.85×,不达
+            0.8 底线,QR 的近阈值 ±1 限制维持文档化——这是默认分发中
+            仅剩的 QR 语义缺口)
 ```
 
 **关键设计点:为什么分解和 Sturm 计数拆成独立 kernel**
@@ -1027,3 +1043,19 @@ grid 按 K 裁剪尾随(cdiv(K-1-J, 64)),tile 最多触到 K+62 < RS,无需行�
 - bidiag64 σ 直验:121/121(~6e-8);长维精确路径 20/20;QR 频段对抗(近阈值 atol/缓衰减/广播 tol)22/22
 - benchmark `--mode operator`:48 项全过;general ≥ 0.92;herm 小 shape 0.73~0.90(历史边际 shape,共享机器噪声,多轮中位数口径 ~0.8)
 - NPUGraph 路径:k≥513 全谱正确(含零矩阵/batch/herm/低秩),replay 与直接发射结果一致
+
+---
+
+# 第七阶段:默认分发正式切换(阶段 4 落地)
+
+> 依据:exact 路径性能已越过 0.8 底线(尾随裁剪 + 单遍 step + herm 三对角化,见第六阶段 §6.6/§6.7)。
+> 结果:**达成(带两段文档化例外)**。
+
+默认分发变更:
+- **hermitian k > 64 → 单边三对角化**(原 RRQR / GK):精确且更快(herm 1024² 2.56→6.94×)。
+- **非 herm k > 128 → 非分块 GK 双对角化**(原 RRQR):129~512 频段实测 0.85~1.75×(探针:(128,128) 0.85、(256,256) 1.10、(512,512) 1.75);QR 的近阈值 ±1 语义缺口在该频段**默认消除**。
+- **保留为例外**:① 长维 k≤64 的 Gram(精确 QR 压缩 0.26~0.6× 不达标);② 非 herm 65~128 的 RRQR(精确路径 0.47~0.85× 不达标,(65,65) 0.475 → (128,128) 0.847,0.8 交叉点在 k≈120,留 128 以内给 QR 保底)。两段例外均可用 `FLAGGEMS_MR_EXACT_PATH=1` 强制精确路径。
+
+验证(切换后):366 例默认扫描 48 失败(全部例外①的文档化 Gram 地板,与切换前一致);exact 扫描 2 失败(fp32 噪声区);herm 压力 34/34(**默认模式**);官方套件双模式 92 passed / 6 skipped;benchmark 默认分发 48 项全部 SUCCESS(general ≥0.93,herm 除两个历史边际 shape 外 ≥0.89)。
+
+切换边界测量(general exact,墙钟中位数):(65,65) 0.475、(80,80) 0.608、(96,96) 0.676、(100,100) 0.699、(112,112) 0.742、(128,128) 0.847。
