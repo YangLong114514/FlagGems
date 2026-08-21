@@ -2221,22 +2221,22 @@ def _mr_bidiag_lstep_kernel(W, V, D, TAU, ACC, J, K, RS, WPITCH, APITCH):
     lr = tl.arange(0, 64)
     ssq = tl.zeros((), dtype=tl.float32)
     x0 = tl.zeros((), dtype=tl.float32)
+    # single pass over the column: store the (masked) reflector vector
+    # provisionally while accumulating the norm, then overwrite the pivot
+    # element with x0 - alpha afterwards (stores only -- no read-back, so
+    # the MTE3/MTE2 ordering hazard does not apply).
     for rb in tl.range(J // 64, RS // 64):
         r0 = rb * 64
         ch = tl.load(wbase + J * RS + r0 + lr)
         ch = ch * ((r0 + lr) >= J).to(tl.float32)
+        tl.store(V + pid * WPITCH + J * RS + r0 + lr, ch)
         ssq += tl.sum(ch * ch, axis=0)
         x0 += tl.sum(ch * ((r0 + lr > J - 1) & (r0 + lr < J + 1)).to(tl.float32), axis=0)
     sigma = tl.sqrt(ssq)
     alpha = tl.where(x0 >= 0.0, -sigma, sigma)
     vnorm2 = 2.0 * sigma * (sigma + tl.abs(x0))
     tau = tl.where(vnorm2 > 0.0, 2.0 / vnorm2, 0.0)
-    for rb in tl.range(J // 64, RS // 64):
-        r0 = rb * 64
-        ch = tl.load(wbase + J * RS + r0 + lr)
-        ch = ch * ((r0 + lr) >= J).to(tl.float32)
-        v2c = tl.where((r0 + lr > J - 1) & (r0 + lr < J + 1), x0 - alpha, ch)
-        tl.store(V + pid * WPITCH + J * RS + r0 + lr, v2c)
+    tl.store(V + pid * WPITCH + J * RS + J, x0 - alpha)
     tl.store(D + pid * K + J, alpha)
     tl.store(TAU + pid * K + J, tau)
     for cb in tl.range(0, APITCH // 64):
@@ -2244,9 +2244,11 @@ def _mr_bidiag_lstep_kernel(W, V, D, TAU, ACC, J, K, RS, WPITCH, APITCH):
 
 
 @triton.jit
-def _mr_bidiag_lmat_kernel(W, V, ACC, J, K, RS, WPITCH, APITCH, NRC):
+def _mr_bidiag_lmat_kernel(W, V, ACC, J, K, RS, WPITCH, APITCH, NRC, RB0):
     # NOTE: 3D grids miscompute on this backend past small sizes (verified:
     # (1,8,8) silently wrong, flat 2D exact), so tiles are flattened.
+    # Row tiles below RB0 = J // 64 are skipped: v is zero above row J, so
+    # they contribute nothing to the reduction.
     pid = tl.program_id(0)
     flat = tl.program_id(1)
     ct = flat // NRC
@@ -2254,7 +2256,7 @@ def _mr_bidiag_lmat_kernel(W, V, ACC, J, K, RS, WPITCH, APITCH, NRC):
     c0 = J + 1 + ct * 64
     lc = tl.arange(0, 64)
     lr = tl.arange(0, 64)
-    r0 = rc * 64
+    r0 = (RB0 + rc) * 64
     wbase = W + pid * WPITCH
     tile = tl.load(wbase + (c0 + lc)[:, None] * RS + (r0 + lr)[None, :])
     v2p = tl.load(V + pid * WPITCH + J * RS + r0 + lr)
@@ -2263,7 +2265,9 @@ def _mr_bidiag_lmat_kernel(W, V, ACC, J, K, RS, WPITCH, APITCH, NRC):
 
 
 @triton.jit
-def _mr_bidiag_lapply_kernel(W, V, TAU, ACC, J, K, RS, WPITCH, APITCH, NRC):
+def _mr_bidiag_lapply_kernel(W, V, TAU, ACC, J, K, RS, WPITCH, APITCH, NRC, RB0):
+    # Row tiles below RB0 are skipped: v is zero there, so the rank-1
+    # update would be a no-op (and the load+store is pure waste).
     pid = tl.program_id(0)
     flat = tl.program_id(1)
     ct = flat // NRC
@@ -2271,7 +2275,7 @@ def _mr_bidiag_lapply_kernel(W, V, TAU, ACC, J, K, RS, WPITCH, APITCH, NRC):
     c0 = J + 1 + ct * 64
     lc = tl.arange(0, 64)
     lr = tl.arange(0, 64)
-    r0 = rc * 64
+    r0 = (RB0 + rc) * 64
     wbase = W + pid * WPITCH
     tau = tl.load(TAU + pid * K + J)
     w = tl.load(ACC + pid * APITCH + c0 + lc) * tau
@@ -2288,22 +2292,20 @@ def _mr_bidiag_rstep_kernel(W, U, E, TAU, ACC, J, K, RS, WPITCH, UPITCH, APITCH)
     lc = tl.arange(0, 64)
     ssq = tl.zeros((), dtype=tl.float32)
     x0 = tl.zeros((), dtype=tl.float32)
-    for cb in tl.range(0, (K + 63) // 64):
+    # single pass (see _mr_bidiag_lstep_kernel); columns <= J contribute
+    # nothing (u has support on c > J), so start at the (J+1)'s tile.
+    for cb in tl.range((J + 1) // 64, (K + 63) // 64):
         c0 = cb * 64
         ch = tl.load(wbase + (c0 + lc) * RS + J, mask=(c0 + lc) < K, other=0.0)
         ch = ch * ((c0 + lc) > J).to(tl.float32)
+        tl.store(U + pid * UPITCH + J * K + c0 + lc, ch, mask=(c0 + lc) < K)
         ssq += tl.sum(ch * ch, axis=0)
         x0 += tl.sum(ch * ((c0 + lc > J) & (c0 + lc < J + 2)).to(tl.float32), axis=0)
     sigma = tl.sqrt(ssq)
     alpha = tl.where(x0 >= 0.0, -sigma, sigma)
     vnorm2 = 2.0 * sigma * (sigma + tl.abs(x0))
     tau = tl.where(vnorm2 > 0.0, 2.0 / vnorm2, 0.0)
-    for cb in tl.range(0, (K + 63) // 64):
-        c0 = cb * 64
-        ch = tl.load(wbase + (c0 + lc) * RS + J, mask=(c0 + lc) < K, other=0.0)
-        ch = ch * ((c0 + lc) > J).to(tl.float32)
-        u2c = tl.where(((c0 + lc) > J) & ((c0 + lc) < J + 2), x0 - alpha, ch)
-        tl.store(U + pid * UPITCH + J * K + c0 + lc, u2c, mask=(c0 + lc) < K)
+    tl.store(U + pid * UPITCH + J * K + (J + 1), x0 - alpha)
     tl.store(E + pid * K + J, alpha)
     tl.store(TAU + pid * K + J, tau)
     for cb in tl.range(0, APITCH // 64):
@@ -2311,7 +2313,9 @@ def _mr_bidiag_rstep_kernel(W, U, E, TAU, ACC, J, K, RS, WPITCH, UPITCH, APITCH)
 
 
 @triton.jit
-def _mr_bidiag_rmat_kernel(W, U, ACC, J, K, RS, WPITCH, UPITCH, APITCH, NCC):
+def _mr_bidiag_rmat_kernel(W, U, ACC, J, K, RS, WPITCH, UPITCH, APITCH, NCC, CC0):
+    # Column tiles below CC0 = (J+1) // 64 are skipped: u is zero on
+    # columns <= J, so they contribute nothing to the reduction.
     pid = tl.program_id(0)
     flat = tl.program_id(1)
     rt = flat // NCC
@@ -2319,7 +2323,7 @@ def _mr_bidiag_rmat_kernel(W, U, ACC, J, K, RS, WPITCH, UPITCH, APITCH, NCC):
     r0 = J + 1 + rt * 64
     lc = tl.arange(0, 64)
     lr = tl.arange(0, 64)
-    c0 = cc * 64
+    c0 = (CC0 + cc) * 64
     wbase = W + pid * WPITCH
     # the J+1-aligned row grid is not 64-aligned, so the last tile straddles
     # the RS row pitch; mask it (the wrapped-around address is the NEXT
@@ -2599,8 +2603,15 @@ def _bidiag_run(ws, matrix, atol_tensor, rtol_tensor, m, n, k, rows,
         matrix, W, nrm2, frob, m, n, k, rows, rs, wpitch,
         TALL=m >= n, HERMITIAN=hermitian, num_warps=4, num_stages=1,
     )
+    nrc_full = (rs - 64) // 64
+    ncc_full = (kp - 64) // 64
     for j in range(k):
         ntl = triton.cdiv(k - 1 - j, 64)
+        # trim the matvec/apply grids to the trailing block: v/u are zero
+        # above/left of j, so those tiles are pure waste (halves the
+        # average per-step work of the four big kernels).
+        rb0 = j // 64
+        nrct = nrc_full - rb0
         _fast_launch(
             _mr_bidiag_lstep_kernel, (batch_count,),
             W, V, dbuf, taul, acc, j, k, rs, wpitch, kp,
@@ -2608,25 +2619,27 @@ def _bidiag_run(ws, matrix, atol_tensor, rtol_tensor, m, n, k, rows,
         )
         if ntl > 0:
             _fast_launch(
-                _mr_bidiag_lmat_kernel, (batch_count, ntl * ((rs - 64) // 64)),
-                W, V, acc, j, k, rs, wpitch, kp, (rs - 64) // 64,
+                _mr_bidiag_lmat_kernel, (batch_count, ntl * nrct),
+                W, V, acc, j, k, rs, wpitch, kp, nrct, rb0,
                 num_warps=4, num_stages=1,
             )
             _fast_launch(
-                _mr_bidiag_lapply_kernel, (batch_count, ntl * ((rs - 64) // 64)),
-                W, V, taul, acc, j, k, rs, wpitch, kp, (rs - 64) // 64,
+                _mr_bidiag_lapply_kernel, (batch_count, ntl * nrct),
+                W, V, taul, acc, j, k, rs, wpitch, kp, nrct, rb0,
                 num_warps=4, num_stages=1,
             )
         if j + 1 < k:
             ntr = triton.cdiv(rs - 1 - j, 64)
+            cc0 = (j + 1) // 64
+            ncct = ncc_full - cc0
             _fast_launch(
                 _mr_bidiag_rstep_kernel, (batch_count,),
                 W, U, ebuf, taur, uacc, j, k, rs, wpitch, upitch, rs,
                 num_warps=4, num_stages=1,
             )
             _fast_launch(
-                _mr_bidiag_rmat_kernel, (batch_count, ntr * ((kp - 64) // 64)),
-                W, U, uacc, j, k, rs, wpitch, upitch, rs, (kp - 64) // 64,
+                _mr_bidiag_rmat_kernel, (batch_count, ntr * ncct),
+                W, U, uacc, j, k, rs, wpitch, upitch, rs, ncct, cc0,
                 num_warps=4, num_stages=1,
             )
             _fast_launch(
