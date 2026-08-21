@@ -995,6 +995,31 @@ k≥513 生产路径(默认 dispatch)同步受益:(1024,1024) **1.03→2.59**,he
 
 剩余缺口:exact 128² general 0.794(0.8 线上,多轮中位数口径)、herm 128² 0.645——herm 走 GK 双对角化浪费一半反射(对称矩阵只需单边三对角化),根治需要独立的 GM 版单边三对角化 kernel 族(3 kernel/步 + 特征值域 ±tol Sturm 尾巴)。
 
+## 6.7 herm k>64 单边三对角化路径(已根治 herm 缺口)
+
+hermitian 输入只需要单边 Householder 三对角化(每步 1 个反射,vs GK 的 2 个),rank = #{|λ| > tol} 在特征值域用 ±tol 双链 Sturm 直接计数。新增 kernel 族(全部克隆现有健康模式):
+
+- `_mr_tridiag_step_kernel`(单 program,单遍 provisional 存 v + pivot 覆写;D[j]=W[j,j],E[j]=±σ;顺带清零 ACC/CSCA)
+- `_mr_tridiag_mat_kernel`(ω = W·v 多 program 原子累加;vᵀω 的切片在同 kernel 内原子累加进 CSCA,零额外 kernel)
+- `_mr_tridiag_apply_kernel`(rank-2 对称更新 W -= v·wᵀ + w·vᵀ,w = τω − (τ²/2)(vᵀω)v,LAPACK DSYTD2 形式)
+- `_mr_sturm_big_tridiag_kernel`(Gershgorin 括号 [max|dᵢ|, max|d|+|e|+|eₚᵣₑᵥ|] —— |λ|max ≥ max|dᵢ| 由 Rayleigh 商保证;需要精化时对 f(x) = #{|λ| > x} 做单次 bisection,lockstep 双链)
+- `_mr_sturm_final_tridiag_kernel`(df64 决定性计数:q_i = d_i − x − e²_{i-1}/q_{i-1},x = ±tol 双链 lockstep,e² 用 TwoProd;tol==0 时保留 bracket 结果——零主元保护方向在负侧会误计)
+
+grid 按 K 裁剪尾随(cdiv(K-1-J, 64)),tile 最多触到 K+62 < RS,无需行距跨越掩码。launch 序列按 shape 做 NPUGraph 捕获(独立 `_TRIDIAG_GRAPHS` 缓存)。dispatch:herm 且 k>64 在 exact 频段和 k≥513 生产路径都走三对角化(替代 GK)。
+
+验证:herm 专项压力 34/34(近阈值 ±tol 双符号簇、低秩、缓衰减穿 √eps 地板、零矩阵、垃圾上三角、batch、atol 簇,全部与 fp64 参考逐点一致);366 双扫描与 HEAD 基线一致(默认 48 = Gram 文档化限制;exact 2 = fp32 噪声区);官方套件双模式 92 passed / 6 skipped。
+
+性能(`--mode operator`,herm 频段):
+
+| shape | GK(前) | 三对角(后) |
+|---|---|---|
+| (128,128) exact | 0.65 | **1.34** |
+| (256,256) exact | 0.94 | **2.04** |
+| (512,512) exact | 1.49 | **3.97** |
+| (1024,1024) 生产 | 2.56 | **7.11** |
+
+**至此 exact 路径(env 开)在 benchmark 的 65~512 全部 shape 上 ≥0.8**(general 128² = 0.82 压线,其余 1.1~1.75;herm 1.34~3.97),唯一剩余的性能缺口是长维 k≤64 的 QR 压缩路径(0.29~0.61,panel 串行 GM 往返的墙,见第六阶段 §3)。
+
 ## 7. 验证(第六阶段最终态)
 
 - 官方套件:**92 passed / 6 skipped**(新增:8 个精确路径测试 + 11 个非方阵回归测试)
