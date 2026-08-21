@@ -794,3 +794,66 @@ def test_linalg_matrix_rank_rejects_complex_tolerance():
 
     with pytest.raises(RuntimeError, match="complex type"):
         flag_gems.linalg_matrix_rank(matrix, atol=complex_tol)
+
+
+@pytest.mark.linalg_matrix_rank
+@pytest.mark.skipif(
+    not IS_ASCEND,
+    reason="FLAGGEMS_MR_EXACT_PATH is specific to the Ascend backend",
+)
+@pytest.mark.parametrize(
+    "shape,rank,hermitian",
+    [
+        # Gram band: non-hermitian 33..64 and long-dimension k <= 64
+        pytest.param((33, 33), 16, False, id="gram-band-k33"),
+        pytest.param((256, 64), 32, False, id="gram-band-tall"),
+        pytest.param((64, 512), 32, False, id="gram-band-wide"),
+        pytest.param((1024, 8), 4, False, id="gram-band-long-dim-k8"),
+        # QR band: 64 < k <= 512
+        pytest.param((128, 128), 60, False, id="qr-band-k128"),
+        pytest.param((256, 512), 100, False, id="qr-band-wide"),
+        pytest.param((2, 100, 100), 40, False, id="qr-band-batched"),
+        pytest.param((200, 200), 80, True, id="qr-band-hermitian"),
+    ],
+)
+def test_linalg_matrix_rank_exact_path(shape, rank, hermitian, monkeypatch):
+    # Opt-in exact reference path (FLAGGEMS_MR_EXACT_PATH=1): routes the
+    # Gram/RRQR bands through the SVD-accurate Golub-Kahan bidiagonalization
+    # + df64 Sturm count.  Slowly-decaying low-rank spectra (singular values
+    # from 1 geometrically down to 1e-4) are where the Gram path
+    # overestimates rank (sigma^2 domain) and the unpivoted QR miscounts
+    # near the tolerance (|R_ii| != sigma_i); the exact path must match an
+    # fp64 reference with fp32-semantics tolerance exactly.
+    monkeypatch.setenv("FLAGGEMS_MR_EXACT_PATH", "1")
+    generator = torch.Generator().manual_seed(2026)
+    *batch, m, n = shape
+    if hermitian:
+        basis = torch.linalg.qr(
+            torch.randn(m, m, generator=generator, dtype=torch.float64)
+        )[0]
+        values = torch.cat(
+            [
+                torch.logspace(0, -4, rank, dtype=torch.float64),
+                torch.zeros(m - rank, dtype=torch.float64),
+            ]
+        )
+        matrix = ((basis * values) @ basis.mT).to(torch.float32)
+    else:
+        left = torch.linalg.qr(
+            torch.randn(*batch, m, rank, generator=generator, dtype=torch.float64)
+        )[0]
+        right = torch.linalg.qr(
+            torch.randn(*batch, n, rank, generator=generator, dtype=torch.float64)
+        )[0]
+        values = torch.logspace(0, -4, rank, dtype=torch.float64)
+        matrix = ((left * values) @ right.mT).to(torch.float32)
+
+    matrix = matrix.to(device=flag_gems.device)
+    rtol = max(m, n) * torch.finfo(torch.float32).eps
+    reference = torch.linalg.matrix_rank(
+        matrix.to(torch.float64).cpu(), atol=0.0, rtol=rtol, hermitian=hermitian
+    )
+
+    result = flag_gems.linalg_matrix_rank(matrix, hermitian=hermitian)
+    _assert_output_metadata(result, matrix)
+    utils.gems_assert_equal(result, reference.to(device=matrix.device))

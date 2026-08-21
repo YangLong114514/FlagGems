@@ -2075,13 +2075,19 @@ def _mr_bidiag_rapply_kernel(W, U, TAU, ACC, J, K, RS, WPITCH, UPITCH, APITCH, N
 
 
 @triton.jit
-def _mr_bidiag_to_tridiag_kernel(D, E, K, BLOCK: tl.constexpr):
+def _mr_bidiag_to_tridiag_kernel(D, E, DD, EE, K, BLOCK: tl.constexpr):
     # Construct the B^T B tridiagonal (dd_i = d_i^2 + e_{i-1}^2,
     # ee_i = d_i * e_i) from the raw bidiagonal d/e, in its OWN launch:
     # the Sturm kernels then only READ global memory.  All loads happen
     # before the stores -- a same-kernel store->load round trip is not
     # ordered on this backend (MTE3 store / MTE2 load), so the consumer
-    # must live behind a kernel boundary.
+    # must live behind a kernel boundary.  DD/EE are SEPARATE buffers: the
+    # fp32 tridiagonal has an absolute element rounding of ~eps*sigma_max^2,
+    # which swamps any squared singular value below ~(sqrt(eps)*sigma_max)^2
+    # -- i.e. everything near the default tolerance (k*eps*sigma_max).  The
+    # decisive df64 kernel therefore works from the RAW d/e instead (their
+    # relative precision is ~K*eps regardless of conditioning) and squares
+    # them inside the df64 arithmetic.
     batch = tl.program_id(0)
     kidx = tl.arange(0, BLOCK)
     base = batch * K
@@ -2089,8 +2095,8 @@ def _mr_bidiag_to_tridiag_kernel(D, E, K, BLOCK: tl.constexpr):
     d = tl.load(D + base + kidx, mask=kmask, other=0.0)
     e_cur = tl.load(E + base + kidx, mask=kidx < K - 1, other=0.0)
     e_prev = tl.load(E + base + kidx - 1, mask=(kidx >= 1) & kmask, other=0.0)
-    tl.store(D + base + kidx, d * d + e_prev * e_prev, mask=kmask)
-    tl.store(E + base + kidx, d * e_cur, mask=kmask)
+    tl.store(DD + base + kidx, d * d + e_prev * e_prev, mask=kmask)
+    tl.store(EE + base + kidx, d * e_cur, mask=kmask)
 
 
 @triton.jit
@@ -2207,35 +2213,46 @@ def _df64_div_ds(a_h, a_l, b_h, b_l):
 
 @triton.jit
 def _mr_sturm_final_kernel(D, E, TOL2, FLAG, OUT, K):
-    # The decisive count, in double-single (df64) arithmetic: at near-critical
-    # thresholds the qd recurrence has intermediates passing within ~1 ulp of
-    # zero, and fp32 implementations diverge from each other there (verified:
-    # CPU fp32 and this kernel disagreed with <1ulp input differences). df64
-    # makes the recurrence fp64-accurate. Requires enable_fp_fusion=False
-    # (fma contraction breaks the TwoSum/TwoProd error-free transforms).
+    # The decisive count, in double-single (df64) arithmetic, from the RAW
+    # bidiagonal d/e (NOT the fp32 dd/ee tridiagonal: squaring into fp32
+    # rounds each dd/ee absolutely by ~eps*sigma_max^2, which swamps any
+    # lambda near the default tol^2 ~ (k*eps*sigma_max)^2 -- a sqrt(eps)
+    # noise floor in the sigma domain).  Squaring the fp32 d/e inside df64
+    # keeps every intermediate at ~eps^2 relative precision.  The qd
+    # recurrence for B^T B: dd_i = d_i^2 + e_{i-1}^2, ee_i = d_i*e_i,
+    # q_i = dd_i - tol2 - ee_{i-1}^2 / q_{i-1}.
+    # Requires enable_fp_fusion=False (fma contraction breaks the
+    # TwoSum/TwoProd error-free transforms).
     batch = tl.program_id(0)
     tol2 = tl.load(TOL2 + batch)
     refine = tl.load(FLAG + batch)
     rank_a = tl.load(OUT + batch)
     base = batch * K
     d0 = tl.load(D + base)
-    q_h, q_l = _df64_add(d0, 0.0, -tol2, 0.0)
+    d0h, d0l = _df64_mul_ds(d0, 0.0, d0, 0.0)
+    q_h, q_l = _df64_add(d0h, d0l, -tol2, 0.0)
     zero = (q_h == 0.0) & (q_l == 0.0)
     q_h = tl.where(zero, -1.1754944e-38, q_h)
     q_l = tl.where(zero, 0.0, q_l)
     neg = ((q_h < 0.0) | ((q_h == 0.0) & (q_l < 0.0))).to(tl.int32)
+    dprev = d0
     i = 1
     while i < K:
         di = tl.load(D + base + i)
         ei = tl.load(E + base + i - 1)
-        t_h, t_l = _df64_mul_ds(ei, 0.0, ei, 0.0)
-        qd_h, qd_l = _df64_div_ds(t_h, t_l, q_h, q_l)
-        s_h, s_l = _df64_add(di, 0.0, -tol2, 0.0)
+        dih, dil = _df64_mul_ds(di, 0.0, di, 0.0)
+        eih, eil = _df64_mul_ds(ei, 0.0, ei, 0.0)
+        dd_h, dd_l = _df64_add(dih, dil, eih, eil)
+        ph, pl = _df64_mul_ds(dprev, 0.0, ei, 0.0)
+        ee_h, ee_l = _df64_mul_ds(ph, pl, ph, pl)
+        qd_h, qd_l = _df64_div_ds(ee_h, ee_l, q_h, q_l)
+        s_h, s_l = _df64_add(dd_h, dd_l, -tol2, 0.0)
         q_h, q_l = _df64_add(s_h, s_l, -qd_h, -qd_l)
         zero = (q_h == 0.0) & (q_l == 0.0)
         q_h = tl.where(zero, -1.1754944e-38, q_h)
         q_l = tl.where(zero, 0.0, q_l)
         neg += ((q_h < 0.0) | ((q_h == 0.0) & (q_l < 0.0))).to(tl.int32)
+        dprev = di
         i += 1
     rank_b = (K - neg).to(tl.int64)
     # always take the df64 count: the fp32 bracket counts in kernel A are only
@@ -2268,6 +2285,10 @@ def _launch_bidiag_rank(
     U = torch.zeros((batch_count, upitch), dtype=torch.float32, device=dev)
     dbuf = torch.zeros((batch_count, k), dtype=torch.float32, device=dev)
     ebuf = torch.zeros((batch_count, k), dtype=torch.float32, device=dev)
+    # fp32 B^T B tridiagonal for the bracket counts only; the decisive df64
+    # count works from the RAW d/e (see _mr_bidiag_to_tridiag_kernel).
+    ddbuf = torch.empty((batch_count, k), dtype=torch.float32, device=dev)
+    eebuf = torch.empty((batch_count, k), dtype=torch.float32, device=dev)
     taul = torch.zeros((batch_count, k), dtype=torch.float32, device=dev)
     taur = torch.zeros((batch_count, k), dtype=torch.float32, device=dev)
     nrm2 = torch.empty((batch_count, k), dtype=torch.float32, device=dev)
@@ -2329,11 +2350,12 @@ def _launch_bidiag_rank(
                     )
             _fast_launch(
                 _mr_bidiag_to_tridiag_kernel, (batch_count,),
-                dbuf, ebuf, k, BLOCK=block_k, num_warps=1, num_stages=1,
+                dbuf, ebuf, ddbuf, eebuf, k, BLOCK=block_k,
+                num_warps=1, num_stages=1,
             )
             _fast_launch(
                 _mr_sturm_big_kernel, (batch_count,),
-                dbuf, ebuf, atol_tensor, rtol_tensor, out.reshape(batch_count),
+                ddbuf, eebuf, atol_tensor, rtol_tensor, out.reshape(batch_count),
                 tol2_buf, flag_buf,
                 k, BLOCK=block_k, BISECT_ITERS=32, num_warps=1, num_stages=1,
             )
@@ -2428,6 +2450,34 @@ def _launch_matrix_rank(input, atol, rtol, hermitian):
                 ABS_EPS=absolute_epsilon,
                 TOL_TENSOR=tol_tensor,
                 num_warps=num_warps,
+            )
+        elif (
+            2 < k < _BIDIAG_MIN_K
+            and not (m <= 32 and n <= 32)
+            and not (hermitian and k <= _TRIDIAG_MAX_K and rows <= _TRIDIAG_MAX_ROWS)
+            and os.environ.get("FLAGGEMS_MR_EXACT_PATH") == "1"
+        ):
+            # Opt-in exact reference path (validation only -- NOT the default
+            # dispatch). Routes the bands that currently rely on the Gram
+            # (sigma^2-domain, overestimates rank on slowly-decaying spectra)
+            # or the unpivoted QR (|R_ii| != sigma_i, +-1 near the tolerance)
+            # through the SVD-accurate unblocked Golub-Kahan
+            # bidiagonalization, so extended sweeps can compare it against
+            # the incumbent paths before it becomes the default.
+            if atol_tensor is None:
+                atol_tensor, rtol_tensor = _prepare_tolerances(input, atol, rtol)
+            _launch_bidiag_rank(
+                matrix,
+                atol_tensor,
+                rtol_tensor,
+                out,
+                m,
+                n,
+                k,
+                rows,
+                batch_count,
+                input,
+                hermitian,
             )
         elif k <= _TRIDIAG_MAX_K and rows <= _TRIDIAG_MAX_ROWS:
             # fp32 small/medium matrices: single fused kernel launch
