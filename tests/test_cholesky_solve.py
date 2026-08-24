@@ -336,6 +336,9 @@ def test_cholesky_solve_small_gather_single_rhs(shape, dtype, upper):
 def test_cholesky_solve_ascend_batched_small_lower_single_rhs(batch_size):
     dtype = torch.float32
     A, factor, rhs = _make_cholesky_solve_inputs((batch_size, 16, 1), dtype)
+    # Explicitly create a non-contiguous lower-factor view. The layout returned
+    # by torch.linalg.cholesky is backend and version dependent.
+    factor = factor.mT.contiguous().mT
 
     assert not factor.is_contiguous()
     assert factor.mT.is_contiguous()
