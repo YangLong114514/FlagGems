@@ -927,3 +927,230 @@ def test_linalg_matrix_rank_nonsquare_lowrank(dtype, shape, rank):
     result = flag_gems.linalg_matrix_rank(matrix)
     _assert_output_metadata(result, matrix)
     utils.gems_assert_equal(result, reference.to(device=matrix.device))
+
+
+@pytest.mark.linalg_matrix_rank
+@pytest.mark.skipif(not IS_ASCEND, reason="Ascend-specific path coverage")
+@pytest.mark.parametrize("k", [3, 33, 65, 128, 257])
+def test_linalg_matrix_rank_hermitian_strict_threshold(k, monkeypatch):
+    # Pin the exact herm paths: k > 64 defaults to unpivoted QR (whose
+    # |R_ii| count has the documented slow-decay/tie limitations); the
+    # strict-threshold semantics live in the fused/padded/tridiag Sturm
+    # counters exercised here.
+    monkeypatch.setenv("FLAGGEMS_MR_EXACT_PATH", "1")
+    # torch's hermitian semantics are STRICT: rank = #{|lambda| > tol}
+    # = #{lambda > tol} + #{lambda < -tol}.  The Sturm zero-pivot guard
+    # counts #{lambda <= x}, so the negative side must be evaluated at a
+    # shift strictly below -tol (_neg_strict_shift); otherwise an
+    # eigenvalue exactly equal to -tol is wrongly counted, and with
+    # atol == rtol == 0 a nonzero rank-deficient spectrum reports full rank.
+    # Diagonal inputs keep the factorization exact, so these ties are
+    # deterministic.  k covers every herm path: fused (<=32), padded
+    # tridiag (33..64), and the large one-sided tridiagonalization.
+    device = flag_gems.device
+
+    def diag_case(values, atol, rtol):
+        matrix = torch.diag(values).to(torch.float32).to(device)
+        reference = torch.linalg.matrix_rank(
+            matrix.double().cpu(), hermitian=True, atol=atol, rtol=rtol
+        )
+        result = flag_gems.linalg_matrix_rank(
+            matrix, hermitian=True, atol=atol, rtol=rtol
+        )
+        utils.gems_assert_equal(result, reference.to(device))
+
+    # negative tie: lambda == -tol must NOT be counted
+    diag_case(torch.tensor([1.0, -0.5] + [0.0] * (k - 2)), 0.5, 0.0)
+    # positive tie: lambda == +tol must NOT be counted
+    diag_case(torch.tensor([0.5, -1.0] + [0.0] * (k - 2)), 0.5, 0.0)
+    # atol == rtol == 0 on a nonzero rank-deficient spectrum: #{|lam| > 0}
+    diag_case(torch.tensor([1.0, -2.0] + [0.0] * (k - 2)), 0.0, 0.0)
+    # all-zero spectrum with atol == rtol == 0
+    diag_case(torch.zeros(k), 0.0, 0.0)
+
+    # dense (rotated) ties with margins above the fp32 noise floor
+    generator = torch.Generator().manual_seed(k)
+    basis = torch.linalg.qr(
+        torch.randn(k, k, generator=generator, dtype=torch.float64)
+    )[0]
+    values = torch.zeros(k, dtype=torch.float64)
+    values[:3] = torch.tensor([1.0, -0.5, 0.5])
+    matrix = ((basis * values) @ basis.mT).float().to(device)
+    for atol, expected_rank in [(0.49, 3), (0.51, 1)]:
+        reference = torch.linalg.matrix_rank(
+            matrix.double().cpu(), hermitian=True, atol=atol, rtol=0.0
+        )
+        assert reference.item() == expected_rank  # construction sanity
+        result = flag_gems.linalg_matrix_rank(
+            matrix, hermitian=True, atol=atol, rtol=0.0
+        )
+        utils.gems_assert_equal(result, reference.to(device))
+
+    # batch + per-batch tensor tolerance
+    matrix = torch.stack(
+        [
+            torch.diag(torch.tensor([1.0, -0.5] + [0.0] * (k - 2))),
+            torch.diag(torch.tensor([1.0, -0.5] + [0.0] * (k - 2))),
+        ]
+    ).float()
+    atol = torch.tensor([0.5, 0.6], device=device)
+    rtol = torch.zeros(2, device=device)
+    reference = torch.linalg.matrix_rank(
+        matrix.double(), hermitian=True, atol=atol.cpu(), rtol=rtol.cpu()
+    )
+    result = flag_gems.linalg_matrix_rank(
+        matrix.to(device), hermitian=True, atol=atol, rtol=rtol
+    )
+    utils.gems_assert_equal(result, reference.to(device))
+
+
+@pytest.mark.linalg_matrix_rank
+@pytest.mark.skipif(not IS_ASCEND, reason="Ascend-specific path coverage")
+@pytest.mark.parametrize("k,expect_rank", [(65, 1), (128, 1), (257, 1), (513, 1)])
+def test_linalg_matrix_rank_hermitian_deflated_spectrum(
+    k, expect_rank, monkeypatch
+):
+    monkeypatch.setenv("FLAGGEMS_MR_EXACT_PATH", "1")
+    # Strongly deflated spectra (a few significant eigenvalues, the rest at
+    # the fp32 noise floor) drive the trailing subdiagonal to ~1e-10, where
+    # tau = 2/vnorm2 ~ 1e20 and a naively grouped (tau*tau)*(v'w)/2
+    # coefficient overflows fp32 in the rank-2 update -- verified to corrupt
+    # the trailing diagonal to -inf and then NaN via 0*inf in the next
+    # float mask.  The apply kernel regroups the coefficient as
+    # tau*(tau*cs); this test guards that regression on the large
+    # one-sided tridiagonalization path.
+    generator = torch.Generator().manual_seed(k)
+    basis = torch.linalg.qr(
+        torch.randn(k, k, generator=generator, dtype=torch.float64)
+    )[0]
+    values = torch.zeros(k, dtype=torch.float64)
+    values[:4] = torch.tensor([1.0, -0.5, 0.5, -0.25])
+    matrix = ((basis * values) @ basis.mT).float().to(flag_gems.device)
+
+    reference = torch.linalg.matrix_rank(
+        matrix.double().cpu(), hermitian=True, atol=0.51, rtol=0.0
+    )
+    assert reference.item() == expect_rank  # 1.0 only; +/-0.5/-0.25 excluded
+    result = flag_gems.linalg_matrix_rank(
+        matrix, hermitian=True, atol=0.51, rtol=0.0
+    )
+    assert torch.isfinite(result.double()).all()
+    utils.gems_assert_equal(result, reference.to(flag_gems.device))
+
+
+@pytest.mark.linalg_matrix_rank
+@pytest.mark.skipif(not IS_ASCEND, reason="Ascend-specific path coverage")
+@pytest.mark.parametrize(
+    "shape,rank,hermitian,kind",
+    [
+        # general: RRQR (65..128) vs default bidiag (>128) boundary.
+        # The RRQR case uses an exactly-gapped spectrum: unpivoted QR's
+        # |R_ii| undercounts slow-decay spectra even at 6x tolerance margin
+        # (verified: sigma=1e-4 vs tol=1.5e-5 reports 59/60) -- that is the
+        # documented exception-2 limitation, not a dispatch bug.
+        pytest.param((128, 128), 60, False, "gapped", id="general-k128-rrqr"),
+        pytest.param((255, 255), 120, False, "gapped", id="general-k255-rrqr"),
+        pytest.param((256, 256), 120, False, "slowdecay", id="general-k256-bidiag"),
+        pytest.param((256, 512), 120, False, "slowdecay", id="general-k256-wide"),
+        pytest.param((512, 256), 120, False, "slowdecay", id="general-k256-tall"),
+        pytest.param((2, 256, 256), 120, False, "slowdecay", id="general-k256-batched"),
+        # hermitian: QR (65..255) vs one-sided big tridiag (>=256)
+        pytest.param((64, 64), 30, True, "slowdecay", id="herm-k64-padded"),
+        pytest.param((65, 65), 30, True, "gapped", id="herm-k65-rrqr"),
+        pytest.param((256, 256), 120, True, "slowdecay", id="herm-k256-tridiag"),
+    ],
+)
+def test_linalg_matrix_rank_dispatch_boundary(shape, rank, hermitian, kind):
+    # Default-dispatch boundaries.  slowdecay = singular values 1 .. 1e-4
+    # (exposes the Gram sigma^2 floor and QR near-tolerance miscount where
+    # those paths are NOT expected); gapped = sigma in {1, 0} with an exact
+    # gap (valid on every dispatch).  Reference: fp64 with fp32-semantics
+    # tolerance.
+    generator = torch.Generator().manual_seed(2026 + rank)
+    *batch, m, n = shape
+    if hermitian:
+        basis = torch.linalg.qr(
+            torch.randn(m, m, generator=generator, dtype=torch.float64)
+        )[0]
+        if kind == "gapped":
+            nonzero = torch.ones(rank, dtype=torch.float64)
+        else:
+            nonzero = torch.logspace(0, -4, rank, dtype=torch.float64)
+        full = torch.cat(
+            [nonzero, torch.zeros(m - rank, dtype=torch.float64)]
+        )
+        matrix = ((basis * full) @ basis.mT).to(torch.float32)
+    else:
+        left = torch.linalg.qr(
+            torch.randn(*batch, m, rank, generator=generator, dtype=torch.float64)
+        )[0]
+        right = torch.linalg.qr(
+            torch.randn(*batch, n, rank, generator=generator, dtype=torch.float64)
+        )[0]
+        if kind == "gapped":
+            values = torch.ones(rank, dtype=torch.float64)
+        else:
+            values = torch.logspace(0, -4, rank, dtype=torch.float64)
+        matrix = ((left * values) @ right.mT).to(torch.float32)
+
+    matrix = matrix.to(flag_gems.device)
+    rtol = max(m, n) * torch.finfo(torch.float32).eps
+    reference = torch.linalg.matrix_rank(
+        matrix.to(torch.float64).cpu(), atol=0.0, rtol=rtol, hermitian=hermitian
+    )
+    result = flag_gems.linalg_matrix_rank(matrix, hermitian=hermitian)
+    _assert_output_metadata(result, matrix)
+    utils.gems_assert_equal(result, reference.to(flag_gems.device))
+
+
+@pytest.mark.linalg_matrix_rank
+@pytest.mark.skipif(not IS_ASCEND, reason="Ascend-specific path coverage")
+@pytest.mark.parametrize("k,hermitian", [(256, False), (513, False), (256, True),
+                                          (513, True)])
+def test_linalg_matrix_rank_graph_vs_nograph(k, hermitian, monkeypatch):
+    # The NPUGraph-replayed launch sequence must produce bit-identical
+    # results to direct launches (FLAGGEMS_MR_NO_GRAPH=1).
+    generator = torch.Generator().manual_seed(k)
+    if hermitian:
+        basis = torch.linalg.qr(
+            torch.randn(k, k, generator=generator, dtype=torch.float64)
+        )[0]
+        values = torch.cat(
+            [
+                torch.logspace(0, -4, k // 3, dtype=torch.float64),
+                torch.zeros(k - k // 3, dtype=torch.float64),
+            ]
+        )
+        matrix = ((basis * values) @ basis.mT).float().to(flag_gems.device)
+    else:
+        matrix = torch.randn(k, k, generator=generator).float().to(flag_gems.device)
+
+    monkeypatch.setenv("FLAGGEMS_MR_NO_GRAPH", "1")
+    direct = flag_gems.linalg_matrix_rank(matrix, hermitian=hermitian)
+    monkeypatch.delenv("FLAGGEMS_MR_NO_GRAPH")
+    graphed = flag_gems.linalg_matrix_rank(matrix, hermitian=hermitian)  # captures
+    replayed = flag_gems.linalg_matrix_rank(matrix, hermitian=hermitian)  # replays
+    utils.gems_assert_equal(direct, graphed)
+    utils.gems_assert_equal(direct, replayed)
+
+
+@pytest.mark.linalg_matrix_rank
+@pytest.mark.skipif(not IS_ASCEND, reason="Ascend-specific path coverage")
+@pytest.mark.parametrize("k", [300, 513])
+def test_linalg_matrix_rank_hermitian_ignores_strict_upper_large(k):
+    # torch hermitian semantics read only the lower triangle; the large
+    # one-sided tridiagonalization (init kernel's max/min addressing) must
+    # not let garbage in the strict upper triangle into the spectrum.
+    generator = torch.Generator().manual_seed(k)
+    lower = torch.tril(torch.randn(k, k, generator=generator))
+    matrix = lower.clone()
+    matrix.masked_fill_(
+        torch.triu(torch.ones(k, k, dtype=torch.bool), 1), 1e6
+    )
+    matrix = matrix.to(flag_gems.device)
+    reference = torch.linalg.matrix_rank(
+        (torch.tril(matrix.double().cpu()) + torch.tril(matrix.double().cpu(), -1).mT),
+        hermitian=True,
+    )
+    result = flag_gems.linalg_matrix_rank(matrix, hermitian=True)
+    utils.gems_assert_equal(result, reference.to(flag_gems.device))

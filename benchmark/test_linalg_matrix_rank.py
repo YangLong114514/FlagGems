@@ -40,13 +40,29 @@ MATRIX_RANK_COMPREHENSIVE_SHAPES = [
     (1024, 32),
     (64, 512),
     (512, 64),
+    # Default-dispatch boundary band (general RRQR -> bidiag at k = 129):
+    # 65..127 stay on unpivoted QR, 129+ on the exact bidiagonalization.
+    (65, 65),
+    (80, 80),
+    (96, 96),
+    (112, 112),
+    (120, 120),
+    (127, 127),
     # Medium, large, and current native-support boundaries.
     (128, 128),
+    (129, 129),
+    (160, 160),
+    (192, 192),
     (256, 256),
     (512, 512),
     (512, 1024),
     (1024, 512),
     (1024, 1024),
+    # Non-square shapes across the k = 129 dispatch boundary.
+    (129, 512),
+    (512, 129),
+    (129, 2048),
+    (2048, 129),
     # Single- and multi-dimensional batches of small/medium matrices.
     (32, 8, 8),
     (8, 16, 16),
@@ -55,6 +71,9 @@ MATRIX_RANK_COMPREHENSIVE_SHAPES = [
     (8, 64, 16),
     (8, 16, 64),
     (2, 4, 16, 16),
+    (2, 129, 129),
+    (8, 129, 129),
+    (2, 256, 256),
 ]
 
 MATRIX_RANK_HERMITIAN_CORE_SHAPES = [
@@ -69,8 +88,13 @@ MATRIX_RANK_HERMITIAN_CORE_SHAPES = [
 ]
 
 MATRIX_RANK_HERMITIAN_COMPREHENSIVE_SHAPES = [
+    # herm 65+ uses the one-sided tridiagonalization (default since the
+    # stage-4 dispatch switch); 65/129/257 sample its coverage.
+    (65, 65),
     (128, 128),
+    (129, 129),
     (256, 256),
+    (257, 257),
     (512, 512),
     (1024, 1024),
     (32, 8, 8),

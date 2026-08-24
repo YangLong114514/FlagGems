@@ -38,8 +38,8 @@ max(atol, rtol * sigma_max) }, with sigma_max bracketed by |R_00| and
 and fp32 matrices with k >= 513 use an unblocked Golub-Kahan
 bidiagonalization plus a Sturm count whose decisive pass runs in
 double-single (df64) arithmetic (SVD-accurate); hermitian matrices with
-k > 64 (both the k >= 513 production path and the opt-in exact band) use a
-one-sided Householder tridiagonalization instead (half the reflectors of
+k > 255 (both the k >= 513 production path and the opt-in exact band) use
+a one-sided Householder tridiagonalization instead (half the reflectors of
 Golub-Kahan) with the rank counted in the eigenvalue domain by a +/-tol
 double-chain Sturm bracket and a df64 decisive pass.
 fp64 is rejected with NotImplementedError (this toolchain cannot compile
@@ -57,6 +57,7 @@ matrix_rank_昇腾算子实现报告.md for the full defect list and methodology
 
 import logging
 import os
+import threading
 import warnings
 
 import torch
@@ -113,14 +114,15 @@ _FUSED_JACOBI_WIDE_MAX_ROWS = 128
 # tridiagonalization for hermitian 33..64, QR-compression to the k x k R
 # factor + bidiag64 for long dimensions.
 _TRIDIAG_MAX_K = 64
-_RRQR_MAX_K = 128  # general 65..128 defaults to RRQR: the exact unblocked
-# bidiag path measures 0.47..0.85x torch there (per-step GM tile-op floor;
-# the register-resident 128-wide kernel is impossible -- UB overflow, see
-# the report stage 6).  General k > 128 measures 0.85..1.75x on the exact
-# path, so the default dispatch IS the exact bidiagonalization there;
-# FLAGGEMS_MR_EXACT_PATH=1 forces the exact path for 65..128 (validation).
-# hermitian k > 64 always uses the one-sided tridiagonalization (exact and
-# faster than RRQR at every measured size).
+_RRQR_MAX_K = 255  # 65..255 defaults to unpivoted QR (both hermitian and
+# general): the exact paths dip below the 0.8x bar there -- per-step GM
+# tile-op floor, with an extra step-cost jump at every 64-wide tile
+# boundary (measured on the extended benchmark: general 129^2 0.50 /
+# 160^2 0.69 / 192^2 0.90 / 129x2048 0.52, herm 65^2 0.74 / 129^2 0.72).
+# k >= 256 is exact by default (256^2 1.10x general / 2.04x herm, and
+# 2.2x/4.0x at 512^2), so the QR band keeps only the documented slow-decay
+# exception; FLAGGEMS_MR_EXACT_PATH=1 forces the exact paths for 65..255
+# (validation).
 
 
 def _jacobi_sweeps(k, is_fp64):
@@ -632,6 +634,23 @@ def _matrix_rank_fused_jacobi_kernel(
 
 
 @triton.jit
+def _neg_strict_shift(tol):
+    # Negative-side shift for the hermitian strict count.  torch counts
+    # #{|lambda| > tol} = #{lambda > tol} + #{lambda < -tol}; the qd
+    # zero-pivot guard (replace a zero pivot by a tiny NEGATIVE value) makes
+    # the Sturm count #{lambda <= x}, so the positive side K - #{lambda <=
+    # tol} is already strict -- but the negative side must NOT count
+    # lambda == -tol.  Counting at a value just below -tol is exactly
+    # #{lambda < -tol} on the fp32 lattice.  (A bitcast nextafter would be
+    # exact but scalar bitcast miscompiles on this backend -- verified:
+    # -0.0 produced a NaN shift.  The arithmetic form is exact where it
+    # matters: -tol*(1+2eps) always rounds strictly below -tol for tol > 0,
+    # and the tol == 0 case gets the hardcoded -1.4e-45, i.e. #{lambda<0}.)
+    x = -tol
+    return tl.where(tol > 0.0, x * 1.0000002384185791, -1.4012985e-45)
+
+
+@triton.jit
 def _sturm_count_less(D, E, base, K: tl.constexpr, x):
     """Number of eigenvalues of the symmetric tridiagonal T = diag(d) +
     diag(e, +/-1) that are <= x, via the qd recurrence (LAPACK DLANEG
@@ -766,8 +785,12 @@ def _mr_sturm_rank_reg(
             sigma_lo = tl.maximum(tl.abs(dmax), tl.abs(tl.min(d_raw, axis=0)))
             tol_lo = tl.maximum(atol, rtol * sigma_lo)
             tol_hi = tl.maximum(atol, rtol * hi)
-            cnt_lo_p, cnt_lo_n = _sturm_count_less_reg2(dd, ee, K, BLOCK, tol_lo, -tol_lo)
-            cnt_hi_p, cnt_hi_n = _sturm_count_less_reg2(dd, ee, K, BLOCK, tol_hi, -tol_hi)
+            cnt_lo_p, cnt_lo_n = _sturm_count_less_reg2(
+                dd, ee, K, BLOCK, tol_lo, _neg_strict_shift(tol_lo)
+            )
+            cnt_hi_p, cnt_hi_n = _sturm_count_less_reg2(
+                dd, ee, K, BLOCK, tol_hi, _neg_strict_shift(tol_hi)
+            )
             rank_lo = (K - cnt_lo_p) + cnt_lo_n
             rank_hi = (K - cnt_hi_p) + cnt_hi_n
             rank = rank_lo
@@ -801,7 +824,7 @@ def _mr_sturm_rank_reg(
                 sigma_max = tl.maximum(tl.abs(lmax), tl.abs(lmin))
                 tol = tl.maximum(atol, rtol * sigma_max)
                 rank = (K - _sturm_count_less_reg(dd, ee, K, BLOCK, tol)) + (
-                    _sturm_count_less_reg(dd, ee, K, BLOCK, -tol)
+                    _sturm_count_less_reg(dd, ee, K, BLOCK, _neg_strict_shift(tol))
                 )
         else:
             # Gram matrix: eigenvalues are sigma^2, threshold is tol^2.
@@ -1251,8 +1274,12 @@ def _matrix_rank_sturm_kernel(
             sigma_lo = tl.maximum(tl.abs(dmax), tl.abs(tl.min(d, axis=0)))
             tol_lo = tl.maximum(atol, rtol * sigma_lo)
             tol_hi = tl.maximum(atol, rtol * hi)
-            cnt_lo_p, cnt_lo_n = _sturm_count_less2(D, E, base, K, tol_lo, -tol_lo)
-            cnt_hi_p, cnt_hi_n = _sturm_count_less2(D, E, base, K, tol_hi, -tol_hi)
+            cnt_lo_p, cnt_lo_n = _sturm_count_less2(
+                D, E, base, K, tol_lo, _neg_strict_shift(tol_lo)
+            )
+            cnt_hi_p, cnt_hi_n = _sturm_count_less2(
+                D, E, base, K, tol_hi, _neg_strict_shift(tol_hi)
+            )
             rank_lo = (K - cnt_lo_p) + cnt_lo_n
             rank_hi = (K - cnt_hi_p) + cnt_hi_n
         else:
@@ -1298,7 +1325,7 @@ def _matrix_rank_sturm_kernel(
                 sigma_max = tl.maximum(tl.abs(lmax), tl.abs(lmin))
                 tol = tl.maximum(atol, rtol * sigma_max)
                 rank = (K - _sturm_count_less(D, E, base, K, tol)) + (
-                    _sturm_count_less(D, E, base, K, -tol)
+                    _sturm_count_less(D, E, base, K, _neg_strict_shift(tol))
                 )
             else:
                 lo = tl.maximum(dmax, 0.0)
@@ -2166,7 +2193,11 @@ def _launch_rrqr_rank(    matrix, atol_tensor, rtol_tensor, out, m, n, k, rows, 
     wpitch = kp * rs
     ntmax = kp // 64
     block_k = triton.next_power_of_2(k)
-    nb = max(1, rs // 64)  # 64-row register tiles in the reg panel kernel
+    nb = min(4, triton.next_power_of_2(max(1, rs // 64)))  # 64-row register
+    # tiles in the reg panel kernel.  NB must stay in {1, 2, 4}: the NB=3
+    # specialization (rs = 192) is a marginal UB allocation that flip-flops
+    # between fitting and "ub overflow" across compiles (verified: (129,129)
+    # failed, (192,192) passed, same binary specialization).
     W = torch.empty((batch_count, kp, rs), dtype=torch.float32, device=dev)
     V = torch.zeros((batch_count, kp, rs), dtype=torch.float32, device=dev)
     nrm2 = torch.empty((batch_count, k), dtype=torch.float32, device=dev)
@@ -2187,7 +2218,11 @@ def _launch_rrqr_rank(    matrix, atol_tensor, rtol_tensor, out, m, n, k, rows, 
         while j0 < k:
             b = min(64, k - j0)
             nt = triton.cdiv(k - j0 - b, 64)
-            if reg_panel:
+            # b == 1 panels must NOT go to the register panel kernel: the
+            # JIT specializes int args equal to 1, and the B=1
+            # specialization UB-overflows (verified: k=129 fails while
+            # k=131 compiles, same NB).  Use the GM-tile panel for those.
+            if reg_panel and b != 1:
                 _fast_launch(
                     _mr_rrqr_panel_reg_kernel, (batch_count,),
                     W, V, piv, tau, j0, b, k, rs, wpitch,
@@ -2445,7 +2480,13 @@ def _mr_tridiag_apply_kernel(W, V, TAU, ACC, CSCA, J, K, RS, WPITCH, APITCH, NRT
     wbase = W + pid * WPITCH
     tau = tl.load(TAU + pid * K + J)
     cs = tl.load(CSCA + pid)
-    coef = 0.5 * tau * tau * cs
+    # coef = (tau^2/2)(v^T omega): evaluate as tau*(tau*cs), NOT tau*tau*cs.
+    # When the trailing subdiagonal deflates (sigma ~ 1e-10 on clustered or
+    # strongly rank-deficient spectra), tau = 2/vnorm2 ~ 1e20 and tau*tau
+    # overflows fp32 (2e40 > 3.4e38) even though the final coefficient is
+    # O(1) -- verified: W diagonal corrupted to -inf, then 0*inf -> NaN in
+    # the next step's float mask.  The regrouped form never squares tau.
+    coef = 0.5 * tau * (tau * cs)
     om_r = tl.load(ACC + pid * APITCH + r0 + lr)
     v_r = tl.load(V + pid * WPITCH + J * RS + r0 + lr)
     om_c = tl.load(ACC + pid * APITCH + c0 + lc)
@@ -2687,7 +2728,9 @@ def _mr_sturm_big_tridiag_kernel(
         tol_lo = tl.maximum(atol, rtol * dmax)
         tol_hi = tl.maximum(atol, rtol * hi)
         c_lo, c_hi = _sturm_count_less2(D, E, base, K, tol_lo, tol_hi)
-        m_lo, m_hi = _sturm_count_less2(D, E, base, K, -tol_lo, -tol_hi)
+        m_lo, m_hi = _sturm_count_less2(
+            D, E, base, K, _neg_strict_shift(tol_lo), _neg_strict_shift(tol_hi)
+        )
         rank_lo = K - c_lo + m_lo
         rank_hi = K - c_hi + m_hi
         tol2 = tol_lo
@@ -2699,7 +2742,9 @@ def _mr_sturm_big_tridiag_kernel(
             it = 0
             while it < BISECT_ITERS:
                 mid = 0.5 * (lo + hi_p)
-                c_m, m_m = _sturm_count_less2(D, E, base, K, mid, -mid)
+                c_m, m_m = _sturm_count_less2(
+                    D, E, base, K, mid, _neg_strict_shift(mid)
+                )
                 if K - c_m + m_m >= 1:
                     lo = mid
                 else:
@@ -2717,21 +2762,23 @@ def _mr_sturm_big_tridiag_kernel(
 def _mr_sturm_final_tridiag_kernel(D, E, TOL2, FLAG, OUT, K):
     # Decisive hermitian count in df64 arithmetic from the RAW tridiagonal:
     # rank = #{lambda > tol} + #{lambda < -tol}, two lockstep qd chains
-    # q_i = d_i - x - e_{i-1}^2 / q_{i-1} with x = +/-tol.  Same df64
+    # q_i = d_i - x - e_{i-1}^2 / q_{i-1}.  The positive chain runs at
+    # x = tol (the zero-pivot guard makes it count #{lambda <= tol}, so
+    # K - neg IS the strict #{lambda > tol}); the negative chain runs at
+    # x = pred(-tol) = nextafter(-tol, -inf), which is exactly the strict
+    # #{lambda < -tol} on the fp32 lattice -- including tol == 0, where
+    # pred(-0.0) = -1.4e-45 yields #{lambda < 0} (a nonzero rank-deficient
+    # spectrum is counted correctly, no special-casing).  Same df64
     # primitives and zero-pivot guards as _mr_sturm_final_kernel; the e^2
     # terms are TwoProd'd so the recurrence keeps ~eps^2 relative precision.
     # Requires enable_fp_fusion=False.
     batch = tl.program_id(0)
     tol = tl.load(TOL2 + batch)
+    xn = _neg_strict_shift(tol)
     base = batch * K
-    if tol == 0.0:
-        # zero spectrum (the bracket kernel's hi == 0 shortcut already wrote
-        # the answer): with tol == 0 the zero-pivot guard would miscount the
-        # negative side, so keep the bracket kernel's result.
-        return
     d0 = tl.load(D + base)
     q1h, q1l = _df64_add(d0, 0.0, -tol, 0.0)
-    q2h, q2l = _df64_add(d0, 0.0, tol, 0.0)
+    q2h, q2l = _df64_add(d0, 0.0, -xn, 0.0)
     zero1 = (q1h == 0.0) & (q1l == 0.0)
     q1h = tl.where(zero1, -1.1754944e-38, q1h)
     q1l = tl.where(zero1, 0.0, q1l)
@@ -2749,7 +2796,7 @@ def _mr_sturm_final_tridiag_kernel(D, E, TOL2, FLAG, OUT, K):
         s1h, s1l = _df64_add(di, 0.0, -tol, 0.0)
         q1h, q1l = _df64_add(s1h, s1l, -qd1h, -qd1l)
         qd2h, qd2l = _df64_div_ds(eih, eil, q2h, q2l)
-        s2h, s2l = _df64_add(di, 0.0, tol, 0.0)
+        s2h, s2l = _df64_add(di, 0.0, -xn, 0.0)
         q2h, q2l = _df64_add(s2h, s2l, -qd2h, -qd2l)
         zero1 = (q1h == 0.0) & (q1l == 0.0)
         q1h = tl.where(zero1, -1.1754944e-38, q1h)
@@ -2894,6 +2941,29 @@ def _bidiag_run(ws, matrix, atol_tensor, rtol_tensor, m, n, k, rows,
 # (measured: 300 captured launches replay in 286us vs 124ms direct).
 # Buffers are persistent per cache entry; only the input matrix and the
 # tolerances are copied in per call, and the rank out of it.
+#
+# Concurrency: the cache key includes the current stream (a capture is only
+# valid on its own stream), and ALL cache access (lookup, capture, staging
+# copy, replay) is serialized by a module-level lock -- otherwise two
+# threads calling with the same shape on the same device would race on the
+# shared staging/tolerance/out buffers.  Eviction is FIFO-one (the dict
+# preserves insertion order), not clear-all: shape churn beyond
+# _*_GRAPH_MAX_ENTRIES re-captures one entry instead of all of them.
+_GRAPH_LOCK = threading.Lock()
+
+
+def _current_stream_key(device):
+    try:
+        stream = torch.npu.current_stream(device)
+        for attr in ("cuda_stream", "npu_stream", "stream_id"):
+            handle = getattr(stream, attr, None)
+            if handle is not None:
+                return handle
+        return id(stream)
+    except Exception:
+        return None
+
+
 _BIDIAG_GRAPHS = {}
 _BIDIAG_GRAPH_MAX_ENTRIES = 16
 
@@ -2933,51 +3003,56 @@ def _launch_bidiag_rank(
                 )
                 out.copy_(ws["out"].reshape(out.shape))
                 return out
-            key = (m, n, batch_count, hermitian, input.device.index)
-            ent = _BIDIAG_GRAPHS.get(key)
-            if ent is None:
-                ws = _bidiag_workspace(dev, batch_count, k, rows)
-                staging = torch.empty(
-                    (batch_count, m, n), dtype=torch.float32, device=dev
-                )
-                staging.copy_(matrix)
-                ws["atol"].copy_(atol_tensor)
-                ws["rtol"].copy_(rtol_tensor)
-                # warm-up run: compiles every kernel/specialization (compile
-                # is illegal during capture) and fills _FAST_LAUNCH_CACHE
-                _bidiag_run(
-                    ws, staging, ws["atol"], ws["rtol"], m, n, k, rows,
-                    batch_count, hermitian,
-                )
-                torch.npu.synchronize()
-                graph = torch.npu.NPUGraph()
-                try:
-                    with torch.npu.graph(graph):
-                        _bidiag_run(
-                            ws, staging, ws["atol"], ws["rtol"], m, n, k,
-                            rows, batch_count, hermitian,
-                        )
-                except Exception:
-                    logger.warning(
-                        "NPUGraph capture failed for matrix_rank bidiag "
-                        "shape (%d, %d); falling back to direct launches",
-                        m, n,
+            key = (
+                m, n, batch_count, hermitian, input.device.index,
+                _current_stream_key(input.device),
+            )
+            with _GRAPH_LOCK:
+                ent = _BIDIAG_GRAPHS.get(key)
+                if ent is None:
+                    ws = _bidiag_workspace(dev, batch_count, k, rows)
+                    staging = torch.empty(
+                        (batch_count, m, n), dtype=torch.float32, device=dev
                     )
+                    staging.copy_(matrix)
+                    ws["atol"].copy_(atol_tensor)
+                    ws["rtol"].copy_(rtol_tensor)
+                    # warm-up run: compiles every kernel/specialization
+                    # (compile is illegal during capture) and fills
+                    # _FAST_LAUNCH_CACHE
                     _bidiag_run(
                         ws, staging, ws["atol"], ws["rtol"], m, n, k, rows,
                         batch_count, hermitian,
                     )
-                    out.copy_(ws["out"].reshape(out.shape))
-                    return out
-                if len(_BIDIAG_GRAPHS) >= _BIDIAG_GRAPH_MAX_ENTRIES:
-                    _BIDIAG_GRAPHS.clear()
-                _BIDIAG_GRAPHS[key] = (ws, staging, graph)
-            ws, staging, graph = _BIDIAG_GRAPHS[key]
-            staging.copy_(matrix)
-            ws["atol"].copy_(atol_tensor)
-            ws["rtol"].copy_(rtol_tensor)
-            graph.replay()
-            out.copy_(ws["out"].reshape(out.shape))
+                    torch.npu.synchronize()
+                    graph = torch.npu.NPUGraph()
+                    try:
+                        with torch.npu.graph(graph):
+                            _bidiag_run(
+                                ws, staging, ws["atol"], ws["rtol"], m, n, k,
+                                rows, batch_count, hermitian,
+                            )
+                    except Exception:
+                        logger.warning(
+                            "NPUGraph capture failed for matrix_rank bidiag "
+                            "shape (%d, %d); falling back to direct launches",
+                            m, n,
+                        )
+                        _bidiag_run(
+                            ws, staging, ws["atol"], ws["rtol"], m, n, k, rows,
+                            batch_count, hermitian,
+                        )
+                        out.copy_(ws["out"].reshape(out.shape))
+                        return out
+                    if len(_BIDIAG_GRAPHS) >= _BIDIAG_GRAPH_MAX_ENTRIES:
+                        _BIDIAG_GRAPHS.pop(next(iter(_BIDIAG_GRAPHS)))
+                    _BIDIAG_GRAPHS[key] = (ws, staging, graph)
+                ws, staging, graph = _BIDIAG_GRAPHS[key]
+                staging.copy_(matrix)
+                ws["atol"].copy_(atol_tensor)
+                ws["rtol"].copy_(rtol_tensor)
+                graph.replay()
+                out.copy_(ws["out"].reshape(out.shape))
     finally:
         if saved_all_blocks is not None:
             os.environ["TRITON_ALL_BLOCKS_PARALLEL"] = saved_all_blocks
@@ -2986,6 +3061,36 @@ def _launch_bidiag_rank(
 
 _TRIDIAG_GRAPHS = {}
 _TRIDIAG_GRAPH_MAX_ENTRIES = 16
+
+
+def _tridiag_workspace(dev, batch_count, k, rows):
+    # Slim variant of _bidiag_workspace: the one-sided tridiagonalization
+    # needs no U/ddbuf/eebuf/taur (those are bidiag-only), saving ~40% of
+    # the per-entry memory.
+    kp = triton.cdiv(k, 64) * 64 + 64
+    rs = triton.cdiv(rows, 64) * 64 + 64
+    block_k = max(triton.next_power_of_2(k), 64)
+    return {
+        "kp": kp,
+        "rs": rs,
+        "wpitch": kp * rs,
+        "block_k": block_k,
+        "W": torch.zeros((batch_count, kp, rs), dtype=torch.float32, device=dev),
+        "V": torch.zeros((batch_count, kp, rs), dtype=torch.float32, device=dev),
+        "dbuf": torch.zeros((batch_count, k), dtype=torch.float32, device=dev),
+        "ebuf": torch.zeros((batch_count, k), dtype=torch.float32, device=dev),
+        "taul": torch.zeros((batch_count, k), dtype=torch.float32, device=dev),
+        "nrm2": torch.empty((batch_count, k), dtype=torch.float32, device=dev),
+        "frob": torch.zeros((batch_count,), dtype=torch.float32, device=dev),
+        "acc": torch.zeros(
+            (batch_count, kp + 64), dtype=torch.float32, device=dev
+        ),
+        "tol2": torch.empty((batch_count,), dtype=torch.float32, device=dev),
+        "flag": torch.empty((batch_count,), dtype=torch.int64, device=dev),
+        "atol": torch.empty((batch_count,), dtype=torch.float32, device=dev),
+        "rtol": torch.empty((batch_count,), dtype=torch.float32, device=dev),
+        "out": torch.empty((batch_count,), dtype=torch.int64, device=dev),
+    }
 
 
 def _tridiag_run(ws, matrix, atol_tensor, rtol_tensor, m, n, k, rows,
@@ -3053,56 +3158,60 @@ def _launch_tridiag_big_rank(
     try:
         with torch_device_fn.device(input.device):
             if os.environ.get("FLAGGEMS_MR_NO_GRAPH") == "1":
-                ws = _bidiag_workspace(dev, batch_count, k, rows)
+                ws = _tridiag_workspace(dev, batch_count, k, rows)
                 _tridiag_run(
                     ws, matrix, atol_tensor, rtol_tensor, m, n, k, rows,
                     batch_count,
                 )
                 out.copy_(ws["out"].reshape(out.shape))
                 return out
-            key = (m, n, batch_count, input.device.index)
-            ent = _TRIDIAG_GRAPHS.get(key)
-            if ent is None:
-                ws = _bidiag_workspace(dev, batch_count, k, rows)
-                staging = torch.empty(
-                    (batch_count, m, n), dtype=torch.float32, device=dev
-                )
-                staging.copy_(matrix)
-                ws["atol"].copy_(atol_tensor)
-                ws["rtol"].copy_(rtol_tensor)
-                _tridiag_run(
-                    ws, staging, ws["atol"], ws["rtol"], m, n, k, rows,
-                    batch_count,
-                )
-                torch.npu.synchronize()
-                graph = torch.npu.NPUGraph()
-                try:
-                    with torch.npu.graph(graph):
-                        _tridiag_run(
-                            ws, staging, ws["atol"], ws["rtol"], m, n, k,
-                            rows, batch_count,
-                        )
-                except Exception:
-                    logger.warning(
-                        "NPUGraph capture failed for matrix_rank tridiag "
-                        "shape (%d, %d); falling back to direct launches",
-                        m, n,
+            key = (
+                m, n, batch_count, input.device.index,
+                _current_stream_key(input.device),
+            )
+            with _GRAPH_LOCK:
+                ent = _TRIDIAG_GRAPHS.get(key)
+                if ent is None:
+                    ws = _tridiag_workspace(dev, batch_count, k, rows)
+                    staging = torch.empty(
+                        (batch_count, m, n), dtype=torch.float32, device=dev
                     )
+                    staging.copy_(matrix)
+                    ws["atol"].copy_(atol_tensor)
+                    ws["rtol"].copy_(rtol_tensor)
                     _tridiag_run(
                         ws, staging, ws["atol"], ws["rtol"], m, n, k, rows,
                         batch_count,
                     )
-                    out.copy_(ws["out"].reshape(out.shape))
-                    return out
-                if len(_TRIDIAG_GRAPHS) >= _TRIDIAG_GRAPH_MAX_ENTRIES:
-                    _TRIDIAG_GRAPHS.clear()
-                _TRIDIAG_GRAPHS[key] = (ws, staging, graph)
-            ws, staging, graph = _TRIDIAG_GRAPHS[key]
-            staging.copy_(matrix)
-            ws["atol"].copy_(atol_tensor)
-            ws["rtol"].copy_(rtol_tensor)
-            graph.replay()
-            out.copy_(ws["out"].reshape(out.shape))
+                    torch.npu.synchronize()
+                    graph = torch.npu.NPUGraph()
+                    try:
+                        with torch.npu.graph(graph):
+                            _tridiag_run(
+                                ws, staging, ws["atol"], ws["rtol"], m, n, k,
+                                rows, batch_count,
+                            )
+                    except Exception:
+                        logger.warning(
+                            "NPUGraph capture failed for matrix_rank tridiag "
+                            "shape (%d, %d); falling back to direct launches",
+                            m, n,
+                        )
+                        _tridiag_run(
+                            ws, staging, ws["atol"], ws["rtol"], m, n, k,
+                            rows, batch_count,
+                        )
+                        out.copy_(ws["out"].reshape(out.shape))
+                        return out
+                    if len(_TRIDIAG_GRAPHS) >= _TRIDIAG_GRAPH_MAX_ENTRIES:
+                        _TRIDIAG_GRAPHS.pop(next(iter(_TRIDIAG_GRAPHS)))
+                    _TRIDIAG_GRAPHS[key] = (ws, staging, graph)
+                ws, staging, graph = _TRIDIAG_GRAPHS[key]
+                staging.copy_(matrix)
+                ws["atol"].copy_(atol_tensor)
+                ws["rtol"].copy_(rtol_tensor)
+                graph.replay()
+                out.copy_(ws["out"].reshape(out.shape))
     finally:
         if saved_all_blocks is not None:
             os.environ["TRITON_ALL_BLOCKS_PARALLEL"] = saved_all_blocks
@@ -3207,51 +3316,48 @@ def _launch_matrix_rank(input, atol, rtol, hermitian):
                 input,
                 hermitian,
             )
-        elif hermitian:
-            # hermitian k > 64: one-sided Householder tridiagonalization +
-            # eigenvalue-domain Sturm count (|lambda| > tol via +/-tol qd
-            # chains, decisive pass in df64).  Exact AND faster than RRQR
-            # at every measured size -- the default for all large
-            # hermitian inputs.
-            if atol_tensor is None:
-                atol_tensor, rtol_tensor = _prepare_tolerances(input, atol, rtol)
-            _launch_tridiag_big_rank(
-                matrix,
-                atol_tensor,
-                rtol_tensor,
-                out,
-                m,
-                n,
-                k,
-                rows,
-                batch_count,
-                input,
-            )
         elif k > _RRQR_MAX_K or os.environ.get("FLAGGEMS_MR_EXACT_PATH") == "1":
-            # general k > 128: unblocked Golub-Kahan bidiagonalization +
-            # df64 Sturm count -- SVD-accurate and >= 0.8x torch at every
-            # measured size (0.85x at 128^2 borderline excluded by the
-            # threshold, 1.1x/1.75x at 256^2/512^2, 2.6x at 1024^2).  The
-            # env var forces this path for general 65..128 (validation).
+            # k >= 256 (or 65..255 under the opt-in env): the exact paths.
+            # hermitian: one-sided Householder tridiagonalization +
+            # eigenvalue-domain Sturm count (|lambda| > tol via +/-tol qd
+            # chains, decisive pass in df64).  general: unblocked Golub-Kahan
+            # bidiagonalization + df64 Sturm.  Both SVD-accurate and >= 0.8x
+            # torch at every measured size in this band (general 1.1x/1.75x
+            # at 256^2/512^2, 2.7x at 1024^2; herm 2.0x/4.0x, 6.9x at 1024^2).
             if atol_tensor is None:
                 atol_tensor, rtol_tensor = _prepare_tolerances(input, atol, rtol)
-            _launch_bidiag_rank(
-                matrix,
-                atol_tensor,
-                rtol_tensor,
-                out,
-                m,
-                n,
-                k,
-                rows,
-                batch_count,
-                input,
-                hermitian,
-            )
+            if hermitian:
+                _launch_tridiag_big_rank(
+                    matrix,
+                    atol_tensor,
+                    rtol_tensor,
+                    out,
+                    m,
+                    n,
+                    k,
+                    rows,
+                    batch_count,
+                    input,
+                )
+            else:
+                _launch_bidiag_rank(
+                    matrix,
+                    atol_tensor,
+                    rtol_tensor,
+                    out,
+                    m,
+                    n,
+                    k,
+                    rows,
+                    batch_count,
+                    input,
+                    hermitian,
+                )
         else:
-            # general 65..128: pure-Triton blocked Householder QR
-            # (unpivoted); the rank is read off the |R_ii| diagonal.
-            # There is no aclnn/native decomposition fallback anywhere.
+            # 65..255 (hermitian and general): pure-Triton blocked
+            # Householder QR (unpivoted); the rank is read off the |R_ii|
+            # diagonal.  There is no aclnn/native decomposition fallback
+            # anywhere.
             if atol_tensor is None:
                 atol_tensor, rtol_tensor = _prepare_tolerances(input, atol, rtol)
             _launch_rrqr_rank(
