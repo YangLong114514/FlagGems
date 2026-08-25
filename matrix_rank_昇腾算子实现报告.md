@@ -6,7 +6,7 @@
 > 软件:CANN 8.5.0、triton-ascend 3.2.0(BiShengIR)、torch 2.6.0+cpu / torch_npu 2.6.0rc1
 > 目标:`torch.linalg.matrix_rank` 在 NPU 上的 speedup ≥ 0.8
 >
-> **阅读指引**:第一至三章是设计/优化的主体内容,其中 §1.4 已更新为**当前最终 dispatch**;第一阶段的原始结构保留在附录 C。第二至第六阶段是按时间顺序的演进记录(RRQR → 精确大矩阵路径 → hermitian 基线修正与小矩阵优化 → 评审修复与工具链退化处置 → 精确路径推广),各阶段内的"当前状态"描述以写作时为准,最终以 §0 总结 + §1.4 + 第六阶段为准。
+> **阅读指引**:第一至三章是设计/优化的主体内容,其中 §1.4 已更新为**当前最终 dispatch**;第一阶段的原始结构保留在附录 C。第二至第九阶段是按时间顺序的演进记录(RRQR → 精确大矩阵路径 → hermitian 基线修正与小矩阵优化 → 评审修复与工具链退化处置 → 精确路径推广 → 默认分发切换 → 三轮评审修复),各阶段内的"当前状态"描述以写作时为准,最终以 §0 总结 + §1.4 + 第九阶段为准。
 
 ---
 
@@ -27,12 +27,12 @@
 | herm k ≥ 256 | **单边三对角化 + ±tol df64 Sturm**(精确)| 2.0~7.1× |
 | 非 herm k ≥ 256 | **非分块 GK 双对角化 + df64 Sturm**(精确)| 1.1~2.7× |
 
-**性能(验收口径 `benchmark --mode operator`,默认分发,48 项全部 SUCCESS)**:general 全部 ≥ 0.93;hermitian 除两个历史边际 shape(33×33、17×17,多轮 0.71~0.98 波动,共享机器噪声)外 ≥ 0.89。大矩阵:general 1024² 2.68×、512² 1.77×;herm 1024² 6.94×、512² 3.92×。
+**性能(验收口径 `benchmark --mode operator`,默认分发,扩展 benchmark 67 项全部 SUCCESS)**:general 算术 2.40/几何 1.98,herm 2.12/1.71;<0.8 的仅 (129,2048)/(2048,129) 0.38/0.41(长行中 k 的固有地板,两条路径同源,见第八阶段 §5)与小 herm 边际 shape(16²/17²/33²,多轮 0.75~0.98 抖动,共享机器噪声)。大矩阵:general 1024² 2.71×、512² 1.74×;herm 1024² 7.00×、512² 3.88×。
 
 **正确性(最终态)**:
-- 官方套件 92 passed / 6 skipped(fp64 与 complex 按环境跳过),默认/exact 双模式一致。
+- 官方套件 128 passed / 6 skipped(fp64 与 complex 按环境跳过),默认分发;严格阈值/负容差用例内部固定 EXACT env 覆盖精确 herm 路径。
 - 366 例全路径扫描(默认 dispatch,完整失败清单已核对):48 例 = **46 例例外①的 Gram σ² 域地板**(长维 k≤64 缓衰减低秩谱高估,文档化)+ **2 例 (3,3)/(7,7) fp32 噪声区边界**(fp32 参考自身即与 fp64 不一致,exact 模式下同样失败,与分发无关);无任何清晰谱失败。
-- herm 专项压力 34/34(近阈值 ±tol 双符号簇、低秩、缓衰减、零矩阵、垃圾上三角、batch)。
+- herm 专项压力 34/34(近阈值 ±tol 双符号簇、低秩、缓衰减、零矩阵、垃圾上三角、batch;内部固定 `FLAGGEMS_MR_EXACT_PATH=1` 以覆盖精确 herm 路径)。
 - bidiag64 σ 直验 121/121(~6e-8);QR 频段对抗 22/22;非方阵回归 11 例。
 
 **过程中修复的四个真实生产缺陷**:① fp32 dd/ee 把平方域地板带回决定性计数(k≥513,近阈值判错);② fused kernel 非方阵丢尾能量(预存,官方测试从未覆盖);③ 评审指出的零矩阵未初始化读取 / hermitian 未守下三角语义 / Sturm 同 kernel 写后读 / fp64 fail-fast 顺序;④ 大路径 host enqueue 瓶颈(NPUGraph 化,replay ~1μs/launch)。
@@ -61,7 +61,8 @@
 11. [第六阶段:精确路径推广](#第六阶段精确路径推广bidiag64--非方阵修复--df64-地板修复--qr-压缩--npugraph)
 12. [第七阶段:默认分发正式切换](#第七阶段默认分发正式切换阶段-4-落地)
 13. [第八阶段:评审修复第二轮(严格阈值/测试进仓库/图加固)](#第八阶段评审修复第二轮严格阈值测试进仓库npug-加固)
-14. [附录 A/B/C](#附录-a改动文件清单)
+14. [第九阶段:评审修复第三轮(严格阈值最终形式/NB=3 遗漏/负容差)](#第九阶段评审修复第三轮严格阈值的最终形式--nb3-遗漏--负容差语义)
+15. [附录 A/B/C](#附录-a改动文件清单)
 
 ---
 
@@ -171,7 +172,7 @@ for j in 0..K-2:
 
 > 本节描述**当前代码**的真实 dispatch;第一阶段的原始结构(k≤64 统一双对角化 + svdvals 兜底)保留在附录 C 供溯源。
 
-全局原则:**所有秩计算都由本文件的 Triton kernel 完成,没有任何 aclnn/native 分解兜底**(svdvals 兜底已于第二阶段删除)。唯一的 host 侧 aten 调用是 hermitian 33~64 路径的 padding 与下三角对称化(zeros/where/arange,不做分解)。fp64 在所有 shape dispatch 之前 fail-fast(`NotImplementedError`:triton-ascend 无法编译 fp64 kernel,aclnn svd_npu 也仅支持 fp32)。
+全局原则:**所有秩计算都由本文件的 Triton kernel 完成,没有任何 aclnn/native 分解兜底**(svdvals 兜底已于第二阶段删除)。唯一的 host 侧 aten 调用是 hermitian 33~64 路径的 padding 与下三角对称化(zeros/where/arange,不做分解),以及双负容差修正(atol<0 且 rtol<0 时 tol<0,torch 不钳制,非零矩阵秩 = k;由 `_launch_matrix_rank` 返回前统一改写,kernel 计数公式均假设 tol ≥ 0——第九阶段)。fp64 在所有 shape dispatch 之前 fail-fast(`NotImplementedError`:triton-ascend 无法编译 fp64 kernel,aclnn svd_npu 也仅支持 fp32)。
 
 ```
 linalg_matrix_rank(input, *, atol, rtol, hermitian)
@@ -1110,3 +1111,43 @@ torch 语义:rank = #{λ > tol} + #{λ < −tol}(两侧都严格)。Sturm qd 递
 - **新发现的性能缺口(扩展 benchmark 首次测量)**:(129,2048)/(2048,129) 仅 0.38/0.40——rows≥1024 且 k∈65~255 的形状,无主元 QR 的 GM panel 每步 O(rows) 串行是墙;exact 双对角化路径同样每步 O(rows)(实测 0.52)。两条路径都达不到 0.8,属"长行中 k"这一 shape 类的固有地板,与长维 k≤64 的缺口同源。已在文档记录,如需根治方向是块化 panel(GEMM 尾随更新已在,瓶颈在未块化的 panel 内因式分解)。
 - 扩展 benchmark(67 项,默认分发):general 算术 2.35/几何 1.93,herm 2.09/1.71,全部 2.28/1.86;<0.8 的仅上述 2 个长行 shape + herm 33×33(0.78,历史边际抖动 shape,多轮中位数 ~0.8)。
 - 本轮再次踩中共享机器的编译污染(缺陷 10):`_mr_rrqr_panel_reg_kernel` 同一源码同一环境前一天编译成功、次日 UB overflow,重跑即恢复——评审环境与生产环境的编译可复现性仍依赖缓存与运气,这是工具链代际问题,非代码问题。
+
+---
+
+# 第九阶段:评审修复第三轮(严格阈值的最终形式 / NB=3 遗漏 / 负容差语义)
+
+> 背景:第三轮外部评审指出 ① `_neg_strict_shift` 的算术 shift 不是真正的 pred(−tol)(correctness blocker)② 长维 exact QR 压缩 launcher 漏了 NB 的 2 幂钳制 ③ 报告/benchmark 注释/文件头与 255 阈值不同步。排查 ① 的测试设计时又发现一个 torch 语义的预存缺口:双负容差。
+
+## 1. `_neg_strict_shift` 不是 pred(−tol):算术 shift 的 ULP 跳跃随尾数变化
+
+第八阶段的修复用 `−tol×(1+2eps)` 逼近"恰好小于 −tol 的 fp32 格点"。这是错的,且错得确定:
+
+- **tol = 0.5**(2 的幂):乘积精确等于 0.5+2·ULP,**向下跳 2 格**,恰好跳过 pred(−0.5)。确定性反例:特征值取 `nextafter(−0.5, −inf)` = −(0.5+2⁻²⁴),atol=0.5 时应计入(λ < −tol),旧 shift 把它漏掉,rank 差 1。
+- **tol = 0.75**(尾数低位已置位):乘积仍是精确值,**跳 3 格**。
+- **tol = 最小次正规数**(1.4e-45):乘积舍回原值,**跳 0 格**,λ = −2×minsub 被漏计。
+
+跳几格取决于 tol 的尾数,不存在对一切 tol 都正确的算术 shift;位操作 nextafter 此前已验证在此后端误编译(标量 bitcast 把 −0.0 变成 NaN)。**正确做法不是在格点上逼近 predecessor,而是换零主元约定本身**:qd 递推里零主元换成 tiny **正**值(DLANEG 约定的镜像),计数语义就从 #{λ ≤ x} 变成严格的 #{λ < x}——直接在 x = −tol 处计数,对一切 tol 精确,包括 0(给出 #{λ < 0})、次正规数、以及负 tol。新增 `_sturm_count_strict` / `_sturm_count_posneg2` / `_sturm_count_strict_reg` / `_sturm_count_posneg_reg2` 四个 helper(单链与"正侧 ≤、负侧 <"的混合双链各一,GM 与寄存器各一),四条 herm 路径(k≤32 融合、33~64 padded、大 herm 三对角 bracket、df64 final)的负侧全部切换,`_neg_strict_shift` 删除;df64 final 的负链零主元守卫同步反向。正侧 `K − #{λ ≤ tol}` 本来就是严格的,不动。
+
+## 2. NB=3 修复漏了一条同源路径
+
+第八阶段把主 QR launcher 的 `nb = max(1, rs//64)` 改成 2 幂钳制,但**长维 exact QR 压缩 launcher**(`_launch_longdim_rank`,`FLAGGEMS_MR_EXACT_PATH=1` 下 (129,64)/(64,129) 这类 shape 的必经之路)漏改:rs=192 时 NB=3 仍会进 UB 分配彩票。已复用同一钳制 `min(4, next_power_of_2(...))`,并补 (129,64)/(64,129)/(192,64)/(64,192) 的 exact 回归测试。
+
+## 3. 新发现的预存语义缺口:双负容差(tol < 0)
+
+torch 对容差**不做下界钳制**:tol = max(atol, rtol·σmax)。实测确认(CPU):
+
+- tol < 0 只在 **atol < 0 且 rtol < 0**(逐 batch 元素)时可达到;此时所有 σ ≥ 0 > tol,非零矩阵秩 = k;
+- 零矩阵仍是 0(rtol·0 = 0 把 tol 顶回 max(atol, 0) = 0);
+- 单独 atol < 0 或 rtol < 0 无害(max 的另一侧 ≥ 0)。
+
+kernel 内计数公式都假设 tol ≥ 0:herm 拆分 #{|λ|>tol} = #{λ>tol} + #{λ<−tol} 在 tol<0 时两个区间重叠、双重计数(rank 可超过 k);σ² 域路径会把 tol 平方。**修复放在 host 侧**(`_launch_matrix_rank` 返回前):检测双负(标量快路径直接判,张量按 batch 判),命中时用 `abs().amax()>0` 挑出非零 batch 元素把秩改写为 k。正常路径零开销;这比在十余处 kernel 计数点插守卫在这条脆弱工具链上安全得多。配套测试:k = 3/33/65/257 × herm on/off,覆盖三种符号组合、零矩阵、混合 batch 逐元素容差。
+
+## 4. 文档/注释同步
+
+benchmark 形状表注释(129 边界→256 边界,129 段标注为"长行中 k"低谷采样)、算子文件头 dispatch 段(64<k≤512 → 64<k≤255,k≥513 → k>255)、`_launch_rrqr_rank`/`_launch_bidiag_rank` docstring、本报告 §0 摘要数字。
+
+## 5. 验证
+
+- 新增/扩展 17 项全部通过(严格阈值扩展 k=3/33/65/128/257:pred(−0.5)、pred(−0.75)、minsub 三组一格之内用例;负容差 8 项;NB=3 回归 4 项)。
+- 官方套件 128 passed / 6 skipped(默认分发);三套扫描 3/3(366 例全路径 + herm 34 + QR 对抗 22,`FLAGGEMS_MR_SWEEP=1`)。
+- 扩展 benchmark 复跑 67/67 SUCCESS:general 算术 2.40/几何 1.98,herm 2.12/1.71——与第八阶段持平(strict 计数改了四条 herm 热路径的链结构但链数不变,性能中性,实测确认)。<0.8 项不变:(129,2048)/(2048,129) 与小 herm 边际 shape(16²/17²/33² 抖动)。

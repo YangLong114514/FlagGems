@@ -40,8 +40,10 @@ MATRIX_RANK_COMPREHENSIVE_SHAPES = [
     (1024, 32),
     (64, 512),
     (512, 64),
-    # Default-dispatch boundary band (general RRQR -> bidiag at k = 129):
-    # 65..127 stay on unpivoted QR, 129+ on the exact bidiagonalization.
+    # Default-dispatch band (QR -> exact paths at k = 256): 65..255 stay on
+    # unpivoted QR, 256+ on the exact bidiagonalization/tridiagonalization.
+    # 65..192 are sampled densely because the exact paths have tile-edge
+    # performance dips there (which is why the boundary sits at 256).
     (65, 65),
     (80, 80),
     (96, 96),
@@ -58,7 +60,9 @@ MATRIX_RANK_COMPREHENSIVE_SHAPES = [
     (512, 1024),
     (1024, 512),
     (1024, 1024),
-    # Non-square shapes across the k = 129 dispatch boundary.
+    # Non-square shapes straddling the middle of the QR band (k = 129 is the
+    # long-row / mid-k worst case: the QR panel and the bidiagonalization
+    # both pay O(rows) per step).
     (129, 512),
     (512, 129),
     (129, 2048),
@@ -88,8 +92,9 @@ MATRIX_RANK_HERMITIAN_CORE_SHAPES = [
 ]
 
 MATRIX_RANK_HERMITIAN_COMPREHENSIVE_SHAPES = [
-    # herm 65+ uses the one-sided tridiagonalization (default since the
-    # stage-4 dispatch switch); 65/129/257 sample its coverage.
+    # herm 65..255 uses unpivoted QR by default and 256+ the one-sided
+    # tridiagonalization (since the stage-8 dispatch switch); 65/129/257
+    # sample both sides of the boundary.
     (65, 65),
     (128, 128),
     (129, 129),

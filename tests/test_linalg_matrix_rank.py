@@ -961,6 +961,25 @@ def test_linalg_matrix_rank_hermitian_strict_threshold(k, monkeypatch):
 
     # negative tie: lambda == -tol must NOT be counted
     diag_case(torch.tensor([1.0, -0.5] + [0.0] * (k - 2)), 0.5, 0.0)
+    # one ULP below the tie: pred(-tol) MUST be counted.  An arithmetic
+    # threshold shift (-tol*(1+2eps)) lands 2-3 ULP below -tol depending on
+    # tol's mantissa (2 ULP for tol=0.5, 3 ULP for tol=0.75) and would
+    # wrongly skip this eigenvalue; only the mirrored zero-pivot tie
+    # convention (zero pivot -> tiny positive) counts it exactly.
+    pred_half = torch.nextafter(
+        torch.tensor(-0.5, dtype=torch.float32),
+        torch.tensor(float("-inf"), dtype=torch.float32),
+    ).item()
+    diag_case(torch.tensor([1.0, pred_half] + [0.0] * (k - 2)), 0.5, 0.0)
+    pred_3q = torch.nextafter(
+        torch.tensor(-0.75, dtype=torch.float32),
+        torch.tensor(float("-inf"), dtype=torch.float32),
+    ).item()
+    diag_case(torch.tensor([1.0, pred_3q] + [0.0] * (k - 2)), 0.75, 0.0)
+    # smallest-subnormal tolerance: an arithmetic shift rounds back onto
+    # -tol itself (0 ULP), wrongly skipping lambda = -2*minsub.
+    minsub = 1.401298464324817e-45  # smallest positive fp32 subnormal
+    diag_case(torch.tensor([1.0, -2.0 * minsub] + [0.0] * (k - 2)), minsub, 0.0)
     # positive tie: lambda == +tol must NOT be counted
     diag_case(torch.tensor([0.5, -1.0] + [0.0] * (k - 2)), 0.5, 0.0)
     # atol == rtol == 0 on a nonzero rank-deficient spectrum: #{|lam| > 0}
@@ -1002,6 +1021,89 @@ def test_linalg_matrix_rank_hermitian_strict_threshold(k, monkeypatch):
         matrix.to(device), hermitian=True, atol=atol, rtol=rtol
     )
     utils.gems_assert_equal(result, reference.to(device))
+
+
+@pytest.mark.linalg_matrix_rank
+@pytest.mark.skipif(not IS_ASCEND, reason="Ascend-specific path coverage")
+@pytest.mark.parametrize("k", [3, 33, 65, 257])
+@pytest.mark.parametrize("hermitian", [False, True])
+def test_linalg_matrix_rank_negative_tolerances(k, hermitian):
+    # torch does not clamp the tolerance: tol = max(atol, rtol*sigma_max).
+    # tol < 0 is reachable only when BOTH atol < 0 and rtol < 0, and then
+    # every singular value (>= 0) exceeds tol -> rank == k for a nonzero
+    # matrix; a zero matrix still gives 0 because rtol*0 == 0 lifts tol to
+    # max(atol, 0) == 0.  A negative atol alone is harmless (rtol*sigma_max
+    # >= 0 dominates the max).  The backend fixes the both-negative corner
+    # up host-side; without it the hermitian split #{|lam|>tol} =
+    # #{lam>tol} + #{lam<-tol} double-counts the overlap (rank > k) and the
+    # sigma^2-domain paths square tol.
+    device = flag_gems.device
+    values = torch.zeros(k)
+    values[:2] = torch.tensor([1.0, -0.5])
+    matrix = torch.diag(values).to(torch.float32).to(device)
+    zero = torch.zeros(k, k, dtype=torch.float32, device=device)
+
+    def check(mat, atol, rtol):
+        reference = torch.linalg.matrix_rank(
+            mat.double().cpu(), hermitian=hermitian, atol=atol, rtol=rtol
+        )
+        result = flag_gems.linalg_matrix_rank(
+            mat, hermitian=hermitian, atol=atol, rtol=rtol
+        )
+        utils.gems_assert_equal(result, reference.to(device))
+
+    # negative atol alone: behaves as atol = 0
+    check(matrix, -1.0, 0.0)
+    # negative rtol alone: behaves as rtol = 0
+    check(matrix, 0.0, -1.0)
+    # both negative: tol < 0 -> every singular value counts -> full rank
+    check(matrix, -1.0, -1.0)
+    # both negative on a zero matrix: tol == 0 -> rank 0
+    check(zero, -1.0, -1.0)
+
+    # batch + per-batch tensor tolerances mixing all three regimes
+    batch = torch.stack([matrix, zero, matrix])
+    atol_t = torch.tensor([-1.0, -1.0, 0.0], device=device)
+    rtol_t = torch.tensor([-1.0, -1.0, 0.0], device=device)
+    reference = torch.linalg.matrix_rank(
+        batch.double().cpu(), hermitian=hermitian, atol=atol_t.cpu(), rtol=rtol_t.cpu()
+    )
+    result = flag_gems.linalg_matrix_rank(
+        batch, hermitian=hermitian, atol=atol_t, rtol=rtol_t
+    )
+    utils.gems_assert_equal(result, reference.to(device))
+
+
+@pytest.mark.linalg_matrix_rank
+@pytest.mark.skipif(not IS_ASCEND, reason="Ascend-specific path coverage")
+@pytest.mark.parametrize("shape", [(129, 64), (64, 129), (192, 64), (64, 192)])
+def test_linalg_matrix_rank_longdim_exact_power2_nb(shape, monkeypatch):
+    # Long-dimension k <= 64 under FLAGGEMS_MR_EXACT_PATH=1 QR-compresses to
+    # the k x k R factor with the register panel kernel; for these shapes
+    # rs = round_up(max(m, n), 64) = 192, and a raw NB = rs // 64 = 3
+    # specialization is a marginal UB allocation that flip-flops between
+    # fitting and "ub overflow" across compiles.  The launcher must clamp NB
+    # to {1, 2, 4} (same as the main QR launcher).
+    monkeypatch.setenv("FLAGGEMS_MR_EXACT_PATH", "1")
+    m, n = shape
+    rank = 17
+    generator = torch.Generator().manual_seed(2026)
+    left = torch.linalg.qr(
+        torch.randn(m, rank, generator=generator, dtype=torch.float64)
+    )[0]
+    right = torch.linalg.qr(
+        torch.randn(n, rank, generator=generator, dtype=torch.float64)
+    )[0]
+    values = torch.logspace(0, -4, rank, dtype=torch.float64)
+    matrix = ((left * values) @ right.mT).to(torch.float32).to(flag_gems.device)
+
+    rtol = max(m, n) * torch.finfo(torch.float32).eps
+    reference = torch.linalg.matrix_rank(
+        matrix.to(torch.float64).cpu(), atol=0.0, rtol=rtol
+    )
+    result = flag_gems.linalg_matrix_rank(matrix)
+    _assert_output_metadata(result, matrix)
+    utils.gems_assert_equal(result, reference.to(device=matrix.device))
 
 
 @pytest.mark.linalg_matrix_rank

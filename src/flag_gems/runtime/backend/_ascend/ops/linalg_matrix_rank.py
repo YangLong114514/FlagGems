@@ -31,17 +31,17 @@ dimensions, a Householder QR compression to the k x k R factor (backward
 stable in the linear sigma domain) followed by the same bidiagonalization
 -- both ending in the shared Sturm tail whose decisive count runs in
 double-single (df64) arithmetic from the raw bidiagonal d/e; fp32 matrices
-with 64 < k <= 512 use a pure-Triton blocked Householder QR (unpivoted)
+with 64 < k <= 255 use a pure-Triton blocked Householder QR (unpivoted)
 whose |R_ii| diagonal is counted against the tolerance: rank = #{ |R_ii| >
 max(atol, rtol * sigma_max) }, with sigma_max bracketed by |R_00| and
 ||A||_F and refined by power iteration only when the two bounds disagree;
-and fp32 matrices with k >= 513 use an unblocked Golub-Kahan
+and non-hermitian fp32 matrices with k > 255 use an unblocked Golub-Kahan
 bidiagonalization plus a Sturm count whose decisive pass runs in
 double-single (df64) arithmetic (SVD-accurate); hermitian matrices with
-k > 255 (both the k >= 513 production path and the opt-in exact band) use
-a one-sided Householder tridiagonalization instead (half the reflectors of
-Golub-Kahan) with the rank counted in the eigenvalue domain by a +/-tol
-double-chain Sturm bracket and a df64 decisive pass.
+k > 255 use a one-sided Householder tridiagonalization instead (half the
+reflectors of Golub-Kahan) with the rank counted in the eigenvalue domain
+by a +/-tol double-chain Sturm bracket and a df64 decisive pass.
+FLAGGEMS_MR_EXACT_PATH=1 opts the 65..255 band into the same exact paths.
 fp64 is rejected with NotImplementedError (this toolchain cannot compile
 fp64 Triton kernels); there is no aclnn/native decomposition fallback
 anywhere -- every rank is computed by the Triton kernels in this file (the
@@ -634,23 +634,6 @@ def _matrix_rank_fused_jacobi_kernel(
 
 
 @triton.jit
-def _neg_strict_shift(tol):
-    # Negative-side shift for the hermitian strict count.  torch counts
-    # #{|lambda| > tol} = #{lambda > tol} + #{lambda < -tol}; the qd
-    # zero-pivot guard (replace a zero pivot by a tiny NEGATIVE value) makes
-    # the Sturm count #{lambda <= x}, so the positive side K - #{lambda <=
-    # tol} is already strict -- but the negative side must NOT count
-    # lambda == -tol.  Counting at a value just below -tol is exactly
-    # #{lambda < -tol} on the fp32 lattice.  (A bitcast nextafter would be
-    # exact but scalar bitcast miscompiles on this backend -- verified:
-    # -0.0 produced a NaN shift.  The arithmetic form is exact where it
-    # matters: -tol*(1+2eps) always rounds strictly below -tol for tol > 0,
-    # and the tol == 0 case gets the hardcoded -1.4e-45, i.e. #{lambda<0}.)
-    x = -tol
-    return tl.where(tol > 0.0, x * 1.0000002384185791, -1.4012985e-45)
-
-
-@triton.jit
 def _sturm_count_less(D, E, base, K: tl.constexpr, x):
     """Number of eigenvalues of the symmetric tridiagonal T = diag(d) +
     diag(e, +/-1) that are <= x, via the qd recurrence (LAPACK DLANEG
@@ -695,6 +678,62 @@ def _sturm_count_less2(D, E, base, K: tl.constexpr, x1, x2):
         q2 = (di - x2) - e2 / q2
         q1 = tl.where(q1 == 0.0, -1.1754944e-38, q1)
         q2 = tl.where(q2 == 0.0, -1.1754944e-38, q2)
+        neg1 += (q1 < 0.0).to(tl.int32)
+        neg2 += (q2 < 0.0).to(tl.int32)
+        i += 1
+    return neg1, neg2
+
+
+@triton.jit
+def _sturm_count_strict(D, E, base, K: tl.constexpr, x):
+    """STRICT variant of _sturm_count_less: counts #{lambda < x}.  Same qd
+    recurrence, but the zero-pivot guard replaces a zero pivot with a tiny
+    POSITIVE value -- the mirrored DLANEG tie convention -- so an eigenvalue
+    exactly equal to x is NOT counted.  Used for the hermitian negative side
+    #{lambda < -tol}: counting the <= variant at an arithmetically shifted
+    threshold cannot be exact on the fp32 lattice (-tol*(1+2eps) lands 0, 2
+    or 3 ULP below -tol depending on tol's mantissa, skipping representable
+    eigenvalues), and a scalar bitcast nextafter miscompiles on this
+    backend.  The mirrored tie convention needs no shift at all and is
+    exact for every tol, including 0 (#{lambda < 0}) and subnormals."""
+    q = tl.load(D + base) - x
+    q = tl.where(q == 0.0, 1.1754944e-38, q)
+    neg = (q < 0.0).to(tl.int32)
+    i = 1
+    while i < K:
+        di = tl.load(D + base + i)
+        ei = tl.load(E + base + i - 1)
+        q = (di - x) - ei * ei / q
+        q = tl.where(q == 0.0, 1.1754944e-38, q)
+        neg += (q < 0.0).to(tl.int32)
+        i += 1
+    return neg
+
+
+@triton.jit
+def _sturm_count_posneg2(D, E, base, K: tl.constexpr, xp, xn):
+    """Hermitian tolerance-bracket pair in ONE pass of the qd recurrence:
+    chain 1 counts #{lambda <= xp} (DLANEG convention: zero pivot -> tiny
+    NEGATIVE), chain 2 counts #{lambda < xn} STRICTLY (zero pivot -> tiny
+    POSITIVE, see _sturm_count_strict).  With xn = -tol the pair yields both
+    sides of #{|lambda| > tol} = K - #{<= xp} + #{< xn} with exact tie
+    semantics; pairing halves the serial K-step chain."""
+    d0 = tl.load(D + base)
+    q1 = d0 - xp
+    q2 = d0 - xn
+    q1 = tl.where(q1 == 0.0, -1.1754944e-38, q1)
+    q2 = tl.where(q2 == 0.0, 1.1754944e-38, q2)
+    neg1 = (q1 < 0.0).to(tl.int32)
+    neg2 = (q2 < 0.0).to(tl.int32)
+    i = 1
+    while i < K:
+        di = tl.load(D + base + i)
+        ei = tl.load(E + base + i - 1)
+        e2 = ei * ei
+        q1 = (di - xp) - e2 / q1
+        q2 = (di - xn) - e2 / q2
+        q1 = tl.where(q1 == 0.0, -1.1754944e-38, q1)
+        q2 = tl.where(q2 == 0.0, 1.1754944e-38, q2)
         neg1 += (q1 < 0.0).to(tl.int32)
         neg2 += (q2 < 0.0).to(tl.int32)
         i += 1
@@ -754,6 +793,57 @@ def _sturm_count_less_reg2(dd, ee, K: tl.constexpr, BLOCK: tl.constexpr, x1, x2)
 
 
 @triton.jit
+def _sturm_count_strict_reg(dd, ee, K: tl.constexpr, BLOCK: tl.constexpr, x):
+    """STRICT register-resident variant of _sturm_count_less_reg: counts
+    #{lambda < x} via the mirrored zero-pivot tie convention (zero pivot ->
+    tiny POSITIVE).  See _sturm_count_strict for why this -- and not an
+    arithmetically shifted threshold -- is the exact strict count."""
+    kidx = tl.arange(0, BLOCK)
+    q = tl.sum(tl.where(kidx < 1, dd, 0.0), axis=0) - x
+    q = tl.where(q == 0.0, 1.1754944e-38, q)
+    neg = (q < 0.0).to(tl.int32)
+    i = 1
+    while i < K:
+        di = tl.sum(tl.where((kidx > i - 1) & (kidx < i + 1), dd, 0.0), axis=0)
+        ei = tl.sum(tl.where((kidx > i - 2) & (kidx < i), ee, 0.0), axis=0)
+        q = (di - x) - ei * ei / q
+        q = tl.where(q == 0.0, 1.1754944e-38, q)
+        neg += (q < 0.0).to(tl.int32)
+        i += 1
+    return neg
+
+
+@triton.jit
+def _sturm_count_posneg_reg2(dd, ee, K: tl.constexpr, BLOCK: tl.constexpr, xp, xn):
+    """Register-resident counterpart of _sturm_count_posneg2: chain 1 counts
+    #{lambda <= xp} (zero pivot -> tiny negative), chain 2 counts
+    #{lambda < xn} STRICTLY (zero pivot -> tiny positive), in ONE pass of
+    the qd recurrence over register-resident d/e vectors (interval masks --
+    an == mask on tl.arange miscompiles on this backend)."""
+    kidx = tl.arange(0, BLOCK)
+    d0 = tl.sum(tl.where(kidx < 1, dd, 0.0), axis=0)
+    q1 = d0 - xp
+    q2 = d0 - xn
+    q1 = tl.where(q1 == 0.0, -1.1754944e-38, q1)
+    q2 = tl.where(q2 == 0.0, 1.1754944e-38, q2)
+    neg1 = (q1 < 0.0).to(tl.int32)
+    neg2 = (q2 < 0.0).to(tl.int32)
+    i = 1
+    while i < K:
+        di = tl.sum(tl.where((kidx > i - 1) & (kidx < i + 1), dd, 0.0), axis=0)
+        ei = tl.sum(tl.where((kidx > i - 2) & (kidx < i), ee, 0.0), axis=0)
+        e2 = ei * ei
+        q1 = (di - xp) - e2 / q1
+        q2 = (di - xn) - e2 / q2
+        q1 = tl.where(q1 == 0.0, -1.1754944e-38, q1)
+        q2 = tl.where(q2 == 0.0, 1.1754944e-38, q2)
+        neg1 += (q1 < 0.0).to(tl.int32)
+        neg2 += (q2 < 0.0).to(tl.int32)
+        i += 1
+    return neg1, neg2
+
+
+@triton.jit
 def _mr_sturm_rank_reg(
     dd,
     ee,
@@ -785,11 +875,11 @@ def _mr_sturm_rank_reg(
             sigma_lo = tl.maximum(tl.abs(dmax), tl.abs(tl.min(d_raw, axis=0)))
             tol_lo = tl.maximum(atol, rtol * sigma_lo)
             tol_hi = tl.maximum(atol, rtol * hi)
-            cnt_lo_p, cnt_lo_n = _sturm_count_less_reg2(
-                dd, ee, K, BLOCK, tol_lo, _neg_strict_shift(tol_lo)
+            cnt_lo_p, cnt_lo_n = _sturm_count_posneg_reg2(
+                dd, ee, K, BLOCK, tol_lo, -tol_lo
             )
-            cnt_hi_p, cnt_hi_n = _sturm_count_less_reg2(
-                dd, ee, K, BLOCK, tol_hi, _neg_strict_shift(tol_hi)
+            cnt_hi_p, cnt_hi_n = _sturm_count_posneg_reg2(
+                dd, ee, K, BLOCK, tol_hi, -tol_hi
             )
             rank_lo = (K - cnt_lo_p) + cnt_lo_n
             rank_hi = (K - cnt_hi_p) + cnt_hi_n
@@ -824,7 +914,7 @@ def _mr_sturm_rank_reg(
                 sigma_max = tl.maximum(tl.abs(lmax), tl.abs(lmin))
                 tol = tl.maximum(atol, rtol * sigma_max)
                 rank = (K - _sturm_count_less_reg(dd, ee, K, BLOCK, tol)) + (
-                    _sturm_count_less_reg(dd, ee, K, BLOCK, _neg_strict_shift(tol))
+                    _sturm_count_strict_reg(dd, ee, K, BLOCK, -tol)
                 )
         else:
             # Gram matrix: eigenvalues are sigma^2, threshold is tol^2.
@@ -1274,11 +1364,11 @@ def _matrix_rank_sturm_kernel(
             sigma_lo = tl.maximum(tl.abs(dmax), tl.abs(tl.min(d, axis=0)))
             tol_lo = tl.maximum(atol, rtol * sigma_lo)
             tol_hi = tl.maximum(atol, rtol * hi)
-            cnt_lo_p, cnt_lo_n = _sturm_count_less2(
-                D, E, base, K, tol_lo, _neg_strict_shift(tol_lo)
+            cnt_lo_p, cnt_lo_n = _sturm_count_posneg2(
+                D, E, base, K, tol_lo, -tol_lo
             )
-            cnt_hi_p, cnt_hi_n = _sturm_count_less2(
-                D, E, base, K, tol_hi, _neg_strict_shift(tol_hi)
+            cnt_hi_p, cnt_hi_n = _sturm_count_posneg2(
+                D, E, base, K, tol_hi, -tol_hi
             )
             rank_lo = (K - cnt_lo_p) + cnt_lo_n
             rank_hi = (K - cnt_hi_p) + cnt_hi_n
@@ -1325,7 +1415,7 @@ def _matrix_rank_sturm_kernel(
                 sigma_max = tl.maximum(tl.abs(lmax), tl.abs(lmin))
                 tol = tl.maximum(atol, rtol * sigma_max)
                 rank = (K - _sturm_count_less(D, E, base, K, tol)) + (
-                    _sturm_count_less(D, E, base, K, _neg_strict_shift(tol))
+                    _sturm_count_strict(D, E, base, K, -tol)
                 )
             else:
                 lo = tl.maximum(dmax, 0.0)
@@ -1646,7 +1736,7 @@ def _launch_tridiag_rank(
 
 
 # ---------------------------------------------------------------------------
-# Large matrices (fp32, 64 < k <= 512): blocked Householder QR, unpivoted.
+# Large matrices (fp32, 64 < k <= 255): blocked Householder QR, unpivoted.
 # The rank is #{ |R_ii| > max(atol, rtol * sigma_max) } with sigma_max
 # bracketed by |R_00| <= sigma_max <= ||A||_F and refined by power iteration
 # only when the two bounds disagree on the count.
@@ -2140,7 +2230,12 @@ def _launch_longdim_rank(
             _fast_launch(
                 _mr_rrqr_panel_reg_kernel, (batch_count,),
                 W, V, piv, tau, 0, k, k, rs, wpitch,
-                NB=max(1, rs // 64), num_warps=4, num_stages=1,
+                # NB must stay in {1, 2, 4}, same as _launch_rrqr_rank: the
+                # NB=3 specialization (rs = 192) is a marginal UB allocation
+                # that flip-flops between fitting and "ub overflow" across
+                # compiles.
+                NB=min(4, triton.next_power_of_2(max(1, rs // 64))),
+                num_warps=4, num_stages=1,
             )
         else:
             _fast_launch(
@@ -2178,7 +2273,7 @@ def _launch_longdim_rank(
 def _launch_rrqr_rank(    matrix, atol_tensor, rtol_tensor, out, m, n, k, rows, batch_count, input,
     hermitian,
 ):
-    """Blocked Householder QR, unpivoted (fp32, 64 < k <= 512).
+    """Blocked Householder QR, unpivoted (fp32, 64 < k <= 255).
 
     Pure Triton: no aclnn decomposition. Singular values never materialize;
     the rank is read off the |R_ii| diagonal, which sits in the LINEAR domain
@@ -2701,8 +2796,10 @@ def _mr_sturm_big_tridiag_kernel(
 ):
     # Hermitian Sturm bracket on the RAW tridiagonal (d, e) -- the
     # eigenvalue-domain counterpart of _mr_sturm_big_kernel.  Counts
-    # #{|lambda| > max(atol, rtol*|lambda|max)} = K - cl(tol) + cl(-tol)
-    # where cl(x) = #{lambda < x} via the qd recurrence.  |lambda|max is
+    # #{|lambda| > max(atol, rtol*|lambda|max)} = (K - cle(tol)) + clt(-tol)
+    # where cle(x) = #{lambda <= x} (zero pivot -> tiny negative) and
+    # clt(x) = #{lambda < x} STRICTLY (zero pivot -> tiny positive), both
+    # from _sturm_count_posneg2.  |lambda|max is
     # bracketed by [max|d_i|, max Gershgorin radius] (max_i |d_ii| <=
     # |lambda|max by Rayleigh) and refined by bisection on
     # f(x) = #{|lambda| > x} only when the two bounds give different ranks.
@@ -2727,10 +2824,8 @@ def _mr_sturm_big_tridiag_kernel(
     else:
         tol_lo = tl.maximum(atol, rtol * dmax)
         tol_hi = tl.maximum(atol, rtol * hi)
-        c_lo, c_hi = _sturm_count_less2(D, E, base, K, tol_lo, tol_hi)
-        m_lo, m_hi = _sturm_count_less2(
-            D, E, base, K, _neg_strict_shift(tol_lo), _neg_strict_shift(tol_hi)
-        )
+        c_lo, m_lo = _sturm_count_posneg2(D, E, base, K, tol_lo, -tol_lo)
+        c_hi, m_hi = _sturm_count_posneg2(D, E, base, K, tol_hi, -tol_hi)
         rank_lo = K - c_lo + m_lo
         rank_hi = K - c_hi + m_hi
         tol2 = tol_lo
@@ -2742,9 +2837,7 @@ def _mr_sturm_big_tridiag_kernel(
             it = 0
             while it < BISECT_ITERS:
                 mid = 0.5 * (lo + hi_p)
-                c_m, m_m = _sturm_count_less2(
-                    D, E, base, K, mid, _neg_strict_shift(mid)
-                )
+                c_m, m_m = _sturm_count_posneg2(D, E, base, K, mid, -mid)
                 if K - c_m + m_m >= 1:
                     lo = mid
                 else:
@@ -2763,18 +2856,18 @@ def _mr_sturm_final_tridiag_kernel(D, E, TOL2, FLAG, OUT, K):
     # Decisive hermitian count in df64 arithmetic from the RAW tridiagonal:
     # rank = #{lambda > tol} + #{lambda < -tol}, two lockstep qd chains
     # q_i = d_i - x - e_{i-1}^2 / q_{i-1}.  The positive chain runs at
-    # x = tol (the zero-pivot guard makes it count #{lambda <= tol}, so
-    # K - neg IS the strict #{lambda > tol}); the negative chain runs at
-    # x = pred(-tol) = nextafter(-tol, -inf), which is exactly the strict
-    # #{lambda < -tol} on the fp32 lattice -- including tol == 0, where
-    # pred(-0.0) = -1.4e-45 yields #{lambda < 0} (a nonzero rank-deficient
-    # spectrum is counted correctly, no special-casing).  Same df64
-    # primitives and zero-pivot guards as _mr_sturm_final_kernel; the e^2
-    # terms are TwoProd'd so the recurrence keeps ~eps^2 relative precision.
-    # Requires enable_fp_fusion=False.
+    # x = tol with the DLANEG guard (zero pivot -> tiny negative), so it
+    # counts #{lambda <= tol} and K - neg1 IS the strict #{lambda > tol};
+    # the negative chain runs at x = -tol with the MIRRORED guard (zero
+    # pivot -> tiny positive), so neg2 IS the strict #{lambda < -tol} --
+    # exact for every tol, including tol == 0, where it yields
+    # #{lambda < 0} (a nonzero rank-deficient spectrum is counted
+    # correctly, no special-casing).  Same df64 primitives as
+    # _mr_sturm_final_kernel; the e^2 terms are TwoProd'd so the recurrence
+    # keeps ~eps^2 relative precision.  Requires enable_fp_fusion=False.
     batch = tl.program_id(0)
     tol = tl.load(TOL2 + batch)
-    xn = _neg_strict_shift(tol)
+    xn = -tol
     base = batch * K
     d0 = tl.load(D + base)
     q1h, q1l = _df64_add(d0, 0.0, -tol, 0.0)
@@ -2783,7 +2876,7 @@ def _mr_sturm_final_tridiag_kernel(D, E, TOL2, FLAG, OUT, K):
     q1h = tl.where(zero1, -1.1754944e-38, q1h)
     q1l = tl.where(zero1, 0.0, q1l)
     zero2 = (q2h == 0.0) & (q2l == 0.0)
-    q2h = tl.where(zero2, -1.1754944e-38, q2h)
+    q2h = tl.where(zero2, 1.1754944e-38, q2h)
     q2l = tl.where(zero2, 0.0, q2l)
     neg1 = ((q1h < 0.0) | ((q1h == 0.0) & (q1l < 0.0))).to(tl.int32)
     neg2 = ((q2h < 0.0) | ((q2h == 0.0) & (q2l < 0.0))).to(tl.int32)
@@ -2802,7 +2895,7 @@ def _mr_sturm_final_tridiag_kernel(D, E, TOL2, FLAG, OUT, K):
         q1h = tl.where(zero1, -1.1754944e-38, q1h)
         q1l = tl.where(zero1, 0.0, q1l)
         zero2 = (q2h == 0.0) & (q2l == 0.0)
-        q2h = tl.where(zero2, -1.1754944e-38, q2h)
+        q2h = tl.where(zero2, 1.1754944e-38, q2h)
         q2l = tl.where(zero2, 0.0, q2l)
         neg1 += ((q1h < 0.0) | ((q1h == 0.0) & (q1l < 0.0))).to(tl.int32)
         neg2 += ((q2h < 0.0) | ((q2h == 0.0) & (q2l < 0.0))).to(tl.int32)
@@ -2972,8 +3065,8 @@ def _launch_bidiag_rank(
     matrix, atol_tensor, rtol_tensor, out, m, n, k, rows, batch_count, input,
     hermitian,
 ):
-    """Unblocked Golub-Kahan bidiagonalization + Sturm count (fp32, k >= 513
-    by default, or the 64 < k < 513 band under FLAGGEMS_MR_EXACT_PATH).
+    """Unblocked Golub-Kahan bidiagonalization + Sturm count (fp32, k > 255
+    by default, or the 64 < k <= 255 band under FLAGGEMS_MR_EXACT_PATH).
 
     SVD-accurate rank: unlike the RRQR path (|R_ii| only approximate sigma_i),
     the bidiagonal d/e keep every singular value at linear precision and the
@@ -3374,6 +3467,26 @@ def _launch_matrix_rank(input, atol, rtol, hermitian):
                 hermitian,
             )
 
+    # torch's tolerance is tol = max(atol, rtol * sigma_max) with NO lower
+    # clamp, so tol < 0 is reachable only when BOTH atol < 0 and rtol < 0
+    # (elementwise) -- and then every singular value (>= 0) exceeds tol:
+    # rank == k for a nonzero matrix.  (A zero matrix still gives 0:
+    # rtol*0 == 0 lifts tol back to max(atol, 0) == 0.)  The in-kernel
+    # counts assume tol >= 0 -- the hermitian split #{|lam|>tol} =
+    # #{lam>tol} + #{lam<-tol} double-counts the overlap when tol < 0, and
+    # the sigma^2-domain paths square tol -- so this corner is fixed up
+    # host-side instead of touching every counting kernel.
+    if tol_tensor:
+        neg_pair = (atol_tensor < 0) & (rtol_tensor < 0)
+        needs_fix = bool(neg_pair.any())
+    else:
+        neg_pair = None
+        needs_fix = atol_val < 0.0 and rtol_val < 0.0
+    if needs_fix:
+        nonzero = (matrix.abs().amax(dim=(1, 2)) > 0).reshape(output_shape)
+        fix = nonzero if neg_pair is None else (neg_pair.reshape(output_shape) & nonzero)
+        if bool(fix.any()):
+            out = torch.where(fix, torch.full_like(out, k), out)
     return out
 
 
