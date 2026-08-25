@@ -939,9 +939,11 @@ def test_linalg_matrix_rank_hermitian_strict_threshold(k, monkeypatch):
     # counters exercised here.
     monkeypatch.setenv("FLAGGEMS_MR_EXACT_PATH", "1")
     # torch's hermitian semantics are STRICT: rank = #{|lambda| > tol}
-    # = #{lambda > tol} + #{lambda < -tol}.  The Sturm zero-pivot guard
-    # counts #{lambda <= x}, so the negative side must be evaluated at a
-    # shift strictly below -tol (_neg_strict_shift); otherwise an
+    # = #{lambda > tol} + #{lambda < -tol}.  The Sturm qd zero-pivot guard
+    # counts #{lambda <= x}, so the positive side K - #{<= tol} is already
+    # strict, while the negative side uses the mirrored tie convention
+    # (zero pivot -> tiny POSITIVE) which counts #{lambda < -tol} exactly
+    # (_sturm_count_posneg2 / _sturm_count_strict*); otherwise an
     # eigenvalue exactly equal to -tol is wrongly counted, and with
     # atol == rtol == 0 a nonzero rank-deficient spectrum reports full rank.
     # Diagonal inputs keep the factorization exact, so these ties are
@@ -1060,6 +1062,33 @@ def test_linalg_matrix_rank_negative_tolerances(k, hermitian):
     check(matrix, -1.0, -1.0)
     # both negative on a zero matrix: tol == 0 -> rank 0
     check(zero, -1.0, -1.0)
+
+    if hermitian:
+        # hermitian reads ONLY the lower triangle: strict-upper garbage is
+        # invisible, so the both-negative fixup must test the lower
+        # triangle for "nonzero" -- torch returns 0 here, not k.
+        upper_only = torch.zeros(k, k, dtype=torch.float32, device=device)
+        upper_only[0, k - 1] = 1.0
+        reference = torch.linalg.matrix_rank(
+            upper_only.double().cpu(), hermitian=True, atol=-1.0, rtol=-1.0
+        )
+        assert reference.item() == 0  # construction sanity
+        result = flag_gems.linalg_matrix_rank(
+            upper_only, hermitian=True, atol=-1.0, rtol=-1.0
+        )
+        utils.gems_assert_equal(result, reference.to(device))
+        # ... and a lower-triangle-only nonzero DOES give full rank under
+        # tol < 0 (eigenvalues +1/-1 of the symmetrized matrix).
+        lower_only = torch.zeros(k, k, dtype=torch.float32, device=device)
+        lower_only[k - 1, 0] = 1.0
+        reference = torch.linalg.matrix_rank(
+            lower_only.double().cpu(), hermitian=True, atol=-1.0, rtol=-1.0
+        )
+        assert reference.item() == k  # construction sanity
+        result = flag_gems.linalg_matrix_rank(
+            lower_only, hermitian=True, atol=-1.0, rtol=-1.0
+        )
+        utils.gems_assert_equal(result, reference.to(device))
 
     # batch + per-batch tensor tolerances mixing all three regimes
     batch = torch.stack([matrix, zero, matrix])

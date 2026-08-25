@@ -27,7 +27,7 @@
 | herm k ≥ 256 | **单边三对角化 + ±tol df64 Sturm**(精确)| 2.0~7.1× |
 | 非 herm k ≥ 256 | **非分块 GK 双对角化 + df64 Sturm**(精确)| 1.1~2.7× |
 
-**性能(验收口径 `benchmark --mode operator`,默认分发,扩展 benchmark 67 项全部 SUCCESS)**:general 算术 2.40/几何 1.98,herm 2.12/1.71;<0.8 的仅 (129,2048)/(2048,129) 0.38/0.41(长行中 k 的固有地板,两条路径同源,见第八阶段 §5)与小 herm 边际 shape(16²/17²/33²,多轮 0.75~0.98 抖动,共享机器噪声)。大矩阵:general 1024² 2.71×、512² 1.74×;herm 1024² 7.00×、512² 3.88×。
+**性能(验收口径 `benchmark --mode operator`,默认分发,扩展 benchmark 67 项全部正常执行——SUCCESS 仅表示无异常,speedup 逐条见下)**:general 算术 2.40/几何 1.98,herm 2.12/1.71;<0.8 的仅 (129,2048)/(2048,129) 0.38/0.41(长行中 k 的固有地板,两条路径同源,见第八阶段 §5)与小 herm 边际 shape(16²/17²/33²,多轮 0.75~0.98 抖动,共享机器噪声)。大矩阵:general 1024² 2.71×、512² 1.74×;herm 1024² 7.00×、512² 3.88×。
 
 **正确性(最终态)**:
 - 官方套件 128 passed / 6 skipped(fp64 与 complex 按环境跳过),默认分发;严格阈值/负容差用例内部固定 EXACT env 覆盖精确 herm 路径。
@@ -1150,4 +1150,11 @@ benchmark 形状表注释(129 边界→256 边界,129 段标注为"长行中 k"�
 
 - 新增/扩展 17 项全部通过(严格阈值扩展 k=3/33/65/128/257:pred(−0.5)、pred(−0.75)、minsub 三组一格之内用例;负容差 8 项;NB=3 回归 4 项)。
 - 官方套件 128 passed / 6 skipped(默认分发);三套扫描 3/3(366 例全路径 + herm 34 + QR 对抗 22,`FLAGGEMS_MR_SWEEP=1`)。
-- 扩展 benchmark 复跑 67/67 SUCCESS:general 算术 2.40/几何 1.98,herm 2.12/1.71——与第八阶段持平(strict 计数改了四条 herm 热路径的链结构但链数不变,性能中性,实测确认)。<0.8 项不变:(129,2048)/(2048,129) 与小 herm 边际 shape(16²/17²/33² 抖动)。
+- 扩展 benchmark 复跑 67/67 正常执行(SUCCESS 仅表示无异常,speedup 逐条核对):general 算术 2.40/几何 1.98,herm 2.12/1.71——与第八阶段持平(strict 计数改了四条 herm 热路径的链结构但链数不变,性能中性,实测确认)。<0.8 项不变:(129,2048)/(2048,129) 与小 herm 边际 shape(16²/17²/33² 抖动)。
+
+## 6. 第四轮评审追加(herm × 双负容差、tensor 容差同步、图并发收尾)
+
+1. **herm 下三角语义与双负修正的交互(真 bug,本轮评审的确定性反例)**:host 修正原来用整张矩阵判"非零",但 `hermitian=True` 只读下三角——严格上三角有垃圾的矩阵 torch 视为零矩阵(秩 0),旧修正会强制改写为 k。修复:herm 时非零判定只看 `matrix.tril()`。补回归:k = 3/33/65/257,严格上三角单元素(应为 0)与严格下三角单元素(应为 k,对称化后特征值 ±1)。
+2. **tensor 容差路径的隐式 host 同步**:原实现 `bool(neg_pair.any())` 在每次 tensor 容差调用都同步设备(benchmark 全用标量容差,从未暴露)。改为完全异步:tensor 分支无条件执行 `torch.where(neg_pair & nonzero, k, out)`(无命中时是空操作),Python 不再依赖设备张量做分支;标量分支仍是纯 Python 判断,零开销。非零判定同时从 `abs().amax()` 改为 `amax/amin` 双归约,省一次全矩阵 abs 物化。
+3. **图并发收尾**:`TRITON_ALL_BLOCKS_PARALLEL` 的 pop/restore 是进程级全局状态,而 kernel 编译就发生在 launcher 体内——两个大路径 launcher 改为**全程持有 `_GRAPH_LOCK`**(此前只有图缓存段在锁内,env 操作在锁外可交错);FIFO 逐出前加 `torch.npu.synchronize()`(逐出仅第 17 个 shape 触发,罕见),保证被逐出 graph 的在飞 replay 完成后才释放 workspace。replay 原本就已在锁内,此举无额外串行化损失。
+4. 测试注释中对已删除的 `_neg_strict_shift` 的引用已清理。

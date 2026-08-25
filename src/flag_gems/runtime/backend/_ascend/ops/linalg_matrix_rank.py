@@ -3085,22 +3085,27 @@ def _launch_bidiag_rank(
     # wrong atomic-accumulated sums). It is read at kernel COMPILE time only,
     # so pop it for the duration of this launcher (compiles happen here via
     # _fast_launch warmups and the graph capture) and restore it afterwards.
-    saved_all_blocks = os.environ.pop("TRITON_ALL_BLOCKS_PARALLEL", None)
-    try:
-        with torch_device_fn.device(input.device):
-            if os.environ.get("FLAGGEMS_MR_NO_GRAPH") == "1":
-                ws = _bidiag_workspace(dev, batch_count, k, rows)
-                _bidiag_run(
-                    ws, matrix, atol_tensor, rtol_tensor, m, n, k, rows,
-                    batch_count, hermitian,
+    # _GRAPH_LOCK serializes the WHOLE launcher, not just the graph cache:
+    # the TRITON_ALL_BLOCKS_PARALLEL pop/restore below is process-global
+    # state and kernel compiles happen inside this body (via _fast_launch
+    # warmups and graph capture), so a concurrent thread must neither
+    # interleave pop/restore nor compile while the variable is removed.
+    with _GRAPH_LOCK:
+        saved_all_blocks = os.environ.pop("TRITON_ALL_BLOCKS_PARALLEL", None)
+        try:
+            with torch_device_fn.device(input.device):
+                if os.environ.get("FLAGGEMS_MR_NO_GRAPH") == "1":
+                    ws = _bidiag_workspace(dev, batch_count, k, rows)
+                    _bidiag_run(
+                        ws, matrix, atol_tensor, rtol_tensor, m, n, k, rows,
+                        batch_count, hermitian,
+                    )
+                    out.copy_(ws["out"].reshape(out.shape))
+                    return out
+                key = (
+                    m, n, batch_count, hermitian, input.device.index,
+                    _current_stream_key(input.device),
                 )
-                out.copy_(ws["out"].reshape(out.shape))
-                return out
-            key = (
-                m, n, batch_count, hermitian, input.device.index,
-                _current_stream_key(input.device),
-            )
-            with _GRAPH_LOCK:
                 ent = _BIDIAG_GRAPHS.get(key)
                 if ent is None:
                     ws = _bidiag_workspace(dev, batch_count, k, rows)
@@ -3138,6 +3143,11 @@ def _launch_bidiag_rank(
                         out.copy_(ws["out"].reshape(out.shape))
                         return out
                     if len(_BIDIAG_GRAPHS) >= _BIDIAG_GRAPH_MAX_ENTRIES:
+                        # An evicted graph may still have an in-flight
+                        # replay (replay is async); dropping the entry frees
+                        # its workspace.  Rare event (17th distinct shape on
+                        # this stream): drain the device before freeing.
+                        torch.npu.synchronize()
                         _BIDIAG_GRAPHS.pop(next(iter(_BIDIAG_GRAPHS)))
                     _BIDIAG_GRAPHS[key] = (ws, staging, graph)
                 ws, staging, graph = _BIDIAG_GRAPHS[key]
@@ -3146,9 +3156,9 @@ def _launch_bidiag_rank(
                 ws["rtol"].copy_(rtol_tensor)
                 graph.replay()
                 out.copy_(ws["out"].reshape(out.shape))
-    finally:
-        if saved_all_blocks is not None:
-            os.environ["TRITON_ALL_BLOCKS_PARALLEL"] = saved_all_blocks
+        finally:
+            if saved_all_blocks is not None:
+                os.environ["TRITON_ALL_BLOCKS_PARALLEL"] = saved_all_blocks
     return out
 
 
@@ -3246,23 +3256,25 @@ def _launch_tridiag_big_rank(
     input: half the reflectors per step.  NPUGraph-captured per shape (set
     FLAGGEMS_MR_NO_GRAPH=1 to force direct launches)."""
     dev = input.device
-    # see _launch_bidiag_rank for why TRITON_ALL_BLOCKS_PARALLEL is popped
-    saved_all_blocks = os.environ.pop("TRITON_ALL_BLOCKS_PARALLEL", None)
-    try:
-        with torch_device_fn.device(input.device):
-            if os.environ.get("FLAGGEMS_MR_NO_GRAPH") == "1":
-                ws = _tridiag_workspace(dev, batch_count, k, rows)
-                _tridiag_run(
-                    ws, matrix, atol_tensor, rtol_tensor, m, n, k, rows,
-                    batch_count,
+    # see _launch_bidiag_rank for why TRITON_ALL_BLOCKS_PARALLEL is popped,
+    # and for why the WHOLE body runs under _GRAPH_LOCK (the pop/restore is
+    # process-global state; compiles happen inside this body).
+    with _GRAPH_LOCK:
+        saved_all_blocks = os.environ.pop("TRITON_ALL_BLOCKS_PARALLEL", None)
+        try:
+            with torch_device_fn.device(input.device):
+                if os.environ.get("FLAGGEMS_MR_NO_GRAPH") == "1":
+                    ws = _tridiag_workspace(dev, batch_count, k, rows)
+                    _tridiag_run(
+                        ws, matrix, atol_tensor, rtol_tensor, m, n, k, rows,
+                        batch_count,
+                    )
+                    out.copy_(ws["out"].reshape(out.shape))
+                    return out
+                key = (
+                    m, n, batch_count, input.device.index,
+                    _current_stream_key(input.device),
                 )
-                out.copy_(ws["out"].reshape(out.shape))
-                return out
-            key = (
-                m, n, batch_count, input.device.index,
-                _current_stream_key(input.device),
-            )
-            with _GRAPH_LOCK:
                 ent = _TRIDIAG_GRAPHS.get(key)
                 if ent is None:
                     ws = _tridiag_workspace(dev, batch_count, k, rows)
@@ -3297,6 +3309,11 @@ def _launch_tridiag_big_rank(
                         out.copy_(ws["out"].reshape(out.shape))
                         return out
                     if len(_TRIDIAG_GRAPHS) >= _TRIDIAG_GRAPH_MAX_ENTRIES:
+                        # An evicted graph may still have an in-flight
+                        # replay (replay is async); dropping the entry frees
+                        # its workspace.  Rare event (17th distinct shape on
+                        # this stream): drain the device before freeing.
+                        torch.npu.synchronize()
                         _TRIDIAG_GRAPHS.pop(next(iter(_TRIDIAG_GRAPHS)))
                     _TRIDIAG_GRAPHS[key] = (ws, staging, graph)
                 ws, staging, graph = _TRIDIAG_GRAPHS[key]
@@ -3305,9 +3322,9 @@ def _launch_tridiag_big_rank(
                 ws["rtol"].copy_(rtol_tensor)
                 graph.replay()
                 out.copy_(ws["out"].reshape(out.shape))
-    finally:
-        if saved_all_blocks is not None:
-            os.environ["TRITON_ALL_BLOCKS_PARALLEL"] = saved_all_blocks
+        finally:
+            if saved_all_blocks is not None:
+                os.environ["TRITON_ALL_BLOCKS_PARALLEL"] = saved_all_blocks
     return out
 
 
@@ -3475,18 +3492,27 @@ def _launch_matrix_rank(input, atol, rtol, hermitian):
     # counts assume tol >= 0 -- the hermitian split #{|lam|>tol} =
     # #{lam>tol} + #{lam<-tol} double-counts the overlap when tol < 0, and
     # the sigma^2-domain paths square tol -- so this corner is fixed up
-    # host-side instead of touching every counting kernel.
+    # host-side instead of touching every counting kernel.  Two
+    # implementation constraints: (a) hermitian reads ONLY the lower
+    # triangle, so "nonzero" must be checked on the lower triangle --
+    # garbage in the strict upper triangle is invisible to torch and must
+    # not trigger the fix; (b) no Python branch on device data -- a
+    # bool(...any()) here would sync the host on EVERY tensor-tolerance
+    # call, so the tensor branch applies the (usually no-op) where
+    # unconditionally and asynchronously.
     if tol_tensor:
-        neg_pair = (atol_tensor < 0) & (rtol_tensor < 0)
-        needs_fix = bool(neg_pair.any())
-    else:
-        neg_pair = None
-        needs_fix = atol_val < 0.0 and rtol_val < 0.0
-    if needs_fix:
-        nonzero = (matrix.abs().amax(dim=(1, 2)) > 0).reshape(output_shape)
-        fix = nonzero if neg_pair is None else (neg_pair.reshape(output_shape) & nonzero)
-        if bool(fix.any()):
-            out = torch.where(fix, torch.full_like(out, k), out)
+        neg_pair = ((atol_tensor < 0) & (rtol_tensor < 0)).reshape(output_shape)
+        src = matrix.tril() if hermitian else matrix
+        nonzero = ((src.amax(dim=(1, 2)) > 0) | (src.amin(dim=(1, 2)) < 0)).reshape(
+            output_shape
+        )
+        out = torch.where(neg_pair & nonzero, torch.full_like(out, k), out)
+    elif atol_val < 0.0 and rtol_val < 0.0:
+        src = matrix.tril() if hermitian else matrix
+        nonzero = ((src.amax(dim=(1, 2)) > 0) | (src.amin(dim=(1, 2)) < 0)).reshape(
+            output_shape
+        )
+        out = torch.where(nonzero, torch.full_like(out, k), out)
     return out
 
 
