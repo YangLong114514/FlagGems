@@ -1,7 +1,7 @@
 # `linalg_matrix_rank` 昇腾 910B 后端实现与优化报告(详细版)
 
 > 分支:`ascend-matrix-rank-triton`(已推送 `github.com:YangLong114514/FlagGems`)
-> 提交:`fbbaec86`(第九阶段评审修复,含第四轮追加)
+> 提交:`5b8a40ad`(第九阶段评审修复,含第四、五轮追加)
 > 硬件:昇腾 910B4(20 AI Core × 2 Vector = 40 Vector 核,UB 192KB)
 > 软件:CANN 8.5.0、triton-ascend 3.2.0(BiShengIR)、torch 2.6.0+cpu / torch_npu 2.6.0rc1
 > 目标:`torch.linalg.matrix_rank` 在 NPU 上的 speedup ≥ 0.8
