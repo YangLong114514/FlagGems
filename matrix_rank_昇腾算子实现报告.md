@@ -1158,3 +1158,10 @@ benchmark 形状表注释(129 边界→256 边界,129 段标注为"长行中 k"�
 2. **tensor 容差路径的隐式 host 同步**:原实现 `bool(neg_pair.any())` 在每次 tensor 容差调用都同步设备(benchmark 全用标量容差,从未暴露)。改为完全异步:tensor 分支无条件执行 `torch.where(neg_pair & nonzero, k, out)`(无命中时是空操作),Python 不再依赖设备张量做分支;标量分支仍是纯 Python 判断,零开销。非零判定同时从 `abs().amax()` 改为 `amax/amin` 双归约,省一次全矩阵 abs 物化。
 3. **图并发收尾**:`TRITON_ALL_BLOCKS_PARALLEL` 的 pop/restore 是进程级全局状态,而 kernel 编译就发生在 launcher 体内——两个大路径 launcher 改为**全程持有 `_GRAPH_LOCK`**(此前只有图缓存段在锁内,env 操作在锁外可交错);FIFO 逐出前加 `torch.npu.synchronize()`(逐出仅第 17 个 shape 触发,罕见),保证被逐出 graph 的在飞 replay 完成后才释放 workspace。replay 原本就已在锁内,此举无额外串行化损失。
 4. 测试注释中对已删除的 `_neg_strict_shift` 的引用已清理。
+
+## 7. 第五轮评审追加(多 device 逐出、tensor 容差开销、交叉测试)
+
+1. **多 NPU FIFO 逐出同步错设备(真实生命周期风险,低概率)**:图缓存进程级共享,key 含 device 但 FIFO 逐出的最老条目可能属于另一张卡;逐出前改为按 victim key 里的 device index 同步对应卡(两个缓存一致)。
+2. **tensor 容差修正的开销收敛**:评审建议的"按 neg_pair 提前退出的 Triton 修正 kernel"**尝试过并放弃**——该后端对"masked load + 任何运行时标量参与向量表达式"的组合一律报 `unresolved () -> tensor materialization`(标量 if 包向量 load、gather 广播 flag、branchless mask 折叠等五个变体全部编译失败);`torch.linalg.vector_norm(ord=inf)` 在 torch_npu 上直接 TBE 报错也不可用。最终保持全异步 aten 形式(tril 仅 herm + amax/amin 双归约 + where,去掉了 abs 物化)。**实测开销(稳态,µs)**:(32,8,8) 标量 153.7 → tensor 427.1(×2.78,几乎全是这台慢 ARM host 上的固定 aten launch 成本,与矩阵大小无关);(2,129,129) ×1.01;(1,256,256)/(1,1024,1024) ×1.00。结论:tensor 容差在小矩阵快路径上有 ~270µs 固定开销,中大矩阵可忽略——文档化为遗留项,根治要等后端标量广播合法化修复。
+3. **交叉测试**:herm 上三角垃圾/下三角非零/零矩阵三种 regime 补了 batch tensor 容差版本,直接覆盖异步 `where` 分支。
+4. **遗留说明**:`_GRAPH_LOCK` 只能串行化本算子的 launcher;其他算子的线程在 `TRITON_ALL_BLOCKS_PARALLEL` 被临时移除的窗口内编译仍有理论风险——这是进程级环境变量设计的工具链问题,超出单个算子的修复范围。

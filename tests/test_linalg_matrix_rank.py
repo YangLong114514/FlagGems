@@ -1090,6 +1090,21 @@ def test_linalg_matrix_rank_negative_tolerances(k, hermitian):
         )
         utils.gems_assert_equal(result, reference.to(device))
 
+        # Same three regimes through the TENSOR-tolerance branch (the async
+        # early-exit fixup kernel): strict-upper garbage -> 0, lower-only
+        # nonzero -> k, true zero -> 0.
+        mixed = torch.stack([upper_only, lower_only, zero])
+        atol_t = torch.full((3,), -1.0, device=device)
+        rtol_t = torch.full((3,), -1.0, device=device)
+        reference = torch.linalg.matrix_rank(
+            mixed.double().cpu(), hermitian=True, atol=atol_t.cpu(), rtol=rtol_t.cpu()
+        )
+        assert reference.tolist() == [0, k, 0]  # construction sanity
+        result = flag_gems.linalg_matrix_rank(
+            mixed, hermitian=True, atol=atol_t, rtol=rtol_t
+        )
+        utils.gems_assert_equal(result, reference.to(device))
+
     # batch + per-batch tensor tolerances mixing all three regimes
     batch = torch.stack([matrix, zero, matrix])
     atol_t = torch.tensor([-1.0, -1.0, 0.0], device=device)

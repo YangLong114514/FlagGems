@@ -3145,10 +3145,14 @@ def _launch_bidiag_rank(
                     if len(_BIDIAG_GRAPHS) >= _BIDIAG_GRAPH_MAX_ENTRIES:
                         # An evicted graph may still have an in-flight
                         # replay (replay is async); dropping the entry frees
-                        # its workspace.  Rare event (17th distinct shape on
-                        # this stream): drain the device before freeing.
-                        torch.npu.synchronize()
-                        _BIDIAG_GRAPHS.pop(next(iter(_BIDIAG_GRAPHS)))
+                        # its workspace.  Rare event (17th distinct shape):
+                        # drain before freeing.  The cache is process-wide
+                        # and the FIFO victim may live on ANOTHER device, so
+                        # synchronize the victim's device (key[4]), not the
+                        # current one.
+                        victim_key = next(iter(_BIDIAG_GRAPHS))
+                        torch.npu.synchronize(victim_key[4])
+                        _BIDIAG_GRAPHS.pop(victim_key)
                     _BIDIAG_GRAPHS[key] = (ws, staging, graph)
                 ws, staging, graph = _BIDIAG_GRAPHS[key]
                 staging.copy_(matrix)
@@ -3311,10 +3315,14 @@ def _launch_tridiag_big_rank(
                     if len(_TRIDIAG_GRAPHS) >= _TRIDIAG_GRAPH_MAX_ENTRIES:
                         # An evicted graph may still have an in-flight
                         # replay (replay is async); dropping the entry frees
-                        # its workspace.  Rare event (17th distinct shape on
-                        # this stream): drain the device before freeing.
-                        torch.npu.synchronize()
-                        _TRIDIAG_GRAPHS.pop(next(iter(_TRIDIAG_GRAPHS)))
+                        # its workspace.  Rare event (17th distinct shape):
+                        # drain before freeing.  The cache is process-wide
+                        # and the FIFO victim may live on ANOTHER device, so
+                        # synchronize the victim's device (key[3]), not the
+                        # current one.
+                        victim_key = next(iter(_TRIDIAG_GRAPHS))
+                        torch.npu.synchronize(victim_key[3])
+                        _TRIDIAG_GRAPHS.pop(victim_key)
                     _TRIDIAG_GRAPHS[key] = (ws, staging, graph)
                 ws, staging, graph = _TRIDIAG_GRAPHS[key]
                 staging.copy_(matrix)
@@ -3492,14 +3500,19 @@ def _launch_matrix_rank(input, atol, rtol, hermitian):
     # counts assume tol >= 0 -- the hermitian split #{|lam|>tol} =
     # #{lam>tol} + #{lam<-tol} double-counts the overlap when tol < 0, and
     # the sigma^2-domain paths square tol -- so this corner is fixed up
-    # host-side instead of touching every counting kernel.  Two
+    # after the fact instead of touching every counting kernel.  Two
     # implementation constraints: (a) hermitian reads ONLY the lower
     # triangle, so "nonzero" must be checked on the lower triangle --
     # garbage in the strict upper triangle is invisible to torch and must
     # not trigger the fix; (b) no Python branch on device data -- a
     # bool(...any()) here would sync the host on EVERY tensor-tolerance
     # call, so the tensor branch applies the (usually no-op) where
-    # unconditionally and asynchronously.
+    # unconditionally and asynchronously.  A Triton early-exit kernel was
+    # tried and abandoned: this backend fails to legalize a masked load
+    # combined with any runtime scalar in a vector expression (unresolved
+    # () -> tensor materialization, five variants), so the tensor branch
+    # pays tril (herm only) + amax + amin + where even when no tolerance
+    # is negative -- a documented follow-up.
     if tol_tensor:
         neg_pair = ((atol_tensor < 0) & (rtol_tensor < 0)).reshape(output_shape)
         src = matrix.tril() if hermitian else matrix
