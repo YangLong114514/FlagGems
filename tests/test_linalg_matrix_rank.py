@@ -606,6 +606,8 @@ def test_linalg_matrix_rank_hermitian_tridiag(dtype, shape, expected_rank):
         pytest.param((600, 700), 550, id="bidiag-wide"),
         pytest.param((700, 600), 550, id="bidiag-tall"),
         pytest.param((2, 513, 513), 500, id="bidiag-batched"),
+        pytest.param((129, 2048), 100, id="bidiag-longrows-wide"),
+        pytest.param((2048, 129), 100, id="bidiag-longrows-tall"),
     ],
 )
 def test_linalg_matrix_rank_bidiag(dtype, shape, expected_rank):

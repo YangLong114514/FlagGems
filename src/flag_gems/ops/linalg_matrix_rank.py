@@ -252,6 +252,10 @@ def _matrix_rank_fused_jacobi_kernel(
             )
         tl.store(work_base + column * ROWS + rows, values, mask=row_mask)
         column += 1
+    # The init stores are distributed across all warps of the block; the
+    # sweep loop below reads the whole tile with a potentially different
+    # lane mapping, so a block barrier is required for visibility.
+    tl.debug_barrier()
 
     pair = tl.arange(0, BLOCK_P)
     ring: tl.constexpr = ROUND - 1
@@ -384,6 +388,10 @@ def _matrix_rank_fused_jacobi_kernel(
                 s[:, None] * ap + c[:, None] * aq,
                 mask=pair_mask,
             )
+            # Columns migrate across pair slots (and hence across warps)
+            # between steps: the next step's tile loads must not race this
+            # step's rotation stores.
+            tl.debug_barrier()
             step += 1
         # --- rank-stability check (same criterion as the multi-block
         # sweep kernels) ---------------------------------------------
@@ -396,6 +404,9 @@ def _matrix_rank_fused_jacobi_kernel(
             mask=(singular_indices < K)[:, None] & row_mask[None, :],
             other=0.0,
         )
+        # The next sweep's first rotation stores must not overtake this
+        # read in a laggard warp.
+        tl.debug_barrier()
         alphas = tl.sum(check_tile * check_tile, axis=1).to(accumulator_dtype)
         maxa = tl.max(alphas, axis=0)
         tol = tl.maximum(atol, rtol * tl.sqrt(maxa))
@@ -2432,10 +2443,20 @@ def _launch_bidiag_rank(matrix, atol_tensor, rtol_tensor, out, m, n, k, rows, ba
     )
     sm = _sm_count(device)
     # The kernel synchronizes with a software grid barrier, so the whole
-    # launch must stay co-resident; keep nb within two blocks per SM.
+    # launch must stay co-resident; keep the block count within two blocks
+    # per SM. Column and row partitions are sized independently so tall
+    # work matrices (rows >> k) still fill the machine without blowing up
+    # the per-block register tiles.
     bj = max(8, triton.next_power_of_2(-(-k // (2 * sm))))
-    nb = triton.cdiv(k, bj)
-    bjr = triton.next_power_of_2(-(-rows // nb))
+    bjr = max(8, triton.next_power_of_2(-(-rows // (2 * sm))))
+    nb_row = triton.cdiv(rows, bjr)
+    # When the row partition alone fills the machine, shrink the column tile
+    # so the left-reflector phases spread over more blocks; nb is unchanged,
+    # so co-residency is preserved. Each column's GEMV reduction still runs
+    # inside a single block, so results are bit-identical.
+    while bj > 2 and triton.cdiv(k, bj // 2) <= nb_row:
+        bj //= 2
+    nb = max(triton.cdiv(k, bj), nb_row)
     barrier = torch.zeros(1, dtype=torch.int32, device=device)
     chunk = max(1, (sm * _RESIDENT_BLOCKS_PER_SM) // nb)
     for batch_start in range(0, batch_count, chunk):
@@ -2496,17 +2517,12 @@ def _launch_matrix_rank(
     herm_tridiag = hermitian and k >= (
         _HERM_TRIDIAG_MIN_K_FP64 if is_fp64 else _HERM_TRIDIAG_MIN_K_FP32
     )
-    # Non-hermitian matrices past the Jacobi column limit use the
-    # bidiagonalization path; the row limit still applies to Jacobi shapes.
-    use_bidiag = (not hermitian) and k > _BLOCKED_JACOBI_MAX_K
-    if not herm_tridiag and not use_bidiag and (
+    # Non-hermitian matrices past either Jacobi limit (k or rows) use the
+    # bidiagonalization path. Hermitian inputs are square, so k == rows and
+    # the tridiagonal path covers any size above its threshold.
+    use_bidiag = (not hermitian) and (
         k > _BLOCKED_JACOBI_MAX_K or rows > _JACOBI_MAX_ROWS
-    ):
-        raise NotImplementedError(
-            "FlagGems linalg_matrix_rank Triton Jacobi path currently supports "
-            f"min(m, n) <= {_BLOCKED_JACOBI_MAX_K} and max(m, n) <= "
-            f"{_JACOBI_MAX_ROWS}; got ({m}, {n})"
-        )
+    )
 
     batch_count = input.numel() // (m * n)
     matrix = input.contiguous().reshape(batch_count, m, n)
