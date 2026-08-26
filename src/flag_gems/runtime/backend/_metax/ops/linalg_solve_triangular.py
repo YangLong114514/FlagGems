@@ -237,19 +237,11 @@ def _kslice_trsm_kernel_notle(
             M4 = tl.dot(M2, M2, allow_tf32=False)
             M8 = tl.dot(M4, M4, allow_tf32=False)
             M16 = tl.dot(M8, M8, allow_tf32=False)
-            # The five factor applications commute (polynomials in M):
-            # (I-M)(I+M^2)(I+M^4)(I+M^8)(I+M^16) x = x + sum_k (M^k)'s terms.
-            # Issue them as five independent dots on the ORIGINAL x so the
-            # MMA pipelines can overlap them -- the in-place sequential form
-            # puts 5 loop-carried dot latencies on the critical path per
-            # block (the n=512 metax kernel is chain-latency-bound: ~183
-            # sequential dots).
-            x1 = x - tl.dot(M, x, allow_tf32=False)
-            x2 = tl.dot(M2, x, allow_tf32=False)
-            x4 = tl.dot(M4, x, allow_tf32=False)
-            x8 = tl.dot(M8, x, allow_tf32=False)
-            x16 = tl.dot(M16, x, allow_tf32=False)
-            x = x1 + x2 + x4 + x8 + x16
+            x = x - tl.dot(M, x, allow_tf32=False)
+            x = x + tl.dot(M2, x, allow_tf32=False)
+            x = x + tl.dot(M4, x, allow_tf32=False)
+            x = x + tl.dot(M8, x, allow_tf32=False)
+            x = x + tl.dot(M16, x, allow_tf32=False)
             tl.store(
                 B_ptr + r2 * stride_b_k + col_offs,
                 x,
@@ -379,11 +371,7 @@ def linalg_solve_triangular(A, B, *, upper, left=True, unitriangular=False, out=
     if n <= 16:
         BLOCK_K = 32 if k <= 32 else 64
         num_k_tiles = (k + BLOCK_K - 1) // BLOCK_K
-        # torch.empty, not zeros: the kernel stores every lane it will later
-        # read (r16 < N in the precompute, row < N in the loop), so the
-        # padding entries are never touched -- saves one fill launch on the
-        # launch-bound n<=16 path.
-        inv = torch.empty(batch * num_k_tiles * 16, dtype=dtype, device=A_view.device)
+        inv = torch.zeros(batch * num_k_tiles * 16, dtype=dtype, device=A_view.device)
         _small_diag_kernel_notle[(batch, num_k_tiles)](
             A_view,
             B_view,
