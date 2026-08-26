@@ -454,15 +454,23 @@ def _grid_barrier(BARRIER, base, generation, num_programs):
     # Software grid barrier. The launcher caps the grid at a co-residency
     # bound, so spinning here cannot deadlock. The counter is monotone
     # across launches: after ``generation`` barriers of this launch it
-    # holds ``base + generation * num_programs``. The spin read must be an
-    # acquire atomic (not a volatile load): without acquire semantics,
-    # subsequent buffer reads can be served stale data that predates the
-    # barrier.
+    # holds ``base + generation * num_programs``. The spin poll must be an
+    # acquire-or-stronger atomic (not a volatile load): without acquire
+    # semantics, subsequent buffer reads can be served stale data that
+    # predates the barrier.
+    #
+    # Keep the poll directly in the while CONDITION with an empty body, and
+    # use the DEFAULT memory order (acq_rel) -- the same form as
+    # linalg_qr._barrier.  The read-modify-write must be re-evaluated by the
+    # loop condition on every iteration: assigning the atomic to a
+    # loop-carried scalar (``arrived = ...; while arrived < target:
+    # arrived = ...``) miscompiles on some vendor backends (metax, hygon),
+    # which then spin forever on a stale value.  acq_rel is a superset of
+    # the acquire ordering the barrier-protected loads need.
     tl.atomic_add(BARRIER, 1)
     target = base + (generation + 1) * num_programs
-    arrived = tl.atomic_add(BARRIER, 0, sem="acquire", scope="gpu")
-    while arrived < target:
-        arrived = tl.atomic_add(BARRIER, 0, sem="acquire", scope="gpu")
+    while tl.atomic_add(BARRIER, 0) < target:
+        pass
 
 
 @triton.jit
@@ -478,12 +486,13 @@ def _neighbor_sync(FLAGS, base, generation, program, pair_block, pair_blocks):
     batch_base = program - pair_block
     prev = batch_base + (pair_block + pair_blocks - 1) % pair_blocks
     nxt = batch_base + (pair_block + 1) % pair_blocks
-    arrived = tl.atomic_add(FLAGS + prev, 0, sem="acquire", scope="gpu")
-    while arrived < target:
-        arrived = tl.atomic_add(FLAGS + prev, 0, sem="acquire", scope="gpu")
-    arrived = tl.atomic_add(FLAGS + nxt, 0, sem="acquire", scope="gpu")
-    while arrived < target:
-        arrived = tl.atomic_add(FLAGS + nxt, 0, sem="acquire", scope="gpu")
+    # Same spin form as _grid_barrier: poll in the while condition with an
+    # empty body and default (acq_rel) ordering; a loop-carried scalar
+    # holding the poll result miscompiles on some vendor backends.
+    while tl.atomic_add(FLAGS + prev, 0) < target:
+        pass
+    while tl.atomic_add(FLAGS + nxt, 0) < target:
+        pass
 
 
 @libentry()
@@ -1641,7 +1650,8 @@ def _matrix_rank_herm_tridiag_blocked_kernel(
             # Tensor ops masked by runtime values (qm) are drastically slow
             # in Triton (~20 us/column measured), so every panel-column mask
             # is applied as tl.where on unmasked/static-masked loads; stale
-            # entries for q >= p are finite and get zeroed by the where.
+            # entries for q >= p are finite (the launcher zero-initializes
+            # the V/W buffers) and get zeroed by the where.
             rvalid_a = (rows >= i) & (rows < K)
             col = tl.load(s_base + rows * K + i, mask=rvalid_a, other=0.0)
             if p > 0:
@@ -1817,9 +1827,37 @@ def _matrix_rank_herm_tridiag_blocked_kernel(
                         ),
                         0.0,
                     )
-                    upd = tl.dot(
-                        v_r, tl.trans(w_c), input_precision="ieee"
-                    ) + tl.dot(w_r, tl.trans(v_c), input_precision="ieee")
+                    if tl.constexpr(S.dtype.element_ty == tl.float64):
+                        # fp64 tl.dot is miscompiled on some vendor backends
+                        # (MetaX/Hygon: wrong results for every block shape
+                        # and num_warps variant measured), so accumulate the
+                        # rank-2k update as per-column outer products. The
+                        # v_r/w_r/v_c/w_c tiles above are dead in this branch
+                        # and get eliminated.
+                        upd = tl.zeros((BLOCK_U, BLOCK_V), dtype=S.dtype.element_ty)
+                        q = 0
+                        while q < p_end:
+                            v_rq = tl.load(
+                                v_base + rows2 * NB_P + q, mask=rmask2, other=0.0
+                            )
+                            w_rq = tl.load(
+                                w_base + rows2 * NB_P + q, mask=rmask2, other=0.0
+                            )
+                            v_cq = tl.load(
+                                v_base + cc * NB_P + q, mask=cmask, other=0.0
+                            )
+                            w_cq = tl.load(
+                                w_base + cc * NB_P + q, mask=cmask, other=0.0
+                            )
+                            upd += (
+                                v_rq[:, None] * w_cq[None, :]
+                                + w_rq[:, None] * v_cq[None, :]
+                            )
+                            q += 1
+                    else:
+                        upd = tl.dot(
+                            v_r, tl.trans(w_c), input_precision="ieee"
+                        ) + tl.dot(w_r, tl.trans(v_c), input_precision="ieee")
                     tile = tl.load(
                         s_base + rows2[:, None] * K + cc[None, :],
                         mask=rmask2[:, None] & cmask[None, :],
@@ -2347,8 +2385,12 @@ def _launch_herm_tridiag_rank(matrix, atol_tensor, rtol_tensor, out, k, batch_co
     if k >= _HERM_TRIDIAG_BLOCKED_MIN_K:
         # Blocked WY path: panel factorization + BLAS3 trailing updates.
         nb_p = 32
-        v_buf = torch.empty((batch_count, k, nb_p), dtype=work_dtype, device=device)
-        w_buf = torch.empty((batch_count, k, nb_p), dtype=work_dtype, device=device)
+        # Zero-init (not empty): the kernel relies on stale panel slots
+        # q >= p being finite, because it multiplies unmasked V/W tile loads
+        # against tl.where-zeroed values and Inf/NaN * 0 would poison the
+        # sums.
+        v_buf = torch.zeros((batch_count, k, nb_p), dtype=work_dtype, device=device)
+        w_buf = torch.zeros((batch_count, k, nb_p), dtype=work_dtype, device=device)
         scratch = torch.zeros(
             (batch_count, (2 + 2 * nb_p) * 16), dtype=work_dtype, device=device
         )

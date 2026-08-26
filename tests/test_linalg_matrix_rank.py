@@ -275,9 +275,20 @@ def test_linalg_matrix_rank_nonempty_zero_matrix(dtype, shape):
         shape[:-2], dtype=torch.int64, device=matrix.device
     )
 
-    result = _assert_direct_and_dispatch_match_native(
-        matrix, hermitian=False
-    )
+    if flag_gems.vendor_name == "metax":
+        # The MetaX torch native reference (linalg.matrix_rank via SVD)
+        # does not converge on large all-zero matrices, so compare against
+        # the analytic expectation only.
+        result = flag_gems.linalg_matrix_rank(matrix, hermitian=False)
+        _assert_output_metadata(result, matrix)
+        with flag_gems.use_gems():
+            dispatched = torch.linalg.matrix_rank(matrix, hermitian=False)
+        _assert_output_metadata(dispatched, matrix)
+        utils.gems_assert_equal(dispatched, result)
+    else:
+        result = _assert_direct_and_dispatch_match_native(
+            matrix, hermitian=False
+        )
     utils.gems_assert_equal(result, expected)
 
 
