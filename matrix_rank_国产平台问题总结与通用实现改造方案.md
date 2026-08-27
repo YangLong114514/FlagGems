@@ -41,17 +41,19 @@ Hermitian 中大矩阵
     -> 依赖 kernel launch 边界完成全局同步
     -> Sturm rank count
 
-float32 Sturm
-    -> 纯 FP32 hi/lo double-single，不出现 tl.float64
-
-float64 Sturm
-    -> 原生 FP64 路径，仅服务 float64 输入
+Sturm 精度分派
+    -> support_fp64=True：保留当前原生 FP64 高精度路径
+       （既可服务 float64 输入，也可作为 float32 输入的内部高精度计算）
+    -> support_fp64=False 且输入为 float32：
+       走纯 FP32 hi/lo double-single fallback，不出现 tl.float64
+    -> support_fp64=False 且输入为 float64：明确报不支持
 ```
 
-通用算子只根据 `dtype`、`shape` 和 `hermitian` 选择算法，不出现
-`vendor_name == ...`。第一版优先保证不死锁和结果正确，暂时接受多 kernel
-launch 带来的性能下降；图捕获和 panel 优化放到后续阶段，并尽量由 runtime
-基础设施提供，而不是写入算子数学逻辑。
+通用算子只根据 `dtype`、`shape`、`hermitian` 和统一能力位
+`flag_gems.runtime.device.support_fp64` 选择算法，不出现 `vendor_name == ...`。
+第一版优先保证不死锁和结果正确，暂时接受多 kernel launch 带来的性能下降；图捕获
+和 panel 优化放到后续阶段，并尽量由 runtime 基础设施提供，而不是写入算子数学
+逻辑。
 
 ## 3. 当前通用实现的关键风险
 
@@ -281,8 +283,9 @@ occupancy。`max(1, sm_count // nb)` 无法处理单矩阵 `nb > capacity`。
 
 ### 5.3 输入 dtype 能力与内部计算 dtype 是两件事
 
-跳过 float64 输入不能保证 float32 kernel 不生成 FP64 指令。通用 float32 路径
-必须从代码结构上避免 `tl.float64`。
+跳过 float64 输入不能保证 float32 kernel 不生成 FP64 指令。在
+`support_fp64=False` 的设备上，float32 fallback 必须从代码结构上避免
+`tl.float64`；支持 FP64 的设备则没有必要被迫放弃现有原生 FP64 高精度路径。
 
 ### 5.4 测试 oracle 也具有平台能力边界
 
@@ -358,7 +361,8 @@ NPUGraph 捕获整条序列，降低重复执行时的 host enqueue 开销。Gra
 
 1. 通用算子中不增加 vendor 判断；
 2. 默认 dispatch 不再依赖跨 program software grid barrier；
-3. float32 算法内部不使用原生 FP64；
+3. 根据 `flag_gems.runtime.device.support_fp64` 做能力分派，而不是根据 vendor
+   名称分派；无 FP64 能力时，float32 fallback 内部不使用原生 FP64；
 4. 只使用 kernel launch 边界作为跨 program 的全局排序点；
 5. 同一 stream 连续 launch 即可，不在每步调用 host synchronize；
 6. 小矩阵继续融合，中大矩阵优先选择结构简单、可验证的 barrier-free 路径；
@@ -426,9 +430,22 @@ right trailing update
 所有中间 workspace 在 launch 前一次分配并循环复用。每一步只 enqueue kernel，
 不做 host 同步。
 
-### 8.4 float32 Sturm
+### 8.4 Sturm 能力分派
 
-新增纯 FP32 double-single Sturm：
+在 host launcher 层读取 `flag_gems.runtime.device.support_fp64`，选择独立 kernel
+或独立 JIT specialization，不把该能力位作为设备侧动态条件塞进同一个 kernel：
+
+```text
+输入 float64
+    support_fp64=True  -> 当前原生 FP64 Sturm
+    support_fp64=False -> 入口处明确报不支持
+
+输入 float32
+    support_fp64=True  -> 保留当前原生 FP64 辅助的 Sturm
+    support_fp64=False -> 纯 FP32 hi/lo double-single Sturm
+```
+
+其中无 FP64 能力设备使用的纯 FP32 double-single fallback 满足：
 
 - D/E、atol/rtol、Gershgorin bound 使用 FP32；
 - `e^2`、pivot、除法余项使用 `(hi, lo)`；
@@ -438,13 +455,16 @@ right trailing update
 - bisection 的 pad 使用 FP32 可表示的 ULP/epsilon，不使用在 FP32 中会舍入成 1
   的 `1 + 1e-9` 或下溢为 0 的 `1e-292`。
 
-float32 输入在所有平台统一走这条路径。这样 NVIDIA 也会承担少量性能损失，但能
-避免后端差异，并保证编译产物中没有 FP64。
+这样只有不支持 FP64 的设备承担 double-single 的额外指令开销；NVIDIA 等支持
+FP64 的设备保持当前实现及其性能特征。两条路径通过统一 capability 选择，仍然
+不含 MetaX、Hygon、Iluvatar 等 vendor 特判。
 
-### 8.5 float64 Sturm
+### 8.5 float64 输入约束
 
-float64 输入保留当前原生 FP64/高精度路径。是否允许构造和执行 float64 输入由
-统一 runtime capability 和输入检查决定，不在 kernel 内写 vendor 分支。
+float64 输入只在 `flag_gems.runtime.device.support_fp64=True` 时进入当前原生
+FP64/高精度路径。能力为 False 时应在 launch 前给出稳定、明确的 unsupported
+错误；相应 correctness/benchmark 用例根据同一个 runtime capability 显式跳过，
+不能依靠编译失败、超时或错误 rank 被动暴露能力不足。
 
 ## 9. 分阶段实施计划
 
@@ -455,16 +475,18 @@ float64 输入保留当前原生 FP64/高精度路径。是否允许构造和执
 - 记录每条路径的 grid、program 数、SM 数、dtype 和 kernel 名；
 - debug 默认关闭，不进入性能路径。
 
-### 阶段 1：纯 FP32 double-single Sturm
+### 阶段 1：Sturm 能力分派与无 FP64 fallback
 
 目标：先解决 BI-V150 在解除死锁后返回 rank 0 的问题。
 
 1. 从昇腾实现提取纯 FP32 double-single 原语和 decisive count；
-2. 在通用代码中实现 float32 专用 Sturm；
-3. 保留 factorization 不变，先用 BI-V150 的 `BJ=64, NB=16` 调试配置验证
+2. 在通用代码中实现仅供 `support_fp64=False` 使用的 float32 Sturm；
+3. 在 host launcher 中按统一 capability 选择现有原生 FP64 路径或新 fallback，
+   并保证支持 FP64 的平台保持原 dispatch；
+4. 保留 factorization 不变，先用 BI-V150 的 `BJ=64, NB=16` 调试配置验证
    `diag/offdiag -> rank 1000`；
-4. 跑近阈值、零 pivot、正负特征值、低秩和缓衰减谱测试；
-5. 检查编译 IR，确认 float32 specialization 不含 f64 类型。
+5. 跑近阈值、零 pivot、正负特征值、低秩和缓衰减谱测试；
+6. 检查编译 IR，确认无 FP64 fallback specialization 不含 f64 类型。
 
 ### 阶段 2：Hermitian barrier-free 路径
 
@@ -524,7 +546,8 @@ hermitian = False / True
 - 默认/atol/rtol/二者同时传入；
 - scalar、0D tensor、per-batch 和广播容差；
 - output shape、dtype、device 和 `out` 语义；
-- float32 specialization 的 IR 不含 f64；
+- `support_fp64=False` 时选中的 float32 fallback IR 不含 f64；
+- `support_fp64=True` 时 float32 保持现有原生 FP64 辅助路径；
 - float64 只在 runtime 宣称支持时运行。
 
 对于原生 Torch 不可用的参考场景：
@@ -549,7 +572,8 @@ hermitian = False / True
 
 1. 通用 `src/flag_gems/ops/linalg_matrix_rank.py` 不出现 vendor name 判断；
 2. 默认 dispatch 不调用跨 program 自旋 barrier；
-3. float32 specialization 不生成 `tl.float64`；
+3. `support_fp64=False` 时，float32 fallback specialization 不生成
+   `tl.float64`；支持 FP64 的设备保持原生 FP64 路径；
 4. BI-V150 `k=1024` 不超时且返回 rank 1000；
 5. MetaX/Hygon 原卡死用例在 timeout 内稳定重复通过；
 6. NVIDIA 等原有平台完整 correctness 不回退；
@@ -587,8 +611,10 @@ kernel 内不读取最终结果、不自旋等待。下一个 kernel 在 launch 
 1. 在 BI-V150 上先打印 blocked `BJ=64, NB=16` 后的 D/E，最终确认 rank 0 位于
    Sturm tail；
 2. 把昇腾 `_mr_sturm_big_tridiag_kernel` 和
-   `_mr_sturm_final_tridiag_kernel` 的纯 FP32 double-single 思想移入通用代码；
-3. 用同一实现替换所有平台的 float32 Sturm，不加 Iluvatar 特判；
+   `_mr_sturm_final_tridiag_kernel` 的纯 FP32 double-single 思想移入通用代码，
+   作为 `support_fp64=False` 时的 fallback；
+3. 在 host launcher 使用 `flag_gems.runtime.device.support_fp64` 分派，支持 FP64
+   的平台保留现有 Sturm，不加 Iluvatar 特判；
 4. 随后实现 Hermitian step/mat/apply 三 kernel，优先覆盖 k=1024；
 5. 在 MetaX、Hygon、Iluvatar、NVIDIA 四个平台跑同一组 timeout correctness；
 6. 确认稳定后再推进非 Hermitian bidiag 和 blocked Jacobi 的 barrier-free 改造。
