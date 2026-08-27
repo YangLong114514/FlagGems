@@ -19,6 +19,7 @@ import torch
 import triton
 import triton.language as tl
 
+from flag_gems.runtime import device as runtime_device
 from flag_gems.runtime import torch_device_fn
 from flag_gems.utils import libentry
 
@@ -52,6 +53,15 @@ _JACOBI_PAIRS_PER_BLOCK = 4
 _RESIDENT_BLOCKS_PER_SM = 2
 
 _SM_COUNT_CACHE = {}
+
+
+def _native_fp64_supported():
+    # Unified capability bit (runtime DeviceDetector): False on devices with
+    # no usable native FP64. There the float32 Sturm count must run as the
+    # pure-FP32 double-single fallback below (no tl.float64 anywhere), and
+    # float64 input is rejected at the entry point. Read per call so tests
+    # can force the fallback; getattr keeps unknown runtimes on the old path.
+    return getattr(runtime_device, "support_fp64", True)
 
 
 def _sm_count(device):
@@ -1770,7 +1780,11 @@ def _matrix_rank_herm_tridiag_blocked_kernel(
                 )
                 dot -= 2.0 * tl.sum(w1 * w2, axis=0)
             w_fin = tau * w_raw
-            w_fin += (-0.5 * tau * tau * dot) * v_own
+            # Never form tau**2: strongly deflated spectra drive tau to
+            # ~1e20, and tau*tau overflows fp32 (poisoning the trailing
+            # matrix with inf/NaN).  The regrouped form is exact for the
+            # same reason the unblocked kernel folds tau into w first.
+            w_fin += ((-0.5 * tau) * (tau * dot)) * v_own
             tl.store(w_base + rows * NB_P + p, w_fin, mask=rvalid)
             tl.store(v_base + rows * NB_P + p, v_own, mask=rvalid)
             if jb == 0:
@@ -2127,13 +2141,22 @@ def _matrix_rank_gk_init_kernel(
 
 
 @triton.jit
-def _sturm_count_less(D, E2H, E2L, base, K: tl.constexpr, x):
+def _sturm_count_less(D, E2H, E2L, base, K: tl.constexpr, x, STRICT: tl.constexpr):
     # Number of eigenvalues of the tridiagonal T = diag(d) + diag(e, +/-1)
-    # that are <= x, via the qd recurrence (LAPACK DLANEG convention: a zero
-    # pivot is replaced by a tiny negative value, keeping the count
-    # consistent for clustered spectra). The recurrence runs in
+    # below the threshold x, via the qd recurrence. The zero-pivot guard
+    # picks the tie convention (LAPACK DLANEG): with a tiny NEGATIVE
+    # replacement the count is #{lambda <= x}; with a tiny POSITIVE one
+    # (STRICT=True) it is exactly #{lambda < x}. torch's hermitian semantics
+    # rank = #{lambda > tol} + #{lambda < -tol} are strict on both sides:
+    # the positive side K - #{lambda <= tol} is already strict, while the
+    # negative side must use the STRICT form so that an eigenvalue exactly
+    # equal to -tol is not counted. The recurrence runs in
     # double-single arithmetic: native fp64 division is a slow software
     # sequence on this target and would dominate the O(k) chain.
+    if STRICT:
+        zero_pivot: tl.constexpr = 1.1754944e-38
+    else:
+        zero_pivot: tl.constexpr = -1.1754944e-38
     xh = x.to(tl.float32)
     xl = (x - xh.to(tl.float64)).to(tl.float32)
     d0 = tl.load(D + base)
@@ -2141,7 +2164,7 @@ def _sturm_count_less(D, E2H, E2L, base, K: tl.constexpr, x):
     dl = (d0 - dh.to(tl.float64)).to(tl.float32)
     qh, ql = _df64_add(dh, dl, -xh, -xl)
     zero_q = (qh == 0.0) & (ql == 0.0)
-    qh = tl.where(zero_q, -1.1754944e-38, qh)
+    qh = tl.where(zero_q, zero_pivot, qh)
     ql = tl.where(zero_q, 0.0, ql)
     neg = tl.where(qh < 0.0, 1, 0)
     i = 1
@@ -2155,7 +2178,7 @@ def _sturm_count_less(D, E2H, E2L, base, K: tl.constexpr, x):
         rh, rl = _df64_div_ds(e2h, e2l, qh, ql)
         qh, ql = _df64_add(th, t_l, -rh, -rl)
         zero_q = (qh == 0.0) & (ql == 0.0)
-        qh = tl.where(zero_q, -1.1754944e-38, qh)
+        qh = tl.where(zero_q, zero_pivot, qh)
         ql = tl.where(zero_q, 0.0, ql)
         neg += tl.where(qh < 0.0, 1, 0)
         i += 1
@@ -2222,16 +2245,21 @@ def _matrix_rank_sturm_rank_kernel(
             sigma_lo = tl.maximum(tl.abs(dmax), tl.abs(dmin))
         tol_lo = tl.maximum(atol, rtol * sigma_lo)
         tol_hi = tl.maximum(atol, rtol * hi)
-        cnt_lo = _sturm_count_less(D, E2H, E2L, base, K, tol_lo)
-        cnt_hi = _sturm_count_less(D, E2H, E2L, base, K, tol_hi)
+        cnt_lo = _sturm_count_less(D, E2H, E2L, base, K, tol_lo, STRICT=False)
+        cnt_hi = _sturm_count_less(D, E2H, E2L, base, K, tol_hi, STRICT=False)
         if GK:
             # Eigenvalues come in +/- sigma pairs, so the positive side
             # alone gives #{sigma > tol} without parity issues.
             rank_lo = K - cnt_lo
             rank_hi = K - cnt_hi
         else:
-            rank_lo = (K - cnt_lo) + _sturm_count_less(D, E2H, E2L, base, K, -tol_lo)
-            rank_hi = (K - cnt_hi) + _sturm_count_less(D, E2H, E2L, base, K, -tol_hi)
+            # Negative side must be strict: #{lambda < -tol}, not <=.
+            rank_lo = (K - cnt_lo) + _sturm_count_less(
+                D, E2H, E2L, base, K, -tol_lo, STRICT=True
+            )
+            rank_hi = (K - cnt_hi) + _sturm_count_less(
+                D, E2H, E2L, base, K, -tol_hi, STRICT=True
+            )
         rank = rank_lo
         if rank_lo != rank_hi:
             # The rank depends on sigma_max: refine it by bisection.
@@ -2241,7 +2269,7 @@ def _matrix_rank_sturm_rank_kernel(
             it = 0
             while it < BISECT_ITERS:
                 mid = 0.5 * (lo + hi_p)
-                cnt = _sturm_count_less(D, E2H, E2L, base, K, mid)
+                cnt = _sturm_count_less(D, E2H, E2L, base, K, mid, STRICT=False)
                 if cnt >= K:
                     hi_p = mid
                 else:
@@ -2257,7 +2285,9 @@ def _matrix_rank_sturm_rank_kernel(
                 it = 0
                 while it < BISECT_ITERS:
                     mid = 0.5 * (lo + hi_p)
-                    cnt = _sturm_count_less(D, E2H, E2L, base, K, mid)
+                    cnt = _sturm_count_less(
+                        D, E2H, E2L, base, K, mid, STRICT=False
+                    )
                     if cnt > 0:
                         hi_p = mid
                     else:
@@ -2266,12 +2296,337 @@ def _matrix_rank_sturm_rank_kernel(
                 lmin = 0.5 * (lo + hi_p)
                 sigma_max = tl.maximum(tl.abs(lmax), tl.abs(lmin))
             tol = tl.maximum(atol, rtol * sigma_max)
-            cnt = _sturm_count_less(D, E2H, E2L, base, K, tol)
+            cnt = _sturm_count_less(D, E2H, E2L, base, K, tol, STRICT=False)
             if GK:
                 rank = K - cnt
             else:
-                rank = (K - cnt) + _sturm_count_less(D, E2H, E2L, base, K, -tol)
+                rank = (K - cnt) + _sturm_count_less(
+                    D, E2H, E2L, base, K, -tol, STRICT=True
+                )
         tl.store(OUT + batch, rank.to(tl.int64))
+
+
+# ===========================================================================
+# Pure-FP32 Sturm fallback for devices without native FP64
+# (_native_fp64_supported() == False, float32 input only).  The
+# factorization paths are already FP32-only for float32 input; historically
+# only the Sturm count promoted to tl.float64.  Here every intermediate is
+# FP32: a bracket stage with plain-FP32 qd recurrences bounds sigma_max and
+# the tolerance, and the decisive count runs behind a kernel boundary in
+# FP32 hi/lo double-single arithmetic (the _df64_* primitives above are pure
+# FP32).  The bracket's rank is never the answer: the final kernel always
+# recomputes the count at the handed-off tolerance, so the ~sqrt(eps) noise
+# floor of the bracket's squared/FP32 arithmetic cannot affect the result.
+# ===========================================================================
+
+
+@triton.jit
+def _sturm32_count_less(D, E, base, K, x):
+    # Plain-FP32 qd count #{lambda <= x} (DLANEG tie convention: a zero
+    # pivot is replaced by a tiny negative value).  Bracket stage only.
+    q = tl.load(D + base) - x
+    q = tl.where(q == 0.0, -1.1754944e-38, q)
+    neg = (q < 0.0).to(tl.int32)
+    i = 1
+    while i < K:
+        di = tl.load(D + base + i)
+        ei = tl.load(E + base + i - 1)
+        q = (di - x) - ei * ei / q
+        q = tl.where(q == 0.0, -1.1754944e-38, q)
+        neg += (q < 0.0).to(tl.int32)
+        i += 1
+    return neg
+
+
+@triton.jit
+def _sturm32_count_posneg2(D, E, base, K, xp, xn):
+    # Hermitian tolerance-bracket pair in ONE pass of the qd recurrence:
+    # chain 1 counts #{lambda <= xp} (zero pivot -> tiny NEGATIVE), chain 2
+    # counts #{lambda < xn} STRICTLY (zero pivot -> tiny POSITIVE, the
+    # mirrored tie convention).  With xp = tol, xn = -tol the pair yields
+    # #{|lambda| > tol} with exact tie semantics; pairing halves the serial
+    # K-step chain.
+    d0 = tl.load(D + base)
+    q1 = d0 - xp
+    q2 = d0 - xn
+    q1 = tl.where(q1 == 0.0, -1.1754944e-38, q1)
+    q2 = tl.where(q2 == 0.0, 1.1754944e-38, q2)
+    neg1 = (q1 < 0.0).to(tl.int32)
+    neg2 = (q2 < 0.0).to(tl.int32)
+    i = 1
+    while i < K:
+        di = tl.load(D + base + i)
+        ei = tl.load(E + base + i - 1)
+        e2 = ei * ei
+        q1 = (di - xp) - e2 / q1
+        q2 = (di - xn) - e2 / q2
+        q1 = tl.where(q1 == 0.0, -1.1754944e-38, q1)
+        q2 = tl.where(q2 == 0.0, 1.1754944e-38, q2)
+        neg1 += (q1 < 0.0).to(tl.int32)
+        neg2 += (q2 < 0.0).to(tl.int32)
+        i += 1
+    return neg1, neg2
+
+
+@libentry()
+@triton.jit
+def _matrix_rank_sturm32_tridiag_bracket_kernel(
+    D,
+    E,
+    ATOL,
+    RTOL,
+    OUT,
+    TOL2,
+    FLAG,
+    K,
+    BLOCK: tl.constexpr,
+    BISECT_ITERS: tl.constexpr,
+):
+    # Hermitian bracket on the RAW tridiagonal (d, e), pure FP32.  Counts
+    # #{|lambda| > max(atol, rtol*|lambda|max)} = (K - cle(tol)) + clt(-tol)
+    # with cle/clt from _sturm32_count_posneg2.  |lambda|max is bracketed by
+    # [max|d_i|, max Gershgorin radius] (max_i |d_ii| <= |lambda|max by
+    # Rayleigh) and refined by bisection on f(x) = #{|lambda| > x} only when
+    # the two bounds give different ranks.  TOL2 hands the (LINEAR, not
+    # squared) tolerance to the decisive double-single kernel.
+    batch = tl.program_id(0)
+    kidx = tl.arange(0, BLOCK)
+    base = batch * K
+    kmask = kidx < K
+    d = tl.load(D + base + kidx, mask=kmask, other=0.0)
+    ee = tl.load(E + base + kidx, mask=kidx < K - 1, other=0.0)
+    ee_prev = tl.load(E + base + kidx - 1, mask=(kidx >= 1) & kmask, other=0.0)
+    gershgorin = tl.abs(d) + tl.abs(ee) + tl.abs(ee_prev)
+    hi = tl.max(gershgorin, axis=0)
+    dmax = tl.max(tl.abs(d), axis=0)
+    atol = tl.load(ATOL + batch)
+    rtol = tl.load(RTOL + batch)
+    if hi == 0.0:
+        # Zero matrix. TOL2 must still be written: the final kernel runs
+        # unconditionally and reads it.
+        tl.store(OUT + batch, tl.zeros((), dtype=tl.int64))
+        tl.store(TOL2 + batch, 0.0)
+        tl.store(FLAG + batch, tl.zeros((), dtype=tl.int64))
+    else:
+        tol_lo = tl.maximum(atol, rtol * dmax)
+        tol_hi = tl.maximum(atol, rtol * hi)
+        c_lo, m_lo = _sturm32_count_posneg2(D, E, base, K, tol_lo, -tol_lo)
+        c_hi, m_hi = _sturm32_count_posneg2(D, E, base, K, tol_hi, -tol_hi)
+        rank_lo = K - c_lo + m_lo
+        rank_hi = K - c_hi + m_hi
+        tol2 = tol_lo
+        if rank_lo != rank_hi:
+            # Bisect |lambda|max on [dmax, hi]: f(x) = #{|lambda| > x} is
+            # monotone; |lambda|max = sup{x : f(x) > 0}.  The pad uses only
+            # FP32-representable increments.
+            lo = dmax
+            hi_p = hi * (1.0 + 1e-9) + 1e-30
+            it = 0
+            while it < BISECT_ITERS:
+                mid = 0.5 * (lo + hi_p)
+                c_m, m_m = _sturm32_count_posneg2(D, E, base, K, mid, -mid)
+                if K - c_m + m_m >= 1:
+                    lo = mid
+                else:
+                    hi_p = mid
+                it += 1
+            lmax = 0.5 * (lo + hi_p)
+            tol2 = tl.maximum(atol, rtol * lmax)
+        refine = rank_lo != rank_hi
+        tl.store(OUT + batch, rank_lo.to(tl.int64))
+        tl.store(TOL2 + batch, tol2)
+        tl.store(FLAG + batch, refine.to(tl.int64))
+
+
+@libentry()
+@triton.jit
+def _matrix_rank_sturm32_tridiag_final_kernel(D, E, TOL2, FLAG, OUT, K):
+    # Decisive hermitian count in double-single arithmetic from the RAW
+    # tridiagonal: rank = #{lambda > tol} + #{lambda < -tol}, two lockstep
+    # qd chains q_i = d_i - x - e_{i-1}^2 / q_{i-1}.  The positive chain at
+    # x = tol uses the DLANEG guard (zero pivot -> tiny negative), so
+    # K - neg1 IS the strict #{lambda > tol}; the negative chain at x = -tol
+    # uses the MIRRORED guard (zero pivot -> tiny positive), so neg2 IS the
+    # strict #{lambda < -tol} -- exact for every tol, including tol == 0,
+    # where it yields #{lambda < 0}.  The e^2 terms are TwoProd'd so the
+    # recurrence keeps ~eps^2 relative precision.
+    # Requires enable_fp_fusion=False (fma contraction breaks the
+    # TwoSum/TwoProd error-free transforms).
+    batch = tl.program_id(0)
+    tol = tl.load(TOL2 + batch)
+    xn = -tol
+    base = batch * K
+    d0 = tl.load(D + base)
+    q1h, q1l = _df64_add(d0, 0.0, -tol, 0.0)
+    q2h, q2l = _df64_add(d0, 0.0, -xn, 0.0)
+    zero1 = (q1h == 0.0) & (q1l == 0.0)
+    q1h = tl.where(zero1, -1.1754944e-38, q1h)
+    q1l = tl.where(zero1, 0.0, q1l)
+    zero2 = (q2h == 0.0) & (q2l == 0.0)
+    q2h = tl.where(zero2, 1.1754944e-38, q2h)
+    q2l = tl.where(zero2, 0.0, q2l)
+    neg1 = ((q1h < 0.0) | ((q1h == 0.0) & (q1l < 0.0))).to(tl.int32)
+    neg2 = ((q2h < 0.0) | ((q2h == 0.0) & (q2l < 0.0))).to(tl.int32)
+    i = 1
+    while i < K:
+        di = tl.load(D + base + i)
+        ei = tl.load(E + base + i - 1)
+        eih, eil = _df64_mul_ds(ei, 0.0, ei, 0.0)
+        qd1h, qd1l = _df64_div_ds(eih, eil, q1h, q1l)
+        s1h, s1l = _df64_add(di, 0.0, -tol, 0.0)
+        q1h, q1l = _df64_add(s1h, s1l, -qd1h, -qd1l)
+        qd2h, qd2l = _df64_div_ds(eih, eil, q2h, q2l)
+        s2h, s2l = _df64_add(di, 0.0, -xn, 0.0)
+        q2h, q2l = _df64_add(s2h, s2l, -qd2h, -qd2l)
+        zero1 = (q1h == 0.0) & (q1l == 0.0)
+        q1h = tl.where(zero1, -1.1754944e-38, q1h)
+        q1l = tl.where(zero1, 0.0, q1l)
+        zero2 = (q2h == 0.0) & (q2l == 0.0)
+        q2h = tl.where(zero2, 1.1754944e-38, q2h)
+        q2l = tl.where(zero2, 0.0, q2l)
+        neg1 += ((q1h < 0.0) | ((q1h == 0.0) & (q1l < 0.0))).to(tl.int32)
+        neg2 += ((q2h < 0.0) | ((q2h == 0.0) & (q2l < 0.0))).to(tl.int32)
+        i += 1
+    rank = (K - neg1) + neg2
+    tl.store(OUT + batch, rank.to(tl.int64))
+
+
+@libentry()
+@triton.jit
+def _matrix_rank_bidiag32_to_tridiag_kernel(D, E, DD, EE, K, BLOCK: tl.constexpr):
+    # Construct the B^T B tridiagonal (dd_i = d_i^2 + e_{i-1}^2,
+    # ee_i = d_i * e_i) from the raw bidiagonal d/e, in its OWN launch so
+    # the Sturm bracket only READS global memory.  The FP32 tridiagonal has
+    # an absolute element rounding of ~eps*sigma_max^2, which swamps any
+    # squared singular value below ~(sqrt(eps)*sigma_max)^2 -- i.e.
+    # everything near the default tolerance (k*eps*sigma_max).  It therefore
+    # feeds only the bracket; the decisive kernel works from the RAW d/e
+    # (relative precision ~K*eps regardless of conditioning) and squares
+    # them inside the double-single arithmetic.
+    batch = tl.program_id(0)
+    kidx = tl.arange(0, BLOCK)
+    base = batch * K
+    kmask = kidx < K
+    d = tl.load(D + base + kidx, mask=kmask, other=0.0)
+    e_cur = tl.load(E + base + kidx, mask=kidx < K - 1, other=0.0)
+    e_prev = tl.load(E + base + kidx - 1, mask=(kidx >= 1) & kmask, other=0.0)
+    tl.store(DD + base + kidx, d * d + e_prev * e_prev, mask=kmask)
+    tl.store(EE + base + kidx, d * e_cur, mask=kmask)
+
+
+@libentry()
+@triton.jit
+def _matrix_rank_sturm32_bidiag_bracket_kernel(
+    D,
+    E,
+    ATOL,
+    RTOL,
+    OUT,
+    TOL2,
+    FLAG,
+    K,
+    BLOCK: tl.constexpr,
+    BISECT_ITERS: tl.constexpr,
+):
+    # Bidiagonal bracket on the B^T B tridiagonal (dd, ee) written by
+    # _matrix_rank_bidiag32_to_tridiag_kernel, pure FP32.  Counts
+    # #{sigma > max(atol, rtol*sigma_max)} with sigma_max bracketed by
+    # sqrt(max dd) / sqrt(Gershgorin) and refined by bisection only when the
+    # two bounds give different ranks.
+    batch = tl.program_id(0)
+    kidx = tl.arange(0, BLOCK)
+    base = batch * K
+    kmask = kidx < K
+    dd = tl.load(D + base + kidx, mask=kmask, other=0.0)
+    ee = tl.load(E + base + kidx, mask=kidx < K - 1, other=0.0)
+    ee_prev = tl.load(E + base + kidx - 1, mask=(kidx >= 1) & kmask, other=0.0)
+    gershgorin = tl.abs(dd) + tl.abs(ee) + tl.abs(ee_prev)
+    hi = tl.max(gershgorin, axis=0)
+    dmax = tl.max(dd, axis=0)
+    atol = tl.load(ATOL + batch)
+    rtol = tl.load(RTOL + batch)
+    if hi == 0.0:
+        # Zero matrix: rank 0. TOL2 must still be written: the final
+        # double-single kernel runs unconditionally and reads it.
+        tl.store(OUT + batch, tl.zeros((), dtype=tl.int64))
+        tl.store(TOL2 + batch, 0.0)
+        tl.store(FLAG + batch, tl.zeros((), dtype=tl.int64))
+    else:
+        sigma_lo = tl.sqrt(tl.maximum(dmax, 0.0))
+        sigma_hi = tl.sqrt(hi)
+        tol_lo = tl.maximum(atol, rtol * sigma_lo)
+        tol_hi = tl.maximum(atol, rtol * sigma_hi)
+        cnt_lo = _sturm32_count_less(D, E, base, K, tol_lo * tol_lo)
+        cnt_hi = _sturm32_count_less(D, E, base, K, tol_hi * tol_hi)
+        rank_lo = K - cnt_lo
+        rank_hi = K - cnt_hi
+        rank = rank_lo
+        refine = rank_lo != rank_hi
+        tol2 = tol_lo * tol_lo
+        if refine:
+            lo = tl.maximum(dmax, 0.0)
+            hi_p = hi * (1.0 + 1e-9) + 1e-30
+            it = 0
+            while it < BISECT_ITERS:
+                mid = 0.5 * (lo + hi_p)
+                cnt = _sturm32_count_less(D, E, base, K, mid)
+                if cnt >= K:
+                    hi_p = mid
+                else:
+                    lo = mid
+                it += 1
+            lmax = 0.5 * (lo + hi_p)
+            sigma_max = tl.sqrt(lmax)
+            tol2 = tl.maximum(atol, rtol * sigma_max)
+            tol2 = tol2 * tol2
+        tl.store(OUT + batch, rank.to(tl.int64))
+        tl.store(TOL2 + batch, tol2)
+        tl.store(FLAG + batch, refine.to(tl.int64))
+
+
+@libentry()
+@triton.jit
+def _matrix_rank_sturm32_bidiag_final_kernel(D, E, TOL2, FLAG, OUT, K):
+    # The decisive count, in double-single arithmetic, from the RAW
+    # bidiagonal d/e (NOT the FP32 dd/ee tridiagonal, whose squaring rounds
+    # each element absolutely by ~eps*sigma_max^2 -- a sqrt(eps) noise floor
+    # in the sigma domain).  Squaring the FP32 d/e inside the double-single
+    # arithmetic keeps every intermediate at ~eps^2 relative precision.  The
+    # qd recurrence for B^T B: dd_i = d_i^2 + e_{i-1}^2, ee_i = d_i*e_i,
+    # q_i = dd_i - tol2 - ee_{i-1}^2 / q_{i-1}.
+    # Requires enable_fp_fusion=False (fma contraction breaks the
+    # TwoSum/TwoProd error-free transforms).
+    batch = tl.program_id(0)
+    tol2 = tl.load(TOL2 + batch)
+    base = batch * K
+    d0 = tl.load(D + base)
+    d0h, d0l = _df64_mul_ds(d0, 0.0, d0, 0.0)
+    q_h, q_l = _df64_add(d0h, d0l, -tol2, 0.0)
+    zero = (q_h == 0.0) & (q_l == 0.0)
+    q_h = tl.where(zero, -1.1754944e-38, q_h)
+    q_l = tl.where(zero, 0.0, q_l)
+    neg = ((q_h < 0.0) | ((q_h == 0.0) & (q_l < 0.0))).to(tl.int32)
+    dprev = d0
+    i = 1
+    while i < K:
+        di = tl.load(D + base + i)
+        ei = tl.load(E + base + i - 1)
+        dih, dil = _df64_mul_ds(di, 0.0, di, 0.0)
+        eih, eil = _df64_mul_ds(ei, 0.0, ei, 0.0)
+        dd_h, dd_l = _df64_add(dih, dil, eih, eil)
+        ph, pl = _df64_mul_ds(dprev, 0.0, ei, 0.0)
+        ee_h, ee_l = _df64_mul_ds(ph, pl, ph, pl)
+        qd_h, qd_l = _df64_div_ds(ee_h, ee_l, q_h, q_l)
+        s_h, s_l = _df64_add(dd_h, dd_l, -tol2, 0.0)
+        q_h, q_l = _df64_add(s_h, s_l, -qd_h, -qd_l)
+        zero = (q_h == 0.0) & (q_l == 0.0)
+        q_h = tl.where(zero, -1.1754944e-38, q_h)
+        q_l = tl.where(zero, 0.0, q_l)
+        neg += ((q_h < 0.0) | ((q_h == 0.0) & (q_l < 0.0))).to(tl.int32)
+        dprev = di
+        i += 1
+    rank_b = (K - neg).to(tl.int64)
+    tl.store(OUT + batch, rank_b)
 
 
 def _expand_tolerance(value, batch_shape, input, name):
@@ -2338,6 +2693,13 @@ def _check_input(input, hermitian):
             "FlagGems linalg_matrix_rank currently supports float32 and float64 "
             f"real inputs only; got {input.dtype}"
         )
+    if input.dtype == torch.float64 and not _native_fp64_supported():
+        # Fail fast, before any shape dispatch: every float64 path below
+        # computes in native FP64 (or fp64-backed double-single splits).
+        raise NotImplementedError(
+            "FlagGems linalg_matrix_rank: float64 input requires native FP64 "
+            "support, which this device does not provide"
+        )
     if hermitian and input.shape[-2] != input.shape[-1]:
         raise RuntimeError(
             "torch.linalg.matrix_rank: A must be batches of square matrices when "
@@ -2360,17 +2722,21 @@ def _empty_matrix_rank(input, output_shape):
 
 
 def _launch_herm_tridiag_rank(matrix, atol_tensor, rtol_tensor, out, k, batch_count, input):
-    # Non-iterative hermitian path: symmetrize into an fp64 work matrix,
-    # tridiagonalize with the multi-block Householder kernel, then count
-    # eigenvalues outside [-tol, tol] with Sturm sequences.
+    # Non-iterative hermitian path: symmetrize into a work matrix of the
+    # input dtype, tridiagonalize with the multi-block Householder kernel,
+    # then count eigenvalues outside [-tol, tol] with Sturm sequences.
     device = input.device
     work_dtype = input.dtype
+    # Devices without native FP64 take the pure-FP32 double-single Sturm
+    # tail; float64 input never reaches here on them (entry fail-fast).
+    ds32 = work_dtype == torch.float32 and not _native_fp64_supported()
     sym = torch.empty((batch_count, k, k), dtype=work_dtype, device=device)
     diag = torch.empty((batch_count, k), dtype=work_dtype, device=device)
     offdiag = torch.empty((batch_count, k), dtype=work_dtype, device=device)
     work_w = torch.empty((batch_count, k), dtype=work_dtype, device=device)
-    e2_hi = torch.empty((batch_count, k), dtype=torch.float32, device=device)
-    e2_lo = torch.empty((batch_count, k), dtype=torch.float32, device=device)
+    if not ds32:
+        e2_hi = torch.empty((batch_count, k), dtype=torch.float32, device=device)
+        e2_lo = torch.empty((batch_count, k), dtype=torch.float32, device=device)
     _matrix_rank_herm_tridiag_init_kernel[(batch_count, triton.cdiv(k, 64))](
         matrix,
         sym,
@@ -2437,6 +2803,34 @@ def _launch_herm_tridiag_rank(matrix, atol_tensor, rtol_tensor, out, k, batch_co
                 BLOCK_C=64,
                 num_warps=2,
             )
+    if ds32:
+        block_k = triton.next_power_of_2(k)
+        tol2 = torch.empty((batch_count,), dtype=torch.float32, device=device)
+        refine = torch.empty((batch_count,), dtype=torch.int64, device=device)
+        _matrix_rank_sturm32_tridiag_bracket_kernel[(batch_count,)](
+            diag,
+            offdiag,
+            atol_tensor,
+            rtol_tensor,
+            out,
+            tol2,
+            refine,
+            k,
+            BLOCK=block_k,
+            BISECT_ITERS=32,
+            num_warps=1,
+        )
+        _matrix_rank_sturm32_tridiag_final_kernel[(batch_count,)](
+            diag,
+            offdiag,
+            tol2,
+            refine,
+            out,
+            k,
+            num_warps=1,
+            enable_fp_fusion=False,
+        )
+        return
     _matrix_rank_sturm_rank_kernel[(batch_count,)](
         diag,
         offdiag,
@@ -2461,17 +2855,27 @@ def _launch_bidiag_rank(matrix, atol_tensor, rtol_tensor, out, m, n, k, rows, ba
     # the tolerance with Sturm sequences on the Golub-Kahan tridiagonal.
     device = input.device
     work_dtype = input.dtype
+    # Devices without native FP64 take the pure-FP32 double-single Sturm
+    # tail; float64 input never reaches here on them (entry fail-fast).
+    ds32 = work_dtype == torch.float32 and not _native_fp64_supported()
     work = torch.empty((batch_count, k, rows), dtype=work_dtype, device=device)
     w_left = torch.empty((batch_count, k), dtype=work_dtype, device=device)
     w_right = torch.empty((batch_count, rows), dtype=work_dtype, device=device)
     diag = torch.empty((batch_count, k), dtype=work_dtype, device=device)
     offdiag = torch.empty((batch_count, k), dtype=work_dtype, device=device)
-    gk_diag = torch.empty((batch_count, 2 * k), dtype=torch.float64, device=device)
-    # Keep the per-batch stride at 2K (one slack entry): the Sturm kernel
-    # indexes the off-diagonal with stride K == 2k.
-    gk_off = torch.empty((batch_count, 2 * k), dtype=work_dtype, device=device)
-    e2_hi = torch.empty((batch_count, 2 * k), dtype=torch.float32, device=device)
-    e2_lo = torch.empty((batch_count, 2 * k), dtype=torch.float32, device=device)
+    if ds32:
+        # B^T B tridiagonal (size k, fp32) built from the raw bidiagonal for
+        # the pure-FP32 bracketing pass; the decisive count re-reads the raw
+        # bidiagonal in double-single arithmetic.
+        gk_dd = torch.empty((batch_count, k), dtype=torch.float32, device=device)
+        gk_ee = torch.empty((batch_count, k), dtype=torch.float32, device=device)
+    else:
+        gk_diag = torch.empty((batch_count, 2 * k), dtype=torch.float64, device=device)
+        # Keep the per-batch stride at 2K (one slack entry): the Sturm kernel
+        # indexes the off-diagonal with stride K == 2k.
+        gk_off = torch.empty((batch_count, 2 * k), dtype=work_dtype, device=device)
+        e2_hi = torch.empty((batch_count, 2 * k), dtype=torch.float32, device=device)
+        e2_lo = torch.empty((batch_count, 2 * k), dtype=torch.float32, device=device)
     _matrix_rank_bidiag_init_kernel[(batch_count, triton.cdiv(rows, 64))](
         matrix,
         work,
@@ -2519,6 +2923,43 @@ def _launch_bidiag_rank(matrix, atol_tensor, rtol_tensor, out, m, n, k, rows, ba
             BLOCK_C=128,
             num_warps=4,
         )
+    if ds32:
+        block_k = triton.next_power_of_2(k)
+        tol2 = torch.empty((batch_count,), dtype=torch.float32, device=device)
+        refine = torch.empty((batch_count,), dtype=torch.int64, device=device)
+        _matrix_rank_bidiag32_to_tridiag_kernel[(batch_count,)](
+            diag,
+            offdiag,
+            gk_dd,
+            gk_ee,
+            k,
+            BLOCK=block_k,
+            num_warps=1,
+        )
+        _matrix_rank_sturm32_bidiag_bracket_kernel[(batch_count,)](
+            gk_dd,
+            gk_ee,
+            atol_tensor,
+            rtol_tensor,
+            out,
+            tol2,
+            refine,
+            k,
+            BLOCK=block_k,
+            BISECT_ITERS=32,
+            num_warps=1,
+        )
+        _matrix_rank_sturm32_bidiag_final_kernel[(batch_count,)](
+            diag,
+            offdiag,
+            tol2,
+            refine,
+            out,
+            k,
+            num_warps=1,
+            enable_fp_fusion=False,
+        )
+        return
     _matrix_rank_gk_init_kernel[(batch_count,)](
         diag,
         offdiag,
@@ -2935,6 +3376,39 @@ def _launch_matrix_rank(
     return out
 
 
+def _needs_negative_tolerance_fixup(atol, rtol):
+    # tol = max(atol, rtol*sigma_max) < 0 is reachable only where BOTH the
+    # effective atol and rtol are negative; since the defaults are >= 0 both
+    # must be given explicitly. Pure host-side check when both are scalars.
+    if atol is None or rtol is None:
+        return False
+    if isinstance(atol, torch.Tensor) or isinstance(rtol, torch.Tensor):
+        # Cannot inspect values without a device sync; take the async path.
+        return True
+    return float(atol) < 0.0 and float(rtol) < 0.0
+
+
+def _correct_negative_tolerance_rank(
+    input, result, atol_tensor, rtol_tensor, hermitian
+):
+    # torch does not clamp the tolerance at zero. Where tol < 0 (both atol
+    # and rtol negative), every singular value (>= 0) exceeds tol, so a
+    # nonzero matrix has full rank k, while a zero matrix still has rank 0
+    # (rtol*0 == 0 lifts tol back to max(atol, 0) == 0). The counting
+    # kernels assume tol >= 0 -- the hermitian Sturm path splits
+    # #{|lambda| > tol} into #{lambda > tol} + #{lambda < -tol}, which double
+    # counts the overlap for tol < 0, and the Golub-Kahan path counts in the
+    # sigma^2 domain where tol gets squared -- so fix the result up here.
+    # Fully asynchronous: no Python branching on device data.
+    neg_pair = (atol_tensor < 0) & (rtol_tensor < 0)
+    # hermitian reads only the lower triangle: strict-upper garbage is
+    # invisible to torch, so the "nonzero" test must ignore it too.
+    visible = torch.tril(input) if hermitian else input
+    nonzero = (visible.amax(dim=(-2, -1)) > 0) | (visible.amin(dim=(-2, -1)) < 0)
+    k = min(input.shape[-2:])
+    return torch.where(neg_pair & nonzero, k, result)
+
+
 def linalg_matrix_rank(input, *, atol=None, rtol=None, hermitian=False):
     """Computes numerical matrix rank with shape-specialized Triton Jacobi."""
     logger.debug("GEMS LINALG_MATRIX_RANK")
@@ -2945,12 +3419,17 @@ def linalg_matrix_rank(input, *, atol=None, rtol=None, hermitian=False):
         return _empty_matrix_rank(input, output_shape)
 
     atol_tensor, rtol_tensor = _prepare_tolerances(input, atol, rtol)
-    return _launch_matrix_rank(
+    result = _launch_matrix_rank(
         input,
         atol_tensor,
         rtol_tensor,
         hermitian,
     )
+    if _needs_negative_tolerance_fixup(atol, rtol):
+        result = _correct_negative_tolerance_rank(
+            input, result, atol_tensor, rtol_tensor, hermitian
+        )
+    return result
 
 
 def linalg_matrix_rank_tol(input, tol, hermitian=False):

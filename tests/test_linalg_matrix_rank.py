@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import importlib
+
 import pytest
 import torch
 
@@ -962,8 +964,11 @@ def test_linalg_matrix_rank_nonsquare_lowrank(dtype, shape, rank):
 
 
 @pytest.mark.linalg_matrix_rank
-@pytest.mark.skipif(not IS_ASCEND, reason="Ascend-specific path coverage")
-@pytest.mark.parametrize("k", [3, 33, 65, 128, 257])
+# k <= 32 is only exercised on Ascend: there the fused kernel counts with a
+# Sturm qd chain (whose tie convention this test targets), while the generic
+# path uses one-sided Jacobi whose column-norm comparison is directly strict
+# (and its fp32 sum-of-squares cannot represent the subnormal-tie case).
+@pytest.mark.parametrize("k", [3, 33, 65, 128, 257] if IS_ASCEND else [33, 65, 128, 257])
 def test_linalg_matrix_rank_hermitian_strict_threshold(k, monkeypatch):
     # Pin the exact herm paths: k > 64 defaults to unpivoted QR (whose
     # |R_ii| count has the documented slow-decay/tie limitations); the
@@ -1058,7 +1063,6 @@ def test_linalg_matrix_rank_hermitian_strict_threshold(k, monkeypatch):
 
 
 @pytest.mark.linalg_matrix_rank
-@pytest.mark.skipif(not IS_ASCEND, reason="Ascend-specific path coverage")
 @pytest.mark.parametrize("k", [3, 33, 65, 257])
 @pytest.mark.parametrize("hermitian", [False, True])
 def test_linalg_matrix_rank_negative_tolerances(k, hermitian):
@@ -1183,7 +1187,6 @@ def test_linalg_matrix_rank_longdim_exact_power2_nb(shape, monkeypatch):
 
 
 @pytest.mark.linalg_matrix_rank
-@pytest.mark.skipif(not IS_ASCEND, reason="Ascend-specific path coverage")
 @pytest.mark.parametrize("k,expect_rank", [(65, 1), (128, 1), (257, 1), (513, 1)])
 def test_linalg_matrix_rank_hermitian_deflated_spectrum(
     k, expect_rank, monkeypatch
@@ -1332,3 +1335,84 @@ def test_linalg_matrix_rank_hermitian_ignores_strict_upper_large(k):
     )
     result = flag_gems.linalg_matrix_rank(matrix, hermitian=True)
     utils.gems_assert_equal(result, reference.to(flag_gems.device))
+
+
+@pytest.mark.linalg_matrix_rank
+@pytest.mark.skipif(IS_ASCEND, reason="Ascend backend has its own implementation")
+@pytest.mark.parametrize(
+    "shape,hermitian",
+    [
+        pytest.param((65, 65), True, id="herm-padded-tridiag"),
+        pytest.param((257, 257), True, id="herm-large-tridiag"),
+        pytest.param((4, 65, 65), True, id="herm-batched"),
+        pytest.param((513, 513), False, id="bidiag-k513"),
+        pytest.param((600, 513), False, id="bidiag-tall"),
+    ],
+)
+def test_linalg_matrix_rank_ds32_fallback(shape, hermitian, monkeypatch):
+    # Force the pure-FP32 double-single Sturm tail (the path selected when
+    # runtime device support_fp64 is False) on a device that natively has
+    # fp64, and check every rank-relevant case against torch.  The fallback
+    # only changes the Sturm count, so diagonal spectra stay exact and the
+    # dense cases are built with margins far above the fp32 noise floor.
+    module = importlib.import_module("flag_gems.ops.linalg_matrix_rank")
+    monkeypatch.setattr(module.runtime_device, "support_fp64", False)
+
+    device = flag_gems.device
+    generator = torch.Generator().manual_seed(0)
+    k = min(shape[-2:])
+    rank = 7
+
+    if hermitian:
+        dense = torch.randn(shape, generator=generator)
+        dense = dense + dense.mT
+        x = torch.randn(shape[:-2] + (k, rank), generator=generator)
+        low_rank = x @ x.mT
+        values = torch.zeros(k)
+        values[:6] = torch.tensor([1.0, -0.5, 1e-3, -1e-3, 1e-8, -1e-8])
+        spectrum = torch.diag(values).expand(shape).contiguous()
+    else:
+        dense = torch.randn(shape, generator=generator)
+        x = torch.randn(shape[:-2] + (shape[-2], rank), generator=generator)
+        y = torch.randn(shape[:-2] + (shape[-1], rank), generator=generator)
+        low_rank = x @ y.mT
+        values = torch.zeros(k)
+        values[:4] = torch.tensor([1.0, 2.0, 1e-3, 1e-8])
+        spectrum = torch.zeros(shape)
+        spectrum[..., torch.arange(k), torch.arange(k)] = values
+    zero = torch.zeros(shape)
+
+    def check(matrix, **kwargs):
+        matrix = matrix.float().to(device)
+        reference = torch.linalg.matrix_rank(matrix.cpu(), **kwargs)
+        result = flag_gems.linalg_matrix_rank(matrix, **kwargs)
+        utils.gems_assert_equal(result, reference.to(device))
+
+    # full-rank dense
+    check(dense, hermitian=hermitian)
+    # exactly rank-`rank`, kept spectrum well above the default tolerance
+    check(low_rank, hermitian=hermitian)
+    # zero matrix -> rank 0 (the bracket must hand a defined zero tolerance
+    # to the decisive count)
+    check(zero, hermitian=hermitian)
+    # near-threshold spectrum: 1e-3 above the default tolerance
+    # (k*eps*sigma_max ~ 1e-5), 1e-8 below it
+    check(spectrum, hermitian=hermitian)
+    # explicit atol: only the O(1) part of the spectrum survives
+    check(spectrum, hermitian=hermitian, atol=1e-2)
+
+
+@pytest.mark.linalg_matrix_rank
+@pytest.mark.skipif(IS_ASCEND, reason="Ascend backend has its own implementation")
+def test_linalg_matrix_rank_fp64_input_requires_native_fp64(monkeypatch):
+    # On a device without native FP64 the entry point must reject float64
+    # input with NotImplementedError before any shape dispatch, instead of
+    # silently computing in demoted precision.
+    module = importlib.import_module("flag_gems.ops.linalg_matrix_rank")
+    monkeypatch.setattr(module.runtime_device, "support_fp64", False)
+
+    matrix = torch.randn(8, 8, dtype=torch.float64, device=flag_gems.device)
+    with pytest.raises(NotImplementedError, match="native FP64"):
+        flag_gems.linalg_matrix_rank(matrix)
+    with pytest.raises(NotImplementedError, match="native FP64"):
+        flag_gems.linalg_matrix_rank(matrix, hermitian=True)
