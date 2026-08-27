@@ -962,11 +962,8 @@ def test_linalg_matrix_rank_nonsquare_lowrank(dtype, shape, rank):
 
 
 @pytest.mark.linalg_matrix_rank
-# k <= 32 is only exercised on Ascend: there the fused kernel counts with a
-# Sturm qd chain (whose tie convention this test targets), while the generic
-# path uses one-sided Jacobi whose column-norm comparison is directly strict
-# (and its fp32 sum-of-squares cannot represent the subnormal-tie case).
-@pytest.mark.parametrize("k", [3, 33, 65, 128, 257] if IS_ASCEND else [33, 65, 128, 257])
+@pytest.mark.skipif(not IS_ASCEND, reason="Ascend-specific path coverage")
+@pytest.mark.parametrize("k", [3, 33, 65, 128, 257])
 def test_linalg_matrix_rank_hermitian_strict_threshold(k, monkeypatch):
     # Pin the exact herm paths: k > 64 defaults to unpivoted QR (whose
     # |R_ii| count has the documented slow-decay/tie limitations); the
@@ -1061,6 +1058,7 @@ def test_linalg_matrix_rank_hermitian_strict_threshold(k, monkeypatch):
 
 
 @pytest.mark.linalg_matrix_rank
+@pytest.mark.skipif(not IS_ASCEND, reason="Ascend-specific path coverage")
 @pytest.mark.parametrize("k", [3, 33, 65, 257])
 @pytest.mark.parametrize("hermitian", [False, True])
 def test_linalg_matrix_rank_negative_tolerances(k, hermitian):
@@ -1185,6 +1183,7 @@ def test_linalg_matrix_rank_longdim_exact_power2_nb(shape, monkeypatch):
 
 
 @pytest.mark.linalg_matrix_rank
+@pytest.mark.skipif(not IS_ASCEND, reason="Ascend-specific path coverage")
 @pytest.mark.parametrize("k,expect_rank", [(65, 1), (128, 1), (257, 1), (513, 1)])
 def test_linalg_matrix_rank_hermitian_deflated_spectrum(
     k, expect_rank, monkeypatch

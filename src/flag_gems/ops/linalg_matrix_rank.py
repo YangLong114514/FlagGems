@@ -13,14 +13,12 @@
 # limitations under the License.
 
 import logging
-import os
 import warnings
 
 import torch
 import triton
 import triton.language as tl
 
-from flag_gems.runtime import device as runtime_device
 from flag_gems.runtime import torch_device_fn
 from flag_gems.utils import libentry
 
@@ -54,44 +52,6 @@ _JACOBI_PAIRS_PER_BLOCK = 4
 _RESIDENT_BLOCKS_PER_SM = 2
 
 _SM_COUNT_CACHE = {}
-
-# Vendors whose Triton port is known to lack reliable cross-program atomic
-# ordering, on which the software grid barriers below would see stale data
-# or deadlock (triton-ascend: >= 8 spinning programs lose atomic
-# visibility). Such backends normally ship their own linalg_matrix_rank
-# override; if the generic implementation is ever selected for them, fail
-# loudly instead of hanging the device. FLAGGEMS_MR_DISABLE_GRID_BARRIER=1
-# forces the same behavior for testing new ports.
-_GRID_BARRIER_UNSUPPORTED_VENDORS = frozenset({"ascend"})
-
-# Memory order for the barrier spin polls. The barrier-protected loads only
-# require acquire ordering, and NVIDIA runs measurably faster with a pure
-# acquire poll (~18% on barrier-heavy shapes). metax/hygon keep the default
-# acq_rel, the form the d8a49b2f miscompile workaround was validated with
-# (same as linalg_qr._barrier). Captured by the JIT as a compile-time
-# constant, so each vendor gets its own specialized kernels.
-_BARRIER_POLL_SEM = tl.constexpr(
-    "acq_rel"
-    if runtime_device.vendor_name in ("metax", "hygon")
-    else "acquire"
-)
-
-
-def _grid_barrier_supported():
-    if os.environ.get("FLAGGEMS_MR_DISABLE_GRID_BARRIER", "0") == "1":
-        return False
-    return runtime_device.vendor_name not in _GRID_BARRIER_UNSUPPORTED_VENDORS
-
-
-def _require_grid_barrier(path_name):
-    if not _grid_barrier_supported():
-        raise NotImplementedError(
-            f"FlagGems linalg_matrix_rank {path_name} path relies on software "
-            f"grid barriers (spinning global atomics), which the "
-            f"'{runtime_device.vendor_name}' backend does not execute "
-            "reliably. Only shapes with min(m, n) <= 64 are available "
-            "through the single-program fused Jacobi path on this backend."
-        )
 
 
 def _sm_count(device):
@@ -499,16 +459,17 @@ def _grid_barrier(BARRIER, base, generation, num_programs):
     # semantics, subsequent buffer reads can be served stale data that
     # predates the barrier.
     #
-    # Keep the poll directly in the while CONDITION with an empty body:
-    # the read-modify-write must be re-evaluated by the loop condition on
-    # every iteration -- assigning the atomic to a loop-carried scalar
-    # (``arrived = ...; while arrived < target: arrived = ...``) miscompiles
-    # on some vendor backends (metax, hygon), which then spin forever on a
-    # stale value. The poll order is _BARRIER_POLL_SEM: acquire everywhere
-    # except on those backends, which keep the validated acq_rel default.
+    # Keep the poll directly in the while CONDITION with an empty body, and
+    # use the DEFAULT memory order (acq_rel) -- the same form as
+    # linalg_qr._barrier.  The read-modify-write must be re-evaluated by the
+    # loop condition on every iteration: assigning the atomic to a
+    # loop-carried scalar (``arrived = ...; while arrived < target:
+    # arrived = ...``) miscompiles on some vendor backends (metax, hygon),
+    # which then spin forever on a stale value.  acq_rel is a superset of
+    # the acquire ordering the barrier-protected loads need.
     tl.atomic_add(BARRIER, 1)
     target = base + (generation + 1) * num_programs
-    while tl.atomic_add(BARRIER, 0, sem=_BARRIER_POLL_SEM, scope="gpu") < target:
+    while tl.atomic_add(BARRIER, 0) < target:
         pass
 
 
@@ -526,11 +487,11 @@ def _neighbor_sync(FLAGS, base, generation, program, pair_block, pair_blocks):
     prev = batch_base + (pair_block + pair_blocks - 1) % pair_blocks
     nxt = batch_base + (pair_block + 1) % pair_blocks
     # Same spin form as _grid_barrier: poll in the while condition with an
-    # empty body and _BARRIER_POLL_SEM ordering; a loop-carried scalar
+    # empty body and default (acq_rel) ordering; a loop-carried scalar
     # holding the poll result miscompiles on some vendor backends.
-    while tl.atomic_add(FLAGS + prev, 0, sem=_BARRIER_POLL_SEM, scope="gpu") < target:
+    while tl.atomic_add(FLAGS + prev, 0) < target:
         pass
-    while tl.atomic_add(FLAGS + nxt, 0, sem=_BARRIER_POLL_SEM, scope="gpu") < target:
+    while tl.atomic_add(FLAGS + nxt, 0) < target:
         pass
 
 
@@ -1563,7 +1524,7 @@ def _matrix_rank_herm_tridiag_kernel(
                     other=0.0,
                 )
                 vv = tl.load(s_base + cc * K + i, mask=cmask, other=0.0)
-                vv = tl.where((cc > L0 - 1) & (cc < L0 + 1), x0 - alpha_r, vv)
+                vv = tl.where(cc == L0, x0 - alpha_r, vv)
                 w_acc += tl.sum(tile * vv[None, :], axis=1)
                 c += BLOCK_C
             w_acc *= tau
@@ -1580,13 +1541,13 @@ def _matrix_rank_herm_tridiag_kernel(
                 cc = c + cidx
                 cmask = cc < K
                 vv = tl.load(s_base + cc * K + i, mask=cmask, other=0.0)
-                vv = tl.where((cc > L0 - 1) & (cc < L0 + 1), x0 - alpha_r, vv)
+                vv = tl.where(cc == L0, x0 - alpha_r, vv)
                 ww = tl.load(w_base + cc, mask=cmask, other=0.0)
                 dot += tl.sum(vv * ww, axis=0)
                 c += BLOCK_C
             beta = -0.5 * tau * dot
             v_own = tl.load(s_base + rows * K + i, mask=rvalid, other=0.0)
-            v_own = tl.where((rows > L0 - 1) & (rows < L0 + 1), x0 - alpha_r, v_own)
+            v_own = tl.where(rows == L0, x0 - alpha_r, v_own)
             w_own = tl.load(w_base + rows, mask=rvalid, other=0.0)
             w_own += beta * v_own
             c = L0
@@ -1594,7 +1555,7 @@ def _matrix_rank_herm_tridiag_kernel(
                 cc = c + cidx
                 cmask = cc < K
                 vc = tl.load(s_base + cc * K + i, mask=cmask, other=0.0)
-                vc = tl.where((cc > L0 - 1) & (cc < L0 + 1), x0 - alpha_r, vc)
+                vc = tl.where(cc == L0, x0 - alpha_r, vc)
                 wc = tl.load(w_base + cc, mask=cmask, other=0.0)
                 wc += beta * vc
                 tile = tl.load(
@@ -1688,17 +1649,14 @@ def _matrix_rank_herm_tridiag_blocked_kernel(
             # ---- phase A: deferred column update + sigma partial ----
             # Tensor ops masked by runtime values (qm) are drastically slow
             # in Triton (~20 us/column measured), so every panel-column mask
-            # is applied as a multiplicative mask on unmasked/static-masked
-            # loads; stale entries for q >= p are finite (the launcher
-            # zero-initializes the V/W buffers) and get zeroed by the mask.
+            # is applied as tl.where on unmasked/static-masked loads; stale
+            # entries for q >= p are finite (the launcher zero-initializes
+            # the V/W buffers) and get zeroed by the where.
             rvalid_a = (rows >= i) & (rows < K)
             col = tl.load(s_base + rows * K + i, mask=rvalid_a, other=0.0)
             if p > 0:
-                # Multiply by the mask: tl.where(qm, vec, 0.0) (vector with a
-                # scalar-0 branch) miscompiles on some vendor Triton ports.
-                qmask = qm.to(S.dtype.element_ty)
-                v_row_i = tl.load(v_base + i * NB_P + qidx) * qmask
-                w_row_i = tl.load(w_base + i * NB_P + qidx) * qmask
+                v_row_i = tl.where(qm, tl.load(v_base + i * NB_P + qidx), 0.0)
+                w_row_i = tl.where(qm, tl.load(w_base + i * NB_P + qidx), 0.0)
                 v_own_a = tl.load(
                     v_base + rows[:, None] * NB_P + qidx[None, :],
                     mask=(rows < K)[:, None],
@@ -1714,7 +1672,7 @@ def _matrix_rank_herm_tridiag_blocked_kernel(
                 )
                 tl.store(s_base + rows * K + i, col, mask=rvalid_a)
             sig_part = tl.sum(
-                col * col * ((rows >= L0) & rvalid_a).to(col.dtype), axis=0
+                tl.where((rows >= L0) & rvalid_a, col * col, 0.0), axis=0
             )
             tl.atomic_add(sig_ptr, sig_part, sem="relaxed")
             if jb == 0:
@@ -1736,7 +1694,7 @@ def _matrix_rank_herm_tridiag_blocked_kernel(
                 tl.store(E + batch * K + i, alpha_r)
             rvalid = (rows >= L0) & (rows < K)
             v_own = tl.load(s_base + rows * K + i, mask=rvalid, other=0.0)
-            v_own = tl.where((rows > L0 - 1) & (rows < L0 + 1), x0 - alpha_r, v_own)
+            v_own = tl.where(rows == L0, x0 - alpha_r, v_own)
             # Accumulate element-wise across tiles and reduce once at the
             # end: a tl.sum inside the loop forces a block-wide barrier per
             # tile, which fences the next tile's load and serializes the
@@ -1752,7 +1710,7 @@ def _matrix_rank_herm_tridiag_blocked_kernel(
                     other=0.0,
                 )
                 vc = tl.load(s_base + cc * K + i, mask=cmask, other=0.0)
-                vc = tl.where((cc > L0 - 1) & (cc < L0 + 1), x0 - alpha_r, vc)
+                vc = tl.where(cc == L0, x0 - alpha_r, vc)
                 acc += tile * vc[None, :]
                 c += BLOCK_C
             w_raw = tl.sum(acc, axis=1)
@@ -1773,12 +1731,12 @@ def _matrix_rank_herm_tridiag_blocked_kernel(
                 # are harmless because phase A re-zeroes the accumulators.
                 tl.atomic_add(
                     w1_ptr + qpad,
-                    tl.sum(w_own_q * qm.to(S.dtype.element_ty)[None, :] * v_own[:, None], axis=0),
+                    tl.where(qm, tl.sum(w_own_q * v_own[:, None], axis=0), 0.0),
                     sem="relaxed",
                 )
                 tl.atomic_add(
                     w2_ptr + qpad,
-                    tl.sum(v_own_q * qm.to(S.dtype.element_ty)[None, :] * v_own[:, None], axis=0),
+                    tl.where(qm, tl.sum(v_own_q * v_own[:, None], axis=0), 0.0),
                     sem="relaxed",
                 )
             tl.atomic_add(dot_ptr, tl.sum(v_own * w_raw, axis=0), sem="relaxed")
@@ -1812,11 +1770,7 @@ def _matrix_rank_herm_tridiag_blocked_kernel(
                 )
                 dot -= 2.0 * tl.sum(w1 * w2, axis=0)
             w_fin = tau * w_raw
-            # Never form tau**2: strongly deflated spectra drive tau to
-            # ~1e20, and tau*tau overflows fp32 (poisoning the trailing
-            # matrix with inf/NaN).  The regrouped form is exact for the
-            # same reason the unblocked kernel folds tau into w first.
-            w_fin += ((-0.5 * tau) * (tau * dot)) * v_own
+            w_fin += (-0.5 * tau * tau * dot) * v_own
             tl.store(w_base + rows * NB_P + p, w_fin, mask=rvalid)
             tl.store(v_base + rows * NB_P + p, v_own, mask=rvalid)
             if jb == 0:
@@ -1833,30 +1787,46 @@ def _matrix_rank_herm_tridiag_blocked_kernel(
             while rt < K:
                 rows2 = rt + uidx
                 rmask2 = (rows2 >= t0) & (rows2 < K)
-                v_r = tl.load(
-                    v_base + rows2[:, None] * NB_P + qidx[None, :],
-                    mask=rmask2[:, None],
-                    other=0.0,
-                ) * qm2.to(S.dtype.element_ty)[None, :]
-                w_r = tl.load(
-                    w_base + rows2[:, None] * NB_P + qidx[None, :],
-                    mask=rmask2[:, None],
-                    other=0.0,
-                ) * qm2.to(S.dtype.element_ty)[None, :]
+                v_r = tl.where(
+                    qm2[None, :],
+                    tl.load(
+                        v_base + rows2[:, None] * NB_P + qidx[None, :],
+                        mask=rmask2[:, None],
+                        other=0.0,
+                    ),
+                    0.0,
+                )
+                w_r = tl.where(
+                    qm2[None, :],
+                    tl.load(
+                        w_base + rows2[:, None] * NB_P + qidx[None, :],
+                        mask=rmask2[:, None],
+                        other=0.0,
+                    ),
+                    0.0,
+                )
                 c = t0
                 while c < K:
                     cc = c + vvidx
                     cmask = cc < K
-                    v_c = tl.load(
-                        v_base + cc[:, None] * NB_P + qidx[None, :],
-                        mask=cmask[:, None],
-                        other=0.0,
-                    ) * qm2.to(S.dtype.element_ty)[None, :]
-                    w_c = tl.load(
-                        w_base + cc[:, None] * NB_P + qidx[None, :],
-                        mask=cmask[:, None],
-                        other=0.0,
-                    ) * qm2.to(S.dtype.element_ty)[None, :]
+                    v_c = tl.where(
+                        qm2[None, :],
+                        tl.load(
+                            v_base + cc[:, None] * NB_P + qidx[None, :],
+                            mask=cmask[:, None],
+                            other=0.0,
+                        ),
+                        0.0,
+                    )
+                    w_c = tl.where(
+                        qm2[None, :],
+                        tl.load(
+                            w_base + cc[:, None] * NB_P + qidx[None, :],
+                            mask=cmask[:, None],
+                            other=0.0,
+                        ),
+                        0.0,
+                    )
                     if tl.constexpr(S.dtype.element_ty == tl.float64):
                         # fp64 tl.dot is miscompiled on some vendor backends
                         # (MetaX/Hygon: wrong results for every block shape
@@ -2021,7 +1991,7 @@ def _matrix_rank_bidiag_kernel(
                 rr = r + cidx
                 rmask = rr < ROWS
                 vv = tl.load(t_base + i * ROWS + rr, mask=rmask, other=0.0)
-                vv = tl.where((rr > i - 1) & (rr < i + 1), x0 - alpha, vv)
+                vv = tl.where(rr == i, x0 - alpha, vv)
                 tile = tl.load(
                     t_base + cols_own[:, None] * ROWS + rr[None, :],
                     mask=cvalid[:, None] & rmask[None, :],
@@ -2042,7 +2012,7 @@ def _matrix_rank_bidiag_kernel(
                 rr = r + cidx
                 rmask = rr < ROWS
                 vv = tl.load(t_base + i * ROWS + rr, mask=rmask, other=0.0)
-                vv = tl.where((rr > i - 1) & (rr < i + 1), x0 - alpha, vv)
+                vv = tl.where(rr == i, x0 - alpha, vv)
                 tile = tl.load(
                     t_base + cols_own[:, None] * ROWS + rr[None, :],
                     mask=cvalid[:, None] & rmask[None, :],
@@ -2085,7 +2055,7 @@ def _matrix_rank_bidiag_kernel(
                     cc = c + cidx
                     cmask = cc < K
                     vr = tl.load(t_base + cc * ROWS + i, mask=cmask, other=0.0)
-                    vr = tl.where((cc > i) & (cc < i + 2), x0r - alpha_r, vr)
+                    vr = tl.where(cc == i + 1, x0r - alpha_r, vr)
                     tile = tl.load(
                         t_base + cc[None, :] * ROWS + rows_own[:, None],
                         mask=rvalid[:, None] & cmask[None, :],
@@ -2106,7 +2076,7 @@ def _matrix_rank_bidiag_kernel(
                     cc = c + cidx
                     cmask = cc < K
                     vr = tl.load(t_base + cc * ROWS + i, mask=cmask, other=0.0)
-                    vr = tl.where((cc > i) & (cc < i + 2), x0r - alpha_r, vr)
+                    vr = tl.where(cc == i + 1, x0r - alpha_r, vr)
                     tile = tl.load(
                         t_base + cc[None, :] * ROWS + rows_own[:, None],
                         mask=rvalid[:, None] & cmask[None, :],
@@ -2157,22 +2127,13 @@ def _matrix_rank_gk_init_kernel(
 
 
 @triton.jit
-def _sturm_count_less(D, E2H, E2L, base, K: tl.constexpr, x, STRICT: tl.constexpr):
+def _sturm_count_less(D, E2H, E2L, base, K: tl.constexpr, x):
     # Number of eigenvalues of the tridiagonal T = diag(d) + diag(e, +/-1)
-    # below the threshold x, via the qd recurrence. The zero-pivot guard
-    # picks the tie convention (LAPACK DLANEG): with a tiny NEGATIVE
-    # replacement the count is #{lambda <= x}; with a tiny POSITIVE one
-    # (STRICT=True) it is exactly #{lambda < x}. torch's hermitian semantics
-    # rank = #{lambda > tol} + #{lambda < -tol} are strict on both sides:
-    # the positive side K - #{lambda <= tol} is already strict, while the
-    # negative side must use the STRICT form so that an eigenvalue exactly
-    # equal to -tol is not counted. The recurrence runs in
+    # that are <= x, via the qd recurrence (LAPACK DLANEG convention: a zero
+    # pivot is replaced by a tiny negative value, keeping the count
+    # consistent for clustered spectra). The recurrence runs in
     # double-single arithmetic: native fp64 division is a slow software
     # sequence on this target and would dominate the O(k) chain.
-    if STRICT:
-        zero_pivot: tl.constexpr = 1.1754944e-38
-    else:
-        zero_pivot: tl.constexpr = -1.1754944e-38
     xh = x.to(tl.float32)
     xl = (x - xh.to(tl.float64)).to(tl.float32)
     d0 = tl.load(D + base)
@@ -2180,7 +2141,7 @@ def _sturm_count_less(D, E2H, E2L, base, K: tl.constexpr, x, STRICT: tl.constexp
     dl = (d0 - dh.to(tl.float64)).to(tl.float32)
     qh, ql = _df64_add(dh, dl, -xh, -xl)
     zero_q = (qh == 0.0) & (ql == 0.0)
-    qh = tl.where(zero_q, zero_pivot, qh)
+    qh = tl.where(zero_q, -1.1754944e-38, qh)
     ql = tl.where(zero_q, 0.0, ql)
     neg = tl.where(qh < 0.0, 1, 0)
     i = 1
@@ -2194,7 +2155,7 @@ def _sturm_count_less(D, E2H, E2L, base, K: tl.constexpr, x, STRICT: tl.constexp
         rh, rl = _df64_div_ds(e2h, e2l, qh, ql)
         qh, ql = _df64_add(th, t_l, -rh, -rl)
         zero_q = (qh == 0.0) & (ql == 0.0)
-        qh = tl.where(zero_q, zero_pivot, qh)
+        qh = tl.where(zero_q, -1.1754944e-38, qh)
         ql = tl.where(zero_q, 0.0, ql)
         neg += tl.where(qh < 0.0, 1, 0)
         i += 1
@@ -2261,21 +2222,16 @@ def _matrix_rank_sturm_rank_kernel(
             sigma_lo = tl.maximum(tl.abs(dmax), tl.abs(dmin))
         tol_lo = tl.maximum(atol, rtol * sigma_lo)
         tol_hi = tl.maximum(atol, rtol * hi)
-        cnt_lo = _sturm_count_less(D, E2H, E2L, base, K, tol_lo, STRICT=False)
-        cnt_hi = _sturm_count_less(D, E2H, E2L, base, K, tol_hi, STRICT=False)
+        cnt_lo = _sturm_count_less(D, E2H, E2L, base, K, tol_lo)
+        cnt_hi = _sturm_count_less(D, E2H, E2L, base, K, tol_hi)
         if GK:
             # Eigenvalues come in +/- sigma pairs, so the positive side
             # alone gives #{sigma > tol} without parity issues.
             rank_lo = K - cnt_lo
             rank_hi = K - cnt_hi
         else:
-            # Negative side must be strict: #{lambda < -tol}, not <=.
-            rank_lo = (K - cnt_lo) + _sturm_count_less(
-                D, E2H, E2L, base, K, -tol_lo, STRICT=True
-            )
-            rank_hi = (K - cnt_hi) + _sturm_count_less(
-                D, E2H, E2L, base, K, -tol_hi, STRICT=True
-            )
+            rank_lo = (K - cnt_lo) + _sturm_count_less(D, E2H, E2L, base, K, -tol_lo)
+            rank_hi = (K - cnt_hi) + _sturm_count_less(D, E2H, E2L, base, K, -tol_hi)
         rank = rank_lo
         if rank_lo != rank_hi:
             # The rank depends on sigma_max: refine it by bisection.
@@ -2285,7 +2241,7 @@ def _matrix_rank_sturm_rank_kernel(
             it = 0
             while it < BISECT_ITERS:
                 mid = 0.5 * (lo + hi_p)
-                cnt = _sturm_count_less(D, E2H, E2L, base, K, mid, STRICT=False)
+                cnt = _sturm_count_less(D, E2H, E2L, base, K, mid)
                 if cnt >= K:
                     hi_p = mid
                 else:
@@ -2301,9 +2257,7 @@ def _matrix_rank_sturm_rank_kernel(
                 it = 0
                 while it < BISECT_ITERS:
                     mid = 0.5 * (lo + hi_p)
-                    cnt = _sturm_count_less(
-                        D, E2H, E2L, base, K, mid, STRICT=False
-                    )
+                    cnt = _sturm_count_less(D, E2H, E2L, base, K, mid)
                     if cnt > 0:
                         hi_p = mid
                     else:
@@ -2312,13 +2266,11 @@ def _matrix_rank_sturm_rank_kernel(
                 lmin = 0.5 * (lo + hi_p)
                 sigma_max = tl.maximum(tl.abs(lmax), tl.abs(lmin))
             tol = tl.maximum(atol, rtol * sigma_max)
-            cnt = _sturm_count_less(D, E2H, E2L, base, K, tol, STRICT=False)
+            cnt = _sturm_count_less(D, E2H, E2L, base, K, tol)
             if GK:
                 rank = K - cnt
             else:
-                rank = (K - cnt) + _sturm_count_less(
-                    D, E2H, E2L, base, K, -tol, STRICT=True
-                )
+                rank = (K - cnt) + _sturm_count_less(D, E2H, E2L, base, K, -tol)
         tl.store(OUT + batch, rank.to(tl.int64))
 
 
@@ -2654,12 +2606,10 @@ def _launch_matrix_rank(
                 num_warps=num_warps,
             )
         elif herm_tridiag:
-            _require_grid_barrier("hermitian tridiagonalization")
             _launch_herm_tridiag_rank(
                 matrix, atol_tensor, rtol_tensor, out, k, batch_count, input
             )
         elif use_bidiag:
-            _require_grid_barrier("bidiagonalization")
             _launch_bidiag_rank(
                 matrix,
                 atol_tensor,
@@ -2725,7 +2675,6 @@ def _launch_matrix_rank(
                 enable_fp_fusion=not is_fp64,
             )
         else:
-            _require_grid_barrier("blocked Jacobi sweep")
             use_df64 = is_fp64 and k > _NATIVE_FP64_JACOBI_MAX_K
             if use_df64:
                 work = torch.empty(
@@ -2986,39 +2935,6 @@ def _launch_matrix_rank(
     return out
 
 
-def _needs_negative_tolerance_fixup(atol, rtol):
-    # tol = max(atol, rtol*sigma_max) < 0 is reachable only where BOTH the
-    # effective atol and rtol are negative; since the defaults are >= 0 both
-    # must be given explicitly. Pure host-side check when both are scalars.
-    if atol is None or rtol is None:
-        return False
-    if isinstance(atol, torch.Tensor) or isinstance(rtol, torch.Tensor):
-        # Cannot inspect values without a device sync; take the async path.
-        return True
-    return float(atol) < 0.0 and float(rtol) < 0.0
-
-
-def _correct_negative_tolerance_rank(
-    input, result, atol_tensor, rtol_tensor, hermitian
-):
-    # torch does not clamp the tolerance at zero. Where tol < 0 (both atol
-    # and rtol negative), every singular value (>= 0) exceeds tol, so a
-    # nonzero matrix has full rank k, while a zero matrix still has rank 0
-    # (rtol*0 == 0 lifts tol back to max(atol, 0) == 0). The counting
-    # kernels assume tol >= 0 -- the hermitian Sturm path splits
-    # #{|lambda| > tol} into #{lambda > tol} + #{lambda < -tol}, which double
-    # counts the overlap for tol < 0, and the Golub-Kahan path counts in the
-    # sigma^2 domain where tol gets squared -- so fix the result up here.
-    # Fully asynchronous: no Python branching on device data.
-    neg_pair = (atol_tensor < 0) & (rtol_tensor < 0)
-    # hermitian reads only the lower triangle: strict-upper garbage is
-    # invisible to torch, so the "nonzero" test must ignore it too.
-    visible = torch.tril(input) if hermitian else input
-    nonzero = (visible.amax(dim=(-2, -1)) > 0) | (visible.amin(dim=(-2, -1)) < 0)
-    k = min(input.shape[-2:])
-    return torch.where(neg_pair & nonzero, k, result)
-
-
 def linalg_matrix_rank(input, *, atol=None, rtol=None, hermitian=False):
     """Computes numerical matrix rank with shape-specialized Triton Jacobi."""
     logger.debug("GEMS LINALG_MATRIX_RANK")
@@ -3029,17 +2945,12 @@ def linalg_matrix_rank(input, *, atol=None, rtol=None, hermitian=False):
         return _empty_matrix_rank(input, output_shape)
 
     atol_tensor, rtol_tensor = _prepare_tolerances(input, atol, rtol)
-    result = _launch_matrix_rank(
+    return _launch_matrix_rank(
         input,
         atol_tensor,
         rtol_tensor,
         hermitian,
     )
-    if _needs_negative_tolerance_fixup(atol, rtol):
-        result = _correct_negative_tolerance_rank(
-            input, result, atol_tensor, rtol_tensor, hermitian
-        )
-    return result
 
 
 def linalg_matrix_rank_tol(input, tol, hermitian=False):
