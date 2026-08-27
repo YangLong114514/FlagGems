@@ -293,10 +293,10 @@ def test_linalg_matrix_rank_nonempty_zero_matrix(dtype, shape):
         shape[:-2], dtype=torch.int64, device=matrix.device
     )
 
-    if flag_gems.vendor_name == "metax":
-        # The MetaX torch native reference (linalg.matrix_rank via SVD)
-        # does not converge on large all-zero matrices, so compare against
-        # the analytic expectation only.
+    if flag_gems.vendor_name in ("metax", "hygon"):
+        # The MetaX and Hygon torch native references (matrix_rank via SVD)
+        # do not converge on large all-zero matrices, so compare against the
+        # analytic expectation while still checking direct and dispatch paths.
         result = flag_gems.linalg_matrix_rank(matrix, hermitian=False)
         _assert_output_metadata(result, matrix)
         with flag_gems.use_gems():
