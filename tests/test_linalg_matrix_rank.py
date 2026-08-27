@@ -1316,6 +1316,56 @@ def test_linalg_matrix_rank_graph_vs_nograph(k, hermitian, monkeypatch):
 
 
 @pytest.mark.linalg_matrix_rank
+@pytest.mark.skipif(IS_ASCEND, reason="Ascend backend has its own graph test above")
+@pytest.mark.parametrize(
+    "shape,hermitian",
+    [
+        pytest.param((65, 65), True, id="herm-k65"),
+        pytest.param((257, 257), True, id="herm-k257"),
+        pytest.param((513, 513), False, id="bidiag-k513"),
+    ],
+)
+def test_linalg_matrix_rank_generic_graph_vs_nograph(shape, hermitian, monkeypatch):
+    # The CUDA-graph-replayed kernel sequence must produce the same rank as
+    # direct launches (FLAGGEMS_MR_NO_GRAPH=1), and replays must refresh the
+    # staging buffers: fresh input data and changed tolerances both have to
+    # be honored by a replayed graph.
+    generator = torch.Generator().manual_seed(sum(shape))
+    matrix = torch.randn(*shape, generator=generator).float()
+    if hermitian:
+        matrix = matrix + matrix.mT
+    matrix = matrix.to(flag_gems.device)
+    reference = torch.linalg.matrix_rank(matrix.cpu(), hermitian=hermitian)
+
+    monkeypatch.setenv("FLAGGEMS_MR_NO_GRAPH", "1")
+    direct = flag_gems.linalg_matrix_rank(matrix, hermitian=hermitian)
+    utils.gems_assert_equal(direct, reference.to(flag_gems.device))
+
+    monkeypatch.delenv("FLAGGEMS_MR_NO_GRAPH")
+    captured = flag_gems.linalg_matrix_rank(matrix, hermitian=hermitian)  # captures
+    replayed = flag_gems.linalg_matrix_rank(matrix, hermitian=hermitian)  # replays
+    utils.gems_assert_equal(captured, reference.to(flag_gems.device))
+    utils.gems_assert_equal(replayed, reference.to(flag_gems.device))
+
+    # Replay with fresh data: the graph must re-read the staging buffers.
+    fresh = torch.randn(*shape, generator=generator).float()
+    if hermitian:
+        fresh = fresh + fresh.mT
+    fresh = fresh.to(flag_gems.device)
+    fresh_ref = torch.linalg.matrix_rank(fresh.cpu(), hermitian=hermitian)
+    utils.gems_assert_equal(
+        flag_gems.linalg_matrix_rank(fresh, hermitian=hermitian),
+        fresh_ref.to(flag_gems.device),
+    )
+    # Replay with a changed tolerance: tolerances are staging inputs too.
+    tol_ref = torch.linalg.matrix_rank(fresh.cpu(), hermitian=hermitian, atol=0.5)
+    utils.gems_assert_equal(
+        flag_gems.linalg_matrix_rank(fresh, hermitian=hermitian, atol=0.5),
+        tol_ref.to(flag_gems.device),
+    )
+
+
+@pytest.mark.linalg_matrix_rank
 @pytest.mark.skipif(not IS_ASCEND, reason="Ascend-specific path coverage")
 @pytest.mark.parametrize("k", [300, 513])
 def test_linalg_matrix_rank_hermitian_ignores_strict_upper_large(k):
@@ -1342,9 +1392,11 @@ def test_linalg_matrix_rank_hermitian_ignores_strict_upper_large(k):
 @pytest.mark.parametrize(
     "shape,hermitian",
     [
+        pytest.param((33, 33), True, id="herm-small-tridiag"),
         pytest.param((65, 65), True, id="herm-padded-tridiag"),
         pytest.param((257, 257), True, id="herm-large-tridiag"),
         pytest.param((4, 65, 65), True, id="herm-batched"),
+        pytest.param((65, 80), False, id="bidiag-medium"),
         pytest.param((513, 513), False, id="bidiag-k513"),
         pytest.param((600, 513), False, id="bidiag-tall"),
     ],
