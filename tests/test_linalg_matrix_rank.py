@@ -109,6 +109,23 @@ def _native_matrix_rank(matrix, **kwargs):
         name: _to_reference_value(value, ref_matrix.device)
         for name, value in kwargs.items()
     }
+
+    # HGGC does not provide cusolverDnXsyevBatched_bufferSize.  Keep native
+    # PyTorch as the oracle on THead, but compute batched Hermitian references
+    # on CPU so the FlagGems device implementation can still be exercised.
+    if (
+        IS_THEAD
+        and kwargs.get("hermitian", False)
+        and ref_matrix.ndim > 2
+        and ref_matrix.device.type != "cpu"
+    ):
+        cpu_kwargs = {
+            name: _to_reference_value(value, torch.device("cpu"))
+            for name, value in ref_kwargs.items()
+        }
+        return torch.linalg.matrix_rank(ref_matrix.cpu(), **cpu_kwargs).to(
+            ref_matrix.device
+        )
     return torch.linalg.matrix_rank(ref_matrix, **ref_kwargs)
 
 
@@ -353,25 +370,9 @@ def test_linalg_matrix_rank_aah_svd_matches_hermitian(dtype):
     svd_rank = _assert_direct_and_dispatch_match_native(
         aah, atol=5e-2, hermitian=False
     )
-    if IS_THEAD:
-        # HGGC does not provide cusolverDnXsyevBatched_bufferSize.  Use the
-        # native general/SVD result as the oracle so the FlagGems hermitian
-        # kernel and its registered dispatch are still exercised.
-        hermitian_rank = flag_gems.linalg_matrix_rank(
-            aah, atol=5e-2, hermitian=True
-        )
-        _assert_output_metadata(hermitian_rank, aah)
-
-        with flag_gems.use_gems():
-            dispatched_hermitian_rank = torch.linalg.matrix_rank(
-                aah, atol=5e-2, hermitian=True
-            )
-        _assert_output_metadata(dispatched_hermitian_rank, aah)
-        utils.gems_assert_equal(svd_rank, dispatched_hermitian_rank)
-    else:
-        hermitian_rank = _assert_direct_and_dispatch_match_native(
-            aah, atol=5e-2, hermitian=True
-        )
+    hermitian_rank = _assert_direct_and_dispatch_match_native(
+        aah, atol=5e-2, hermitian=True
+    )
 
     utils.gems_assert_equal(svd_rank, hermitian_rank)
     utils.gems_assert_equal(svd_rank, expected)
