@@ -2377,7 +2377,6 @@ def _matrix_rank_sturm32_tridiag_bracket_kernel(
     RTOL,
     OUT,
     TOL2,
-    FLAG,
     K,
     BLOCK: tl.constexpr,
     BISECT_ITERS: tl.constexpr,
@@ -2406,7 +2405,6 @@ def _matrix_rank_sturm32_tridiag_bracket_kernel(
         # unconditionally and reads it.
         tl.store(OUT + batch, tl.zeros((), dtype=tl.int64))
         tl.store(TOL2 + batch, 0.0)
-        tl.store(FLAG + batch, tl.zeros((), dtype=tl.int64))
     else:
         tol_lo = tl.maximum(atol, rtol * dmax)
         tol_hi = tl.maximum(atol, rtol * hi)
@@ -2417,10 +2415,13 @@ def _matrix_rank_sturm32_tridiag_bracket_kernel(
         tol2 = tol_lo
         if rank_lo != rank_hi:
             # Bisect |lambda|max on [dmax, hi]: f(x) = #{|lambda| > x} is
-            # monotone; |lambda|max = sup{x : f(x) > 0}.  The pad uses only
-            # FP32-representable increments.
+            # monotone; |lambda|max = sup{x : f(x) > 0}.  The pad must be an
+            # FP32-representable ULP-scale bump: 2*eps_fp32 lifts the bound
+            # by 2 ULP (1 + 1e-9 rounds back to 1.0 in FP32 and would pad
+            # nothing), which keeps hi_p strictly above the rounded
+            # Gershgorin bound and hence above |lambda|max.
             lo = dmax
-            hi_p = hi * (1.0 + 1e-9) + 1e-30
+            hi_p = hi * (1.0 + 2.3841858e-07)
             it = 0
             while it < BISECT_ITERS:
                 mid = 0.5 * (lo + hi_p)
@@ -2432,15 +2433,13 @@ def _matrix_rank_sturm32_tridiag_bracket_kernel(
                 it += 1
             lmax = 0.5 * (lo + hi_p)
             tol2 = tl.maximum(atol, rtol * lmax)
-        refine = rank_lo != rank_hi
         tl.store(OUT + batch, rank_lo.to(tl.int64))
         tl.store(TOL2 + batch, tol2)
-        tl.store(FLAG + batch, refine.to(tl.int64))
 
 
 @libentry()
 @triton.jit
-def _matrix_rank_sturm32_tridiag_final_kernel(D, E, TOL2, FLAG, OUT, K):
+def _matrix_rank_sturm32_tridiag_final_kernel(D, E, TOL2, OUT, K):
     # Decisive hermitian count in double-single arithmetic from the RAW
     # tridiagonal: rank = #{lambda > tol} + #{lambda < -tol}, two lockstep
     # qd chains q_i = d_i - x - e_{i-1}^2 / q_{i-1}.  The positive chain at
@@ -2523,7 +2522,6 @@ def _matrix_rank_sturm32_bidiag_bracket_kernel(
     RTOL,
     OUT,
     TOL2,
-    FLAG,
     K,
     BLOCK: tl.constexpr,
     BISECT_ITERS: tl.constexpr,
@@ -2550,7 +2548,6 @@ def _matrix_rank_sturm32_bidiag_bracket_kernel(
         # double-single kernel runs unconditionally and reads it.
         tl.store(OUT + batch, tl.zeros((), dtype=tl.int64))
         tl.store(TOL2 + batch, 0.0)
-        tl.store(FLAG + batch, tl.zeros((), dtype=tl.int64))
     else:
         sigma_lo = tl.sqrt(tl.maximum(dmax, 0.0))
         sigma_hi = tl.sqrt(hi)
@@ -2561,11 +2558,12 @@ def _matrix_rank_sturm32_bidiag_bracket_kernel(
         rank_lo = K - cnt_lo
         rank_hi = K - cnt_hi
         rank = rank_lo
-        refine = rank_lo != rank_hi
         tol2 = tol_lo * tol_lo
-        if refine:
+        if rank_lo != rank_hi:
+            # Same FP32-representable ULP pad as the hermitian bracket:
+            # 2*eps_fp32 (2 ULP), since 1 + 1e-9 rounds back to 1.0 in FP32.
             lo = tl.maximum(dmax, 0.0)
-            hi_p = hi * (1.0 + 1e-9) + 1e-30
+            hi_p = hi * (1.0 + 2.3841858e-07)
             it = 0
             while it < BISECT_ITERS:
                 mid = 0.5 * (lo + hi_p)
@@ -2581,12 +2579,11 @@ def _matrix_rank_sturm32_bidiag_bracket_kernel(
             tol2 = tol2 * tol2
         tl.store(OUT + batch, rank.to(tl.int64))
         tl.store(TOL2 + batch, tol2)
-        tl.store(FLAG + batch, refine.to(tl.int64))
 
 
 @libentry()
 @triton.jit
-def _matrix_rank_sturm32_bidiag_final_kernel(D, E, TOL2, FLAG, OUT, K):
+def _matrix_rank_sturm32_bidiag_final_kernel(D, E, TOL2, OUT, K):
     # The decisive count, in double-single arithmetic, from the RAW
     # bidiagonal d/e (NOT the FP32 dd/ee tridiagonal, whose squaring rounds
     # each element absolutely by ~eps*sigma_max^2 -- a sqrt(eps) noise floor
@@ -2806,7 +2803,6 @@ def _launch_herm_tridiag_rank(matrix, atol_tensor, rtol_tensor, out, k, batch_co
     if ds32:
         block_k = triton.next_power_of_2(k)
         tol2 = torch.empty((batch_count,), dtype=torch.float32, device=device)
-        refine = torch.empty((batch_count,), dtype=torch.int64, device=device)
         _matrix_rank_sturm32_tridiag_bracket_kernel[(batch_count,)](
             diag,
             offdiag,
@@ -2814,7 +2810,6 @@ def _launch_herm_tridiag_rank(matrix, atol_tensor, rtol_tensor, out, k, batch_co
             rtol_tensor,
             out,
             tol2,
-            refine,
             k,
             BLOCK=block_k,
             BISECT_ITERS=32,
@@ -2824,7 +2819,6 @@ def _launch_herm_tridiag_rank(matrix, atol_tensor, rtol_tensor, out, k, batch_co
             diag,
             offdiag,
             tol2,
-            refine,
             out,
             k,
             num_warps=1,
@@ -2926,7 +2920,6 @@ def _launch_bidiag_rank(matrix, atol_tensor, rtol_tensor, out, m, n, k, rows, ba
     if ds32:
         block_k = triton.next_power_of_2(k)
         tol2 = torch.empty((batch_count,), dtype=torch.float32, device=device)
-        refine = torch.empty((batch_count,), dtype=torch.int64, device=device)
         _matrix_rank_bidiag32_to_tridiag_kernel[(batch_count,)](
             diag,
             offdiag,
@@ -2943,7 +2936,6 @@ def _launch_bidiag_rank(matrix, atol_tensor, rtol_tensor, out, m, n, k, rows, ba
             rtol_tensor,
             out,
             tol2,
-            refine,
             k,
             BLOCK=block_k,
             BISECT_ITERS=32,
@@ -2953,7 +2945,6 @@ def _launch_bidiag_rank(matrix, atol_tensor, rtol_tensor, out, m, n, k, rows, ba
             diag,
             offdiag,
             tol2,
-            refine,
             out,
             k,
             num_warps=1,
