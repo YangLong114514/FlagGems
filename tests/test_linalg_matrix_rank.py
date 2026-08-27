@@ -21,6 +21,7 @@ from . import accuracy_utils as utils
 
 VENDOR_NAME = getattr(flag_gems, "vendor_name", "")
 IS_ASCEND = VENDOR_NAME == "ascend"
+IS_THEAD = VENDOR_NAME == "thead"
 SUPPORT_FP64 = flag_gems.runtime.device.support_fp64
 
 # torch.linalg.matrix_rank officially accepts these four dtypes. FlagGems
@@ -352,9 +353,26 @@ def test_linalg_matrix_rank_aah_svd_matches_hermitian(dtype):
     svd_rank = _assert_direct_and_dispatch_match_native(
         aah, atol=5e-2, hermitian=False
     )
-    hermitian_rank = _assert_direct_and_dispatch_match_native(
-        aah, atol=5e-2, hermitian=True
-    )
+    if IS_THEAD:
+        # HGGC does not provide cusolverDnXsyevBatched_bufferSize.  Use the
+        # native general/SVD result as the oracle so the FlagGems hermitian
+        # kernel and its registered dispatch are still exercised.
+        hermitian_rank = flag_gems.linalg_matrix_rank(
+            aah, atol=5e-2, hermitian=True
+        )
+        _assert_output_metadata(hermitian_rank, aah)
+
+        with flag_gems.use_gems():
+            dispatched_hermitian_rank = torch.linalg.matrix_rank(
+                aah, atol=5e-2, hermitian=True
+            )
+        _assert_output_metadata(dispatched_hermitian_rank, aah)
+        utils.gems_assert_equal(svd_rank, dispatched_hermitian_rank)
+    else:
+        hermitian_rank = _assert_direct_and_dispatch_match_native(
+            aah, atol=5e-2, hermitian=True
+        )
+
     utils.gems_assert_equal(svd_rank, hermitian_rank)
     utils.gems_assert_equal(svd_rank, expected)
 
