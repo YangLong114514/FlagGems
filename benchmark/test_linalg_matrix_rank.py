@@ -7,6 +7,7 @@ from . import base, consts
 
 VENDOR_NAME = getattr(flag_gems, "vendor_name", "")
 IS_ASCEND = VENDOR_NAME == "ascend"
+IS_THEAD = VENDOR_NAME == "thead"
 
 # torch.linalg.matrix_rank on Ascend is backed by aclnn svd_npu, which is
 # float32-only ("svd_npu only supported Float, but get double"). Restrict the
@@ -138,10 +139,16 @@ class MatrixRankHermitianBenchmark(base.GenericBenchmark):
     DEFAULT_SHAPE_DESC = "*, N, N"
 
     def set_shapes(self, shape_file_path=None):
-        self.shapes = _select_shapes(
+        shapes = _select_shapes(
             MATRIX_RANK_HERMITIAN_CORE_SHAPES,
             MATRIX_RANK_HERMITIAN_COMPREHENSIVE_SHAPES,
         )
+        if IS_THEAD:
+            # HGGC lacks cusolverDnXsyevBatched_bufferSize, so native Torch
+            # cannot provide a device-side baseline for Hermitian batches.
+            # Skip those shapes instead of reporting CPU/composed speedups.
+            shapes = [shape for shape in shapes if len(shape) == 2]
+        self.shapes = shapes
 
 
 def _composed_matrix_rank(matrix, atol=None, rtol=None, hermitian=False):
