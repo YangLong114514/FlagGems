@@ -179,13 +179,17 @@ def _matrix_rank_rank1_kernel(
     A,
     ATOL,
     RTOL,
+    SCALE,
     OUT,
+    ATOL_S: tl.float64,
+    RTOL_S: tl.float64,
     M: tl.constexpr,
     N: tl.constexpr,
     ROWS: tl.constexpr,
     TALL: tl.constexpr,
     HERMITIAN: tl.constexpr,
     BLOCK_R: tl.constexpr,
+    SCALAR_TOL: tl.constexpr,
 ):
     batch = tl.program_id(0)
     rows = tl.arange(0, BLOCK_R)
@@ -199,9 +203,18 @@ def _matrix_rank_rank1_kernel(
     else:
         values = tl.load(a_base + rows, mask=row_mask, other=0.0)
 
+    # In-kernel scale normalization: the launcher hands over the per-batch
+    # max-abs so small paths pay no extra elementwise kernel.  Tolerances
+    # arrive RAW and are scaled here the same way.
+    inv_s = 1.0 / tl.load(SCALE + batch)
+    values = values * inv_s
     singular_value = tl.sqrt(tl.sum(values * values, axis=0))
-    atol = tl.load(ATOL + batch)
-    rtol = tl.load(RTOL + batch)
+    if SCALAR_TOL:
+        atol = ATOL_S * inv_s
+        rtol = RTOL_S
+    else:
+        atol = tl.load(ATOL + batch) * inv_s
+        rtol = tl.load(RTOL + batch)
     threshold = tl.maximum(atol, rtol * singular_value)
     rank = (singular_value > threshold).to(tl.int64)
     tl.store(OUT + batch, rank)
@@ -213,7 +226,10 @@ def _matrix_rank_rank2_kernel(
     A,
     ATOL,
     RTOL,
+    SCALE,
     OUT,
+    ATOL_S: tl.float64,
+    RTOL_S: tl.float64,
     M: tl.constexpr,
     N: tl.constexpr,
     ROWS: tl.constexpr,
@@ -222,6 +238,7 @@ def _matrix_rank_rank2_kernel(
     BLOCK_R: tl.constexpr,
     REL_EPS: tl.constexpr,
     ABS_EPS: tl.constexpr,
+    SCALAR_TOL: tl.constexpr,
 ):
     batch = tl.program_id(0)
     rows = tl.arange(0, BLOCK_R)
@@ -244,6 +261,11 @@ def _matrix_rank_rank2_kernel(
         x = tl.load(a_base + rows, mask=row_mask, other=0.0)
         y = tl.load(a_base + N + rows, mask=row_mask, other=0.0)
 
+    # Same in-kernel scale normalization as the rank1 kernel.
+    inv_s = 1.0 / tl.load(SCALE + batch)
+    x = x * inv_s
+    y = y * inv_s
+
     alpha = tl.sum(x * x, axis=0)
     beta = tl.sum(y * y, axis=0)
     gamma = tl.sum(x * y, axis=0)
@@ -263,8 +285,12 @@ def _matrix_rank_rank2_kernel(
     singular_y = tl.sqrt(tl.sum(rotated_y * rotated_y, axis=0))
     max_value = tl.maximum(singular_x, singular_y)
 
-    atol = tl.load(ATOL + batch)
-    rtol = tl.load(RTOL + batch)
+    if SCALAR_TOL:
+        atol = ATOL_S * inv_s
+        rtol = RTOL_S
+    else:
+        atol = tl.load(ATOL + batch) * inv_s
+        rtol = tl.load(RTOL + batch)
     threshold = tl.maximum(atol, rtol * max_value)
     rank = (singular_x > threshold).to(tl.int32)
     rank += (singular_y > threshold).to(tl.int32)
@@ -278,7 +304,10 @@ def _matrix_rank_fused_jacobi_kernel(
     A_WORK,
     ATOL,
     RTOL,
+    SCALE,
     OUT,
+    ATOL_S: tl.float64,
+    RTOL_S: tl.float64,
     M: tl.constexpr,
     N: tl.constexpr,
     K: tl.constexpr,
@@ -295,6 +324,7 @@ def _matrix_rank_fused_jacobi_kernel(
     SWEEPS,
     REL_EPS: tl.constexpr,
     ABS_EPS: tl.constexpr,
+    SCALAR_TOL: tl.constexpr,
 ):
     # One program owns one matrix and runs the whole one-sided cyclic Jacobi
     # iteration. All pairs of a round-robin step are disjoint, so they are
@@ -307,6 +337,7 @@ def _matrix_rank_fused_jacobi_kernel(
     work_base = A_WORK + batch * K * ROWS
 
     column = 0
+    inv_s = 1.0 / tl.load(SCALE + batch)
     while column < K:
         if HERMITIAN:
             source_rows = tl.maximum(rows, column)
@@ -328,7 +359,8 @@ def _matrix_rank_fused_jacobi_kernel(
                 mask=row_mask,
                 other=0.0,
             )
-        tl.store(work_base + column * ROWS + rows, values, mask=row_mask)
+        # In-kernel scale normalization (same convention as rank1/rank2).
+        tl.store(work_base + column * ROWS + rows, values * inv_s, mask=row_mask)
         column += 1
     # The init stores are distributed across all warps of the block; the
     # sweep loop below reads the whole tile with a potentially different
@@ -339,8 +371,12 @@ def _matrix_rank_fused_jacobi_kernel(
     ring: tl.constexpr = ROUND - 1
     accumulator_dtype = tl.float64 if IS_FP64 else tl.float32
     singular_indices = tl.arange(0, BLOCK_K)
-    atol = tl.load(ATOL + batch)
-    rtol = tl.load(RTOL + batch)
+    if SCALAR_TOL:
+        atol = ATOL_S * inv_s
+        rtol = RTOL_S
+    else:
+        atol = tl.load(ATOL + batch) * inv_s
+        rtol = tl.load(RTOL + batch)
     sweep = 0
     e2_prev = tl.zeros((), dtype=accumulator_dtype)
     # Rebound by the per-sweep stability check; after the last sweep it
@@ -1164,36 +1200,62 @@ def _expand_tolerance(value, batch_shape, input, name):
             ) from error
         return value.to(dtype=tol_dtype).contiguous()
 
+    raise TypeError(
+        f"torch.linalg.matrix_rank: {name} must be a float or Tensor"
+    )
+
+
+def _scalar_tolerance(value, name):
     try:
-        scalar = float(value)
+        return float(value)
     except (TypeError, ValueError) as error:
         raise TypeError(
             f"torch.linalg.matrix_rank: {name} must be a float or Tensor"
         ) from error
-    return torch.full(batch_shape, scalar, dtype=tol_dtype, device=input.device)
+
+
+def _materialize_tolerance(value, batch_shape, input):
+    # Scalar -> device tensor, for the graph-captured large-matrix paths
+    # (replay must re-read tolerances from staged buffers) and for the
+    # mixed scalar/tensor case on small paths.
+    if isinstance(value, torch.Tensor):
+        return value
+    tol_dtype = torch.float64 if _native_fp64_supported() else torch.float32
+    return torch.full(batch_shape, value, dtype=tol_dtype, device=input.device)
 
 
 def _prepare_tolerances(input, atol, rtol):
+    # Each return is either a Python float (scalar fast path -- no device
+    # tensor is materialized) or a device tensor expanded to the batch
+    # shape.  Only genuine tensor tolerances take the tensor path.
     batch_shape = input.shape[:-2]
     atol_is_set = atol is not None
-    atol_tensor = _expand_tolerance(
-        0.0 if atol is None else atol, batch_shape, input, "atol"
-    )
+    if atol is None:
+        atol_val = 0.0
+    elif isinstance(atol, torch.Tensor):
+        atol_val = _expand_tolerance(atol, batch_shape, input, "atol")
+    else:
+        atol_val = _scalar_tolerance(atol, "atol")
 
-    if rtol is not None:
-        rtol_tensor = _expand_tolerance(rtol, batch_shape, input, "rtol")
+    if isinstance(rtol, torch.Tensor):
+        rtol_val = _expand_tolerance(rtol, batch_shape, input, "rtol")
+    elif rtol is not None:
+        rtol_val = _scalar_tolerance(rtol, "rtol")
     else:
         default_rtol = max(input.shape[-2:]) * torch.finfo(input.dtype).eps
-        if atol_is_set:
-            rtol_tensor = torch.where(
-                atol_tensor > 0,
-                torch.zeros_like(atol_tensor),
-                torch.full_like(atol_tensor, default_rtol),
+        if not atol_is_set:
+            rtol_val = default_rtol
+        elif isinstance(atol_val, torch.Tensor):
+            rtol_val = torch.where(
+                atol_val > 0,
+                torch.zeros_like(atol_val),
+                torch.full_like(atol_val, default_rtol),
             )
         else:
-            rtol_tensor = torch.full_like(atol_tensor, default_rtol)
-
-    return atol_tensor, rtol_tensor.contiguous()
+            rtol_val = 0.0 if atol_val > 0 else default_rtol
+    if isinstance(rtol_val, torch.Tensor):
+        rtol_val = rtol_val.contiguous()
+    return atol_val, rtol_val
 
 
 def _check_input(input, hermitian):
@@ -2035,10 +2097,12 @@ def _launch_bidiag_rank(matrix, atol_tensor, rtol_tensor, out, m, n, k, rows, ba
 
 def _launch_matrix_rank(
     input,
-    atol_tensor,
-    rtol_tensor,
+    atol,
+    rtol,
     hermitian,
 ):
+    # atol/rtol are tolerance descriptors: Python floats on the scalar fast
+    # path, device tensors (batch shape) otherwise.
     output_shape = input.shape[:-2]
     m, n = input.shape[-2:]
     k = min(m, n)
@@ -2079,11 +2143,47 @@ def _launch_matrix_rank(
     # garbage).
     visible = torch.tril(matrix) if hermitian else matrix
     scale = visible.abs().amax(dim=(-2, -1))
-    scale = torch.where(scale > 0, scale, torch.ones_like(scale))
-    matrix = matrix / scale.unsqueeze(-1).unsqueeze(-1)
-    atol_tensor = (atol_tensor.reshape(batch_count) / scale).reshape(
-        atol_tensor.shape
+    # Floor the scale instead of where(scale>0, scale, 1): one clamp kernel
+    # replaces the gt/ones/where trio.  sqrt(tiny) keeps 1/scale finite and
+    # far from overflow for both fp32 (~1e-19) and fp64 (~1e-154), so zero
+    # matrices scale to exact zeros without NaN.
+    scale = torch.clamp_min(scale, torch.finfo(matrix.dtype).tiny ** 0.5)
+    # small_path must mirror the dispatch order below exactly: hermitian
+    # matrices eligible for BOTH fused Jacobi and tridiagonalization take
+    # the tridiag branch (use_bidiag and fused are mutually exclusive, so
+    # no guard is needed there).
+    small_path = (k <= 2) or (fused_eligible and not herm_tridiag)
+    # Scalar tolerances are passed as tl.float64 kernel arguments; on
+    # devices without native FP64 the f64 kernel code is off-limits even
+    # under a constexpr guard that never fires, so fall back to the pointer
+    # path there.
+    scalar_tol = (
+        not isinstance(atol, torch.Tensor)
+        and not isinstance(rtol, torch.Tensor)
+        and _native_fp64_supported()
     )
+    if small_path:
+        # Small single-kernel paths take RAW tolerances and the scale, and
+        # do both the matrix scaling and the atol/scale division in-kernel
+        # -- no torch.full / div elementwise launches.  Scalars go straight
+        # to kernel arguments; tensors are read through pointers.
+        if scalar_tol:
+            atol_ptr = rtol_ptr = scale  # dummies, unused under SCALAR_TOL
+            atol_s, rtol_s = float(atol), float(rtol)
+        else:
+            atol_ptr = _materialize_tolerance(atol, output_shape, input)
+            rtol_ptr = _materialize_tolerance(rtol, output_shape, input)
+            atol_s = rtol_s = 0.0
+    else:
+        # Large graph-captured paths keep the staged-tensor convention
+        # (replay must re-read tolerances from workspace buffers): scalars
+        # materialize here, and matrix/atol are pre-divided by the scale.
+        matrix = matrix / scale.unsqueeze(-1).unsqueeze(-1)
+        atol_tensor = _materialize_tolerance(atol, output_shape, input)
+        rtol_tensor = _materialize_tolerance(rtol, output_shape, input)
+        atol_tensor = (atol_tensor.reshape(batch_count) / scale).reshape(
+            output_shape
+        )
     out = torch.empty(output_shape, dtype=torch.int64, device=input.device)
     block_r = triton.next_power_of_2(rows)
     relative_epsilon = 1.0e-15 if is_fp64 else 1.0e-7
@@ -2094,23 +2194,30 @@ def _launch_matrix_rank(
         if k == 1:
             _matrix_rank_rank1_kernel[(batch_count,)](
                 matrix,
-                atol_tensor,
-                rtol_tensor,
+                atol_ptr,
+                rtol_ptr,
+                scale,
                 out,
+                atol_s,
+                rtol_s,
                 M=m,
                 N=n,
                 ROWS=rows,
                 TALL=m >= n,
                 HERMITIAN=hermitian,
                 BLOCK_R=block_r,
+                SCALAR_TOL=scalar_tol,
                 num_warps=num_warps,
             )
         elif k == 2:
             _matrix_rank_rank2_kernel[(batch_count,)](
                 matrix,
-                atol_tensor,
-                rtol_tensor,
+                atol_ptr,
+                rtol_ptr,
+                scale,
                 out,
+                atol_s,
+                rtol_s,
                 M=m,
                 N=n,
                 ROWS=rows,
@@ -2119,6 +2226,7 @@ def _launch_matrix_rank(
                 BLOCK_R=block_r,
                 REL_EPS=relative_epsilon,
                 ABS_EPS=absolute_epsilon,
+                SCALAR_TOL=scalar_tol,
                 num_warps=num_warps,
             )
         elif herm_tridiag:
@@ -2157,9 +2265,12 @@ def _launch_matrix_rank(
             _matrix_rank_fused_jacobi_kernel[(batch_count,)](
                 matrix,
                 work,
-                atol_tensor,
-                rtol_tensor,
+                atol_ptr,
+                rtol_ptr,
+                scale,
                 out,
+                atol_s,
+                rtol_s,
                 M=m,
                 N=n,
                 K=k,
@@ -2176,6 +2287,7 @@ def _launch_matrix_rank(
                 SWEEPS=sweeps,
                 REL_EPS=relative_epsilon,
                 ABS_EPS=absolute_epsilon,
+                SCALAR_TOL=scalar_tol,
                 num_warps=fused_warps,
                 enable_fp_fusion=not is_fp64,
             )
@@ -2194,9 +2306,7 @@ def _needs_negative_tolerance_fixup(atol, rtol):
     return float(atol) < 0.0 and float(rtol) < 0.0
 
 
-def _correct_negative_tolerance_rank(
-    input, result, atol_tensor, rtol_tensor, hermitian
-):
+def _correct_negative_tolerance_rank(input, result, atol, rtol, hermitian):
     # torch does not clamp the tolerance at zero. Where tol < 0 (both atol
     # and rtol negative), every singular value (>= 0) exceeds tol, so a
     # nonzero matrix has full rank k, while a zero matrix still has rank 0
@@ -2206,13 +2316,19 @@ def _correct_negative_tolerance_rank(
     # counts the overlap for tol < 0, and the Golub-Kahan path counts in the
     # sigma^2 domain where tol gets squared -- so fix the result up here.
     # Fully asynchronous: no Python branching on device data.
-    neg_pair = (atol_tensor < 0) & (rtol_tensor < 0)
     # hermitian reads only the lower triangle: strict-upper garbage is
     # invisible to torch, so the "nonzero" test must ignore it too.
     visible = torch.tril(input) if hermitian else input
     nonzero = (visible.amax(dim=(-2, -1)) > 0) | (visible.amin(dim=(-2, -1)) < 0)
     k = min(input.shape[-2:])
-    return torch.where(neg_pair & nonzero, k, result)
+    if isinstance(atol, torch.Tensor) or isinstance(rtol, torch.Tensor):
+        # At least one tolerance is a device tensor; a Python float on the
+        # other side broadcasts into the predicate.
+        neg_pair = (atol < 0) & (rtol < 0)
+        return torch.where(neg_pair & nonzero, k, result)
+    # Both tolerances are scalars: the caller already verified on the host
+    # that both are negative, so the predicate is uniformly true.
+    return torch.where(nonzero, k, result)
 
 
 def linalg_matrix_rank(input, *, atol=None, rtol=None, hermitian=False):
@@ -2224,16 +2340,16 @@ def linalg_matrix_rank(input, *, atol=None, rtol=None, hermitian=False):
     if input.numel() == 0:
         return _empty_matrix_rank(input, output_shape)
 
-    atol_tensor, rtol_tensor = _prepare_tolerances(input, atol, rtol)
+    atol_val, rtol_val = _prepare_tolerances(input, atol, rtol)
     result = _launch_matrix_rank(
         input,
-        atol_tensor,
-        rtol_tensor,
+        atol_val,
+        rtol_val,
         hermitian,
     )
     if _needs_negative_tolerance_fixup(atol, rtol):
         result = _correct_negative_tolerance_rank(
-            input, result, atol_tensor, rtol_tensor, hermitian
+            input, result, atol_val, rtol_val, hermitian
         )
     return result
 
