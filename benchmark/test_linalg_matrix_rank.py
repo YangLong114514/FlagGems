@@ -8,6 +8,7 @@ from . import base, consts
 
 VENDOR_NAME = getattr(flag_gems, "vendor_name", "")
 IS_ASCEND = VENDOR_NAME == "ascend"
+IS_ILUVATAR = VENDOR_NAME == "iluvatar"
 IS_THEAD = VENDOR_NAME == "thead"
 
 # Skip float64 where the device lacks native FP64 (capability bit, e.g.
@@ -193,6 +194,14 @@ def test_linalg_matrix_rank():
 
 
 @pytest.mark.linalg_matrix_rank
+@pytest.mark.skipif(
+    IS_ILUVATAR,
+    reason=(
+        "Iluvatar native torch.linalg.matrix_rank(hermitian=True) fails in "
+        "cusolverDnSsyevd for dense symmetric inputs, so no comparable "
+        "device-side Torch baseline is available"
+    ),
+)
 def test_linalg_matrix_rank_hermitian():
     def matrix_rank_hermitian_input_fn(shape, cur_dtype, device):
         matrix = torch.randn(shape, dtype=cur_dtype, device=device)
