@@ -1393,6 +1393,281 @@ def _matrix_rank_herm_tridiag_mat_kernel(
     tl.atomic_add(CSCA + pid, tl.sum(part * vp, axis=0))
 
 
+_HERM_TRIDIAG_BLOCKED_MIN_K = 768
+_HERM_TRIDIAG_PANEL = 32
+
+
+_HERM_TRIDIAG_SCRATCH_LINE = 32  # one 128B cache line per scratch entry
+
+
+@libentry()
+@triton.jit
+def _matrix_rank_herm_tridiag_pcol_kernel(
+    W, V, PV, PW, ACC, CSCA, PSCR, J, P, K, RS, WPITCH, APITCH, PVP, SPITCH,
+    NB_P: tl.constexpr, SL: tl.constexpr,
+):
+    # Blocked WY tridiagonalization (LAPACK DSYTRD), column J = panel slot
+    # P, phase A -- MULTI-PROGRAM over 64-row chunks: apply the deferred
+    # panel update to column J,
+    #   a_J -= Vp @ Wp[J, :] + Wp @ Vp[J, :]        (panel columns q < P)
+    # store the (pre-pivot) reflector into row J of V, and atomically
+    # accumulate the per-chunk partials the next kernels need:
+    # sigma^2 / dj / x0 scalars and the w1 = Wp^T v, w2 = Vp^T v panel
+    # vectors (each scratch entry padded to its own 128B line -- thousands
+    # of atomics into one shared line serialize in the L2).  Every program
+    # also zeroes the ACC chunk it owns (first program: CSCA) for the GEMV
+    # kernel's atomics.  Cross-program ordering comes from kernel launch
+    # boundaries only -- no grid barrier.
+    #
+    # Column J is read as ROW J: the padded work matrix is symmetrized
+    # (pad_init mirrors the lower triangle) and rank-2k keeps the trailing
+    # block symmetric, so row J == column J exactly and the read is fully
+    # coalesced.  The updated column is NEVER written back to W: later
+    # columns read their own rows, and the panel region of W is dead once
+    # factored.  (A strided column access with stride RS measured ~30
+    # us/column at k=1024 -- it dominated the whole path.)
+    #
+    # Panel slots q >= P hold stale FINITE values (zero-initialized once at
+    # workspace creation) and are masked with tl.where on unmasked loads: a
+    # runtime mask on the loads themselves makes Triton emit serialized
+    # predicated updates, and Inf/NaN * 0 would poison the sums.
+    pid = tl.program_id(0)
+    rb = tl.program_id(1) + J // 64
+    wrow = W + pid * WPITCH + J * RS
+    vrow = V + pid * WPITCH + J * RS
+    pvbase = PV + pid * PVP
+    pwbase = PW + pid * PVP
+    lr = tl.arange(0, 64)
+    qidx = tl.arange(0, NB_P)
+    dtype = W.dtype.element_ty
+    tl.store(ACC + pid * APITCH + rb * 64 + lr, tl.zeros((64,), dtype=dtype))
+    if tl.program_id(1) == 0:
+        tl.store(CSCA + pid, tl.zeros((), dtype=dtype))
+    if rb < (K + 63) // 64:
+        slot = PSCR + pid * SPITCH + J * (3 + 2 * NB_P) * SL
+        r = rb * 64 + lr
+        col = tl.load(wrow + r)
+        if P > 0:
+            qm = qidx < P
+            v_row_j = tl.where(qm, tl.load(pvbase + J * NB_P + qidx), 0.0)
+            w_row_j = tl.where(qm, tl.load(pwbase + J * NB_P + qidx), 0.0)
+            v_own = tl.load(pvbase + r[:, None] * NB_P + qidx[None, :])
+            w_own = tl.load(pwbase + r[:, None] * NB_P + qidx[None, :])
+            col -= tl.sum(v_own * w_row_j[None, :], axis=1) + tl.sum(
+                w_own * v_row_j[None, :], axis=1
+            )
+            # w1/w2 partials on the pre-pivot reflector; the pivot entry
+            # discrepancy (-alpha * panel[J+1, q]) is corrected in pfin.
+            ch = tl.where(r > J, col, 0.0)
+            tl.atomic_add(
+                slot + (3 + qidx) * SL,
+                tl.sum(w_own * ch[:, None], axis=0),
+                sem="relaxed",
+            )
+            tl.atomic_add(
+                slot + (3 + NB_P + qidx) * SL,
+                tl.sum(v_own * ch[:, None], axis=0),
+                sem="relaxed",
+            )
+        # Store the reflector zeroed below J + 1; the pivot is adjusted on
+        # load by pmat/pfin (which recompute alpha from the partials).
+        tl.store(vrow + r, tl.where(r > J, col, 0.0))
+        ch = tl.where(r > J, col, 0.0)
+        tl.atomic_add(slot, tl.sum(ch * ch, axis=0), sem="relaxed")
+        tl.atomic_add(
+            slot + SL, tl.sum(tl.where(r == J, col, 0.0), axis=0), sem="relaxed"
+        )
+        tl.atomic_add(
+            slot + 2 * SL,
+            tl.sum(tl.where(r == J + 1, col, 0.0), axis=0),
+            sem="relaxed",
+        )
+
+
+@libentry()
+@triton.jit
+def _matrix_rank_herm_tridiag_pmat_kernel(
+    W, V, D, E, ACC, CSCA, PSCR, J, K, RS, WPITCH, APITCH, SPITCH, NRT,
+    NB_P: tl.constexpr, SL: tl.constexpr,
+):
+    # Blocked WY column J, phase B: omega = W_trailing @ v (symmetric
+    # matvec, multi-program with atomic accumulation into ACC, plus the
+    # v^T omega partial into CSCA).  Every program redundantly recomputes
+    # the Householder scalars from pcol's partials (three scalar loads) and
+    # applies the pivot overwrite v[J+1] = x0 - alpha on load; program
+    # flat == 0 additionally stores D[J] / E[J].  Tiles are K-trimmed
+    # trailing blocks (c0/r0 = J+1+tile*64 reach at most K+62 < RS), so no
+    # masks -- pad rows/cols are zeros by construction.
+    pid = tl.program_id(0)
+    flat = tl.program_id(1)
+    ct = flat // NRT
+    rt = flat % NRT
+    c0 = J + 1 + ct * 64
+    r0 = J + 1 + rt * 64
+    lc = tl.arange(0, 64)
+    lr = tl.arange(0, 64)
+    slot = PSCR + pid * SPITCH + J * (3 + 2 * NB_P) * SL
+    sig = tl.load(slot)
+    x0 = tl.load(slot + 2 * SL)
+    sigma = tl.sqrt(sig)
+    alpha = tl.where(x0 >= 0.0, -sigma, sigma)
+    wbase = W + pid * WPITCH
+    vrow = V + pid * WPITCH + J * RS
+    tile = tl.load(wbase + (c0 + lc)[:, None] * RS + (r0 + lr)[None, :])
+    vc = tl.load(vrow + c0 + lc)
+    vc = tl.where(c0 + lc == J + 1, x0 - alpha, vc)
+    part = tl.sum(tl.trans(tile) * vc[None, :], axis=1)
+    tl.atomic_add(ACC + pid * APITCH + r0 + lr, part)
+    vp = tl.load(vrow + r0 + lr)
+    vp = tl.where(r0 + lr == J + 1, x0 - alpha, vp)
+    tl.atomic_add(CSCA + pid, tl.sum(part * vp, axis=0))
+    if flat == 0:
+        tl.store(D + pid * K + J, tl.load(slot + SL))
+        tl.store(E + pid * K + J, alpha)
+
+
+@libentry()
+@triton.jit
+def _matrix_rank_herm_tridiag_pfin_kernel(
+    V, PV, PW, ACC, CSCA, PSCR, J, P, K, RS, WPITCH, APITCH, PVP, SPITCH,
+    NB_P: tl.constexpr, SL: tl.constexpr,
+):
+    # Blocked WY column J = panel slot P, phase C -- MULTI-PROGRAM over
+    # 64-row chunks: finish the corrected w and store the panel columns.
+    # Every program redundantly recomputes the Householder scalars and the
+    # rank-2 coefficient from the scratch partials (the identity
+    # v^T A_p v = v^T S v - 2 (w1 . w2) needs no second global reduction;
+    # v^T S v is the CSCA partial the GEMV kernel accumulated):
+    #   w = tau * (omega - Vp w1 - Wp w2) - (tau^2/2)(v^T A_p v) * v
+    # The tau^2 factor is evaluated as tau * (tau * dot), never tau*tau:
+    # strongly deflated spectra drive tau to ~1e20 and the square overflows
+    # fp32 even though the final coefficient is O(1).  pcol accumulated
+    # w1/w2 with the PRE-pivot value x0 at row J+1, so both get the
+    # -alpha * panel[J+1, q] correction here.  Program 0 additionally
+    # zeroes the NEXT column's scratch slot (wrapping to slot 0 after the
+    # last column) so the next call / graph replay finds zeros.
+    pid = tl.program_id(0)
+    rb = tl.program_id(1) + (J + 1) // 64
+    pvbase = PV + pid * PVP
+    pwbase = PW + pid * PVP
+    vrow = V + pid * WPITCH + J * RS
+    lr = tl.arange(0, 64)
+    qidx = tl.arange(0, NB_P)
+    dtype = V.dtype.element_ty
+    slot = PSCR + pid * SPITCH + J * (3 + 2 * NB_P) * SL
+    sig = tl.load(slot)
+    x0 = tl.load(slot + 2 * SL)
+    sigma = tl.sqrt(sig)
+    alpha = tl.where(x0 >= 0.0, -sigma, sigma)
+    vnorm2 = 2.0 * sigma * (sigma + tl.abs(x0))
+    tau = tl.where(vnorm2 > 0.0, 2.0 / vnorm2, 0.0)
+    qm = qidx < P
+    w1 = tl.load(slot + (3 + qidx) * SL)
+    w2 = tl.load(slot + (3 + NB_P + qidx) * SL)
+    w1 -= alpha * tl.load(pwbase + (J + 1) * NB_P + qidx)
+    w2 -= alpha * tl.load(pvbase + (J + 1) * NB_P + qidx)
+    w1 = tl.where(qm, w1, 0.0)
+    w2 = tl.where(qm, w2, 0.0)
+    dot = tl.load(CSCA + pid) - 2.0 * tl.sum(w1 * w2, axis=0)
+    coef = (-0.5 * tau) * (tau * dot)
+    r = rb * 64 + lr
+    v = tl.load(vrow + r)
+    v = tl.where(r == J + 1, x0 - alpha, v)
+    w_raw = tl.load(ACC + pid * APITCH + r)
+    if P > 0:
+        v_own = tl.load(pvbase + r[:, None] * NB_P + qidx[None, :])
+        w_own = tl.load(pwbase + r[:, None] * NB_P + qidx[None, :])
+        w_raw -= tl.sum(v_own * w1[None, :], axis=1) + tl.sum(
+            w_own * w2[None, :], axis=1
+        )
+    w = tau * w_raw + coef * v
+    # Pad rows keep their zero-init; stale entries at rows <= J from the
+    # previous panel's slot P are finite and are masked by q < p at every
+    # read site.
+    tl.store(pwbase + r * NB_P + P, w, mask=(r > J) & (r < K))
+    tl.store(pvbase + r * NB_P + P, v, mask=(r > J) & (r < K))
+    if tl.program_id(1) == 0:
+        jn = tl.where(J + 1 > K - 2, 0, J + 1)
+        slot_n = PSCR + pid * SPITCH + jn * (3 + 2 * NB_P) * SL
+        eidx = tl.arange(0, 4 * NB_P)
+        tl.store(
+            slot_n + eidx * SL,
+            tl.zeros((4 * NB_P,), dtype=dtype),
+            mask=eidx < 3 + 2 * NB_P,
+        )
+
+
+@libentry()
+@triton.jit
+def _matrix_rank_herm_tridiag_rank2k_kernel(
+    W, PV, PW, T0, PE, K, RS, WPITCH, PVP, NT, NB_P: tl.constexpr
+):
+    # Trailing symmetric rank-2k update S -= Vp Wp^T + Wp Vp^T over
+    # rows/cols >= T0, one program per (col tile, row strip) of the
+    # K-trimmed trailing block: T0 + 63 <= K + 62 < RS (padded) so tiles
+    # never straddle the pitch and need no masks, and the zero pad rows of
+    # PV/PW make the update exactly zero in the padding.
+    pid = tl.program_id(0)
+    flat = tl.program_id(1)
+    ct = flat // NT
+    rt = flat % NT
+    r0 = T0 + rt * 64
+    c0 = T0 + ct * 64
+    lr = tl.arange(0, 64)
+    qidx = tl.arange(0, NB_P)
+    qm = qidx < PE
+    pvbase = PV + pid * PVP
+    pwbase = PW + pid * PVP
+    r = r0 + lr
+    c = c0 + lr
+    v_r = tl.where(
+        qm[None, :], tl.load(pvbase + r[:, None] * NB_P + qidx[None, :]), 0.0
+    )
+    w_r = tl.where(
+        qm[None, :], tl.load(pwbase + r[:, None] * NB_P + qidx[None, :]), 0.0
+    )
+    v_c = tl.where(
+        qm[None, :], tl.load(pvbase + c[:, None] * NB_P + qidx[None, :]), 0.0
+    )
+    w_c = tl.where(
+        qm[None, :], tl.load(pwbase + c[:, None] * NB_P + qidx[None, :]), 0.0
+    )
+    if tl.constexpr(W.dtype.element_ty == tl.float64):
+        # fp64 tl.dot is miscompiled on some vendor backends (wrong results
+        # for every block shape / num_warps variant measured), so
+        # accumulate the rank-2k update as per-column outer products.  The
+        # v_r/w_r/v_c/w_c tiles above are dead in this branch and get
+        # eliminated.
+        upd = tl.zeros((64, 64), dtype=W.dtype.element_ty)
+        for q in tl.range(0, PE):
+            v_rq = tl.load(pvbase + r * NB_P + q)
+            w_rq = tl.load(pwbase + r * NB_P + q)
+            v_cq = tl.load(pvbase + c * NB_P + q)
+            w_cq = tl.load(pwbase + c * NB_P + q)
+            upd += v_rq[:, None] * w_cq[None, :] + w_rq[:, None] * v_cq[None, :]
+    else:
+        upd = tl.dot(v_r, tl.trans(w_c), input_precision="ieee") + tl.dot(
+            w_r, tl.trans(v_c), input_precision="ieee"
+        )
+    # upd[i, j] belongs to (row r_i, col c_j); the pointer tile must use the
+    # same orientation or the update lands transposed and breaks symmetry.
+    ptrs = W + pid * WPITCH + r[:, None] * RS + c[None, :]
+    tile = tl.load(ptrs)
+    tl.store(ptrs, tile - upd)
+
+
+@libentry()
+@triton.jit
+def _matrix_rank_herm_tridiag_last_diag_kernel(W, D, K, RS, WPITCH):
+    # The blocked loop factors columns 0 .. K-2; D[K-1] is whatever the
+    # last rank-2k update left at W[K-1, K-1].
+    pid = tl.program_id(0)
+    tl.store(
+        D + pid * K + (K - 1),
+        tl.load(W + pid * WPITCH + (K - 1) * RS + (K - 1)),
+    )
+
+
 @libentry()
 @triton.jit
 def _matrix_rank_herm_tridiag_apply_kernel(
@@ -1438,16 +1713,35 @@ def _herm_tridiag_workspace(device, batch_count, k, work_dtype, atol_tensor, rto
     # can be graph-captured (capture requires stable buffer addresses).
     kp = triton.cdiv(k, 64) * 64 + 64
     rs = kp  # hermitian input is square: rows == k
+    nb_p = _HERM_TRIDIAG_PANEL
     ws = {
         "device_index": device.index,
         "kp": kp,
         "rs": rs,
         "wpitch": kp * rs,
         "apitch": kp + 64,
+        "pvp": kp * nb_p,
+        "nb_p": nb_p,
         # Zero-init (not empty): the mat/apply kernels read the padding
         # without masks and rely on it staying zero.
         "w_buf": torch.zeros((batch_count, kp, rs), dtype=work_dtype, device=device),
         "v_buf": torch.zeros((batch_count, kp, rs), dtype=work_dtype, device=device),
+        # Panel reflector/correction buffers (blocked path only).  Zero-init:
+        # stale slots q >= p must be finite because the kernels multiply
+        # unmasked tile loads against tl.where-zeroed values.
+        "pv": torch.zeros((batch_count, kp, nb_p), dtype=work_dtype, device=device),
+        "pw": torch.zeros((batch_count, kp, nb_p), dtype=work_dtype, device=device),
+        # Per-column reduction scratch for the blocked path: one slot per
+        # column, entries padded to 128B lines so concurrent atomics do not
+        # serialize in the L2.  Zero-init: pcol accumulates with atomics and
+        # pfin re-zeroes the next column's slot after use (slot 0 is re-zeroed
+        # by the last column's pfin), so every call / graph replay starts
+        # from zeros.
+        "pscr": torch.zeros(
+            (batch_count, k * (3 + 2 * nb_p) * _HERM_TRIDIAG_SCRATCH_LINE),
+            dtype=work_dtype,
+            device=device,
+        ),
         "diag": torch.empty((batch_count, k), dtype=work_dtype, device=device),
         "offdiag": torch.empty((batch_count, k), dtype=work_dtype, device=device),
         "taul": torch.empty((batch_count, k), dtype=work_dtype, device=device),
@@ -1533,6 +1827,135 @@ def _herm_tridiag_run(ws, k, batch_count, ds32):
                 num_warps=4,
                 num_stages=1,
             )
+    _herm_tridiag_sturm_tail(ws, k, batch_count, ds32)
+
+
+def _herm_tridiag_blocked_run(ws, k, batch_count, ds32):
+    # Blocked WY variant for large matrices: columns are factored in panels
+    # of NB_P.  Inside a panel the trailing matrix is NOT updated; each
+    # column step is three launches (deferred column update + reflector /
+    # symmetric GEMV against the STALE trailing block / corrected-w finish
+    # storing the panel V/W columns), and the panel's reflection is applied
+    # afterwards as ONE symmetric rank-2k update built with tl.dot.  This
+    # replaces the unblocked path's per-column trailing rank-2 read+write
+    # (BLAS2, bandwidth-bound) with a per-panel BLAS3 pass.  Kernel launch
+    # boundaries remain the ONLY cross-program ordering.  Pure function of
+    # the workspace so it can be graph-captured.
+    kp, rs = ws["kp"], ws["rs"]
+    wpitch, apitch, pvp = ws["wpitch"], ws["apitch"], ws["pvp"]
+    nb_p = ws["nb_p"]
+    sl = _HERM_TRIDIAG_SCRATCH_LINE
+    spitch = k * (3 + 2 * nb_p) * sl
+    w_buf, v_buf = ws["w_buf"], ws["v_buf"]
+    pv, pw, pscr = ws["pv"], ws["pw"], ws["pscr"]
+    diag, offdiag = ws["diag"], ws["offdiag"]
+    acc, csca = ws["acc"], ws["csca"]
+    _matrix_rank_herm_tridiag_pad_init_kernel[(batch_count, triton.cdiv(k, 64))](
+        ws["staging"],
+        w_buf,
+        K=k,
+        RS=rs,
+        WPITCH=wpitch,
+        num_warps=4,
+    )
+    j0 = 0
+    while j0 < k - 1:
+        pe = min(nb_p, k - 1 - j0)
+        for p in range(pe):
+            j = j0 + p
+            # pcol covers the ACC-zero range (APITCH // 64 chunks from
+            # J // 64); programs past the real row count only zero ACC.
+            nc = apitch // 64 - j // 64
+            _matrix_rank_herm_tridiag_pcol_kernel[(batch_count, nc)](
+                w_buf,
+                v_buf,
+                pv,
+                pw,
+                acc,
+                csca,
+                pscr,
+                j,
+                p,
+                k,
+                rs,
+                wpitch,
+                apitch,
+                pvp,
+                spitch,
+                NB_P=nb_p,
+                SL=sl,
+                num_warps=4,
+                num_stages=1,
+            )
+            nrt = triton.cdiv(k - 1 - j, 64)
+            _matrix_rank_herm_tridiag_pmat_kernel[(batch_count, nrt * nrt)](
+                w_buf,
+                v_buf,
+                diag,
+                offdiag,
+                acc,
+                csca,
+                pscr,
+                j,
+                k,
+                rs,
+                wpitch,
+                apitch,
+                spitch,
+                nrt,
+                NB_P=nb_p,
+                SL=sl,
+                num_warps=8,
+                num_stages=1,
+            )
+            nc2 = triton.cdiv(k, 64) - (j + 1) // 64
+            _matrix_rank_herm_tridiag_pfin_kernel[(batch_count, nc2)](
+                v_buf,
+                pv,
+                pw,
+                acc,
+                csca,
+                pscr,
+                j,
+                p,
+                k,
+                rs,
+                wpitch,
+                apitch,
+                pvp,
+                spitch,
+                NB_P=nb_p,
+                SL=sl,
+                num_warps=4,
+                num_stages=1,
+            )
+        t0 = j0 + pe
+        if t0 < k:
+            nt = triton.cdiv(k - t0, 64)
+            _matrix_rank_herm_tridiag_rank2k_kernel[(batch_count, nt * nt)](
+                w_buf,
+                pv,
+                pw,
+                t0,
+                pe,
+                k,
+                rs,
+                wpitch,
+                pvp,
+                nt,
+                NB_P=nb_p,
+                num_warps=4,
+                num_stages=1,
+            )
+        j0 += pe
+    _matrix_rank_herm_tridiag_last_diag_kernel[(batch_count,)](
+        w_buf, diag, k, rs, wpitch
+    )
+    _herm_tridiag_sturm_tail(ws, k, batch_count, ds32)
+
+
+def _herm_tridiag_sturm_tail(ws, k, batch_count, ds32):
+    diag, offdiag = ws["diag"], ws["offdiag"]
     if ds32:
         _matrix_rank_sturm32_tridiag_bracket_kernel[(batch_count,)](
             diag,
@@ -1588,6 +2011,14 @@ def _launch_herm_tridiag_rank(matrix, atol_tensor, rtol_tensor, out, k, batch_co
     # Devices without native FP64 take the pure-FP32 double-single Sturm
     # tail; float64 input never reaches here on them (entry fail-fast).
     ds32 = work_dtype == torch.float32 and not _native_fp64_supported()
+    # Large fp32 matrices take the blocked WY panel factorization (BLAS3
+    # trailing updates).  Smaller sizes stay on the per-column unblocked
+    # path (measured crossover between 512 and 1024), and fp64 stays
+    # unblocked too: with no fast fp64 tl.dot on current hardware the
+    # rank-2k falls back to an outer-product loop and the panel algebra
+    # costs more than it saves (measured: blocked fp64 loses at every
+    # size).
+    blocked = k >= _HERM_TRIDIAG_BLOCKED_MIN_K and work_dtype == torch.float32
 
     def copy_in(ws):
         ws["staging"].copy_(matrix)
@@ -1607,7 +2038,11 @@ def _launch_herm_tridiag_rank(matrix, atol_tensor, rtol_tensor, out, k, batch_co
             device, batch_count, k, work_dtype, atol_tensor, rtol_tensor
         ),
         copy_in,
-        lambda ws: _herm_tridiag_run(ws, k, batch_count, ds32),
+        lambda ws: (
+            _herm_tridiag_blocked_run(ws, k, batch_count, ds32)
+            if blocked
+            else _herm_tridiag_run(ws, k, batch_count, ds32)
+        ),
         copy_out,
     )
 
@@ -2319,7 +2754,9 @@ def _correct_negative_tolerance_rank(input, result, atol, rtol, hermitian):
     # hermitian reads only the lower triangle: strict-upper garbage is
     # invisible to torch, so the "nonzero" test must ignore it too.
     visible = torch.tril(input) if hermitian else input
-    nonzero = (visible.amax(dim=(-2, -1)) > 0) | (visible.amin(dim=(-2, -1)) < 0)
+    # abs().amax() instead of (amax > 0) | (amin < 0): the generic amin op
+    # has no float64 kernel, and one reduction is cheaper than two.
+    nonzero = visible.abs().amax(dim=(-2, -1)) > 0
     k = min(input.shape[-2:])
     if isinstance(atol, torch.Tensor) or isinstance(rtol, torch.Tensor):
         # At least one tolerance is a device tensor; a Python float on the

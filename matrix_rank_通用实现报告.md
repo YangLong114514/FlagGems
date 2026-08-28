@@ -188,6 +188,60 @@ eps·σmax，不是 Gram 矩阵方案的 √eps·σmax——附录 A.4 的选型
 tril），回归 201 passed / 32 skipped 不变，herm (1,1) 等小 shape 加速比回到项 1
 之前水平（见第 4 节）。
 
+### 2.7 blocked WY 面板化三对角化（barrier-free 重写）
+
+unblocked 路径每列做"reflector + 完整尾矩阵 GEMV + 完整尾矩阵对称 rank-2 更新"，
+主要计算是 BLAS2、带宽受限；CUDA Graph 只能省 launch 提交开销，省不掉每列对尾矩
+阵的反复读写。旧版（自旋 barrier 时代）的 blocked WY 曾把 herm fp32 (1024,1024)
+从 0.48x 拉到 1.13x，算法相同但长在 grid barrier 上，重构时被一并删除。本节按同
+样的 DSYTRD 结构重写了一个 barrier-free 版本（fp32 且 k ≥ 768 启用，面板宽 32；
+启用条件由实测交叉点决定，见下）：
+
+- **面板内延迟更新**：每列 3 次 launch——`pcol`（多 program 按 64 行分块：用面板
+  V/W 对当前列做延迟更新 `a_J -= Vp·Wp[J,:] + Wp·V[J,:]`，把 reflector 存进 V 的
+  第 J 行，并用原子加累积 sigma²/dj/x0 标量与 w1 = Wpᵀv、w2 = Vpᵀv 面板向量的分块
+  部分和）、`pmat`（多 program 对称 GEMV：对**未更新**的尾矩阵块求
+  `omega = S22·v` 并原子累加 `vᵀomega`；每个 program 从 scratch 部分和冗余重算
+  sigma/alpha/tau 并在载入时施加 pivot 覆写 `v[J+1] = x0 - alpha`，program 0 顺手
+  存 D/E)、`pfin`（多 program：按恒等式 `vᵀA_p v = vᵀSv - 2·w1ᵀw2` 省掉第二次全
+  局归约，完成 `w = tau*(omega - Vp·w1 - Wp·w2) - (tau^2/2)(vᵀA_p v)*v` 并存入面
+  板列）。尾矩阵在面板内完全不被写。
+- **面板间一次 BLAS3 更新**：面板结束用 `rank2k` kernel 做
+  `S -= Vp·Wpᵀ + Wp·Vpᵀ`(fp32 `tl.dot(input_precision="ieee")`)。每列主导流量从
+  3(k-j)² 降到约 (k-j)²,launch 总数基本不变（3k + k/32)，照样整张图捕获。
+- **关键性能纪律（全部来自实测）**:
+  - 列 J 一律按**行 J** 读（工作矩阵已对称化，行 == 列），跨步列读在 k=1024 实测
+    约 30µs/列，曾主导整条路径；
+  - 面板相位必须多 program 化——单 program 顺序扫 k×NB 面板数据 + 循环内
+    `tl.sum`（每次归约强制块级 bar.sync、fence 住下一片 load）实测 pcol+pfin 达
+    22µs/列，多 program 化后降到 2.7+2.4µs；
+  - scratch 部分和的每个条目独占一条 128B cache line（并发原子加在共享行上会在
+    L2 串行）;
+  - 每列一个 scratch 槽位避免清零竞争：`pcol` 原子累积前槽位必须为零，由**上一列
+    的 pfin** 负责清零下一列槽位（最后一列回绕清槽位 0)，保证每次调用/图重放都
+    从零开始；
+  - 面板槽位 q ≥ p 的过期值只保证有限（buffer 一次性零初始化），读取一律无
+    mask + `tl.where`;tau 永不平方（强 deflate 谱 tau ~ 1e20,fp32 下 tau*tau 上
+    溢）;`beta` 用恒等式而非额外归约。
+- **fp64 不走 blocked**：当前硬件没有快速 fp64 tl.dot,rank-2k 只能退化到逐列外积
+  循环，面板代数开销超过收益（实测 blocked fp64 在 256/512/1024 全部输给
+  unblocked)。这是纯 dtype 性能启发式，不涉及厂商判断。
+
+**调试中抓到的两个真 bug**:
+
+1. rank-2k kernel 的 tile 指针行列方向与 `upd` 张量方向不一致（`upd[i,j]` 属于
+   (r_i, c_j)，指针却按 (c_i, r_j) 寻址），更新被转置写入、对称性破坏——第一个
+   面板完全正确，从第二个面板起发散。定位方法：绕开 graph 缓存直接调
+   `_herm_tridiag_blocked_run`，对比 blocked/unblocked 输出的 D/E 首个发散下标
+   （恰好是 32 = 第二个面板起点）。
+2. reflector 行未在 J+1 以下清零：`pcol` 把 v 写进 V 的第 J 行时未显式置零下
+   标 ≤ J 的部分（unblocked 的 step kernel 有 `ch * (r > J)`),`pfin`/`pmat` 按
+   64 宽分块读 V 的 J 行会吃到镜像垃圾值，低秩（强 deflate）矩阵立刻出错。
+
+**顺带修的既有 bug**：负容差修正路径用 `visible.amin(...)`，而通用 `amin` 算子没
+有 fp64 kernel,fp64 输入 + tensor 容差直接崩；改成 `abs().amax() > 0`（语义等价，
+还省一次归约）。
+
 ## 3. 遇到的问题与解决（按平台）
 
 ### 3.1 海光：图捕获挂死
@@ -242,7 +296,7 @@ Ascend 专属用例）。
 
 | 路径 | k ≤ 512 各 shape | (1024,1024) |
 |---|---|---|
-| herm fp32 | 1.67 ~ 4.34x | **0.78x（未达标）** |
+| herm fp32 | 1.67 ~ 4.34x | 0.90x（blocked WY,2.7 节） |
 | herm fp64 | 1.06 ~ 5.21x | 0.90x |
 | 非 herm fp32 | 1.13 ~ 9.1x（batch 最高 81x） | 2.46x |
 | 非 herm fp64 | 3.0x 以上（最高 124x） | 23.8x |
@@ -250,12 +304,9 @@ Ascend 专属用例）。
 graph 捕获把 barrier-free 重构初期的 herm fp32 回归（0.17~0.45x）全部拉回 1x 以
 上；2.6 节的标量 fast path 又把小 shape 从项 1 的缩放开销里收了回来——herm
 (1,1)/(2,2) 从 0.95x/1.2x 回到 2.16x/3.24x，非 herm (16,16) 4.69x，一次小矩阵
-调用只剩 4 个 kernel（abs、amax、clamp、rank 主体；herm 多一个 tril）。
-
-**已知遗留**：herm (1024,1024) fp32 = 0.78x。原因是本次重构删除了旧的 blocked
-（分块 WY，BLAS3）三对角化 kernel，大矩阵目前走逐列 unblocked 路径，计算本身落后
-于 torch 的 blocked sytrd。回收方向是 panel/WY 分块化（改造方案阶段 4 第 3 条），
-属于独立的 kernel 工作量，尚未实施。
+调用只剩 4 个 kernel（abs、amax、clamp、rank 主体；herm 多一个 tril）。2.7 节的
+blocked WY 把 herm (1024,1024) fp32 从 0.78x 提到 0.90x——**至此 benchmark 全部
+shape ≥ 0.8x**。
 
 ## 5. 重构提交记录
 
