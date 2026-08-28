@@ -80,7 +80,17 @@ def _mr_graph_cached(key, device, make_workspace, copy_in, run, copy_out):
     # make_workspace() allocates the persistent buffers, copy_in(ws) stages
     # the live inputs, run(ws) is the pure launch sequence, copy_out(ws)
     # publishes the result.
-    if device.type != "cuda" or os.environ.get("FLAGGEMS_MR_NO_GRAPH") == "1":
+    # Graph capture is a pure performance optimization, never a correctness
+    # requirement.  Gate on the torch BUILD, not the vendor: ROCm-stack
+    # builds (torch.version.hip set, torch.version.cuda empty -- this covers
+    # every HIP-compatible platform, not just AMD) hang capturing the large
+    # O(k) launch sequences, so graphs stay a genuine-CUDA-only fast path.
+    if (
+        device.type != "cuda"
+        or torch.version.cuda is None
+        or torch.version.hip is not None
+        or os.environ.get("FLAGGEMS_MR_NO_GRAPH") == "1"
+    ):
         ws = make_workspace()
         copy_in(ws)
         run(ws)
