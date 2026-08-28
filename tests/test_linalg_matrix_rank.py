@@ -885,7 +885,7 @@ def test_linalg_matrix_rank_exact_path(shape, rank, hermitian, monkeypatch):
     matrix = matrix.to(device=flag_gems.device)
     rtol = max(m, n) * torch.finfo(torch.float32).eps
     reference = torch.linalg.matrix_rank(
-        matrix.to(torch.float64).cpu(), atol=0.0, rtol=rtol, hermitian=hermitian
+        matrix.cpu().to(torch.float64), atol=0.0, rtol=rtol, hermitian=hermitian
     )
 
     result = flag_gems.linalg_matrix_rank(matrix, hermitian=hermitian)
@@ -955,7 +955,7 @@ def test_linalg_matrix_rank_nonsquare_lowrank(dtype, shape, rank):
 
     rtol = max(m, n) * torch.finfo(torch.float32).eps
     reference = torch.linalg.matrix_rank(
-        matrix.to(torch.float64).cpu(), atol=0.0, rtol=rtol
+        matrix.cpu().to(torch.float64), atol=0.0, rtol=rtol
     )
 
     result = flag_gems.linalg_matrix_rank(matrix)
@@ -991,7 +991,7 @@ def test_linalg_matrix_rank_hermitian_strict_threshold(k, monkeypatch):
     def diag_case(values, atol, rtol):
         matrix = torch.diag(values).to(torch.float32).to(device)
         reference = torch.linalg.matrix_rank(
-            matrix.double().cpu(), hermitian=True, atol=atol, rtol=rtol
+            matrix.cpu().double(), hermitian=True, atol=atol, rtol=rtol
         )
         result = flag_gems.linalg_matrix_rank(
             matrix, hermitian=True, atol=atol, rtol=rtol
@@ -1036,7 +1036,7 @@ def test_linalg_matrix_rank_hermitian_strict_threshold(k, monkeypatch):
     matrix = ((basis * values) @ basis.mT).float().to(device)
     for atol, expected_rank in [(0.49, 3), (0.51, 1)]:
         reference = torch.linalg.matrix_rank(
-            matrix.double().cpu(), hermitian=True, atol=atol, rtol=0.0
+            matrix.cpu().double(), hermitian=True, atol=atol, rtol=0.0
         )
         assert reference.item() == expected_rank  # construction sanity
         result = flag_gems.linalg_matrix_rank(
@@ -1083,7 +1083,7 @@ def test_linalg_matrix_rank_negative_tolerances(k, hermitian):
 
     def check(mat, atol, rtol):
         reference = torch.linalg.matrix_rank(
-            mat.double().cpu(), hermitian=hermitian, atol=atol, rtol=rtol
+            mat.cpu().double(), hermitian=hermitian, atol=atol, rtol=rtol
         )
         result = flag_gems.linalg_matrix_rank(
             mat, hermitian=hermitian, atol=atol, rtol=rtol
@@ -1106,7 +1106,7 @@ def test_linalg_matrix_rank_negative_tolerances(k, hermitian):
         upper_only = torch.zeros(k, k, dtype=torch.float32, device=device)
         upper_only[0, k - 1] = 1.0
         reference = torch.linalg.matrix_rank(
-            upper_only.double().cpu(), hermitian=True, atol=-1.0, rtol=-1.0
+            upper_only.cpu().double(), hermitian=True, atol=-1.0, rtol=-1.0
         )
         assert reference.item() == 0  # construction sanity
         result = flag_gems.linalg_matrix_rank(
@@ -1118,7 +1118,7 @@ def test_linalg_matrix_rank_negative_tolerances(k, hermitian):
         lower_only = torch.zeros(k, k, dtype=torch.float32, device=device)
         lower_only[k - 1, 0] = 1.0
         reference = torch.linalg.matrix_rank(
-            lower_only.double().cpu(), hermitian=True, atol=-1.0, rtol=-1.0
+            lower_only.cpu().double(), hermitian=True, atol=-1.0, rtol=-1.0
         )
         assert reference.item() == k  # construction sanity
         result = flag_gems.linalg_matrix_rank(
@@ -1133,7 +1133,7 @@ def test_linalg_matrix_rank_negative_tolerances(k, hermitian):
         atol_t = torch.full((3,), -1.0, device=device)
         rtol_t = torch.full((3,), -1.0, device=device)
         reference = torch.linalg.matrix_rank(
-            mixed.double().cpu(), hermitian=True, atol=atol_t.cpu(), rtol=rtol_t.cpu()
+            mixed.cpu().double(), hermitian=True, atol=atol_t.cpu(), rtol=rtol_t.cpu()
         )
         assert reference.tolist() == [0, k, 0]  # construction sanity
         result = flag_gems.linalg_matrix_rank(
@@ -1146,7 +1146,7 @@ def test_linalg_matrix_rank_negative_tolerances(k, hermitian):
     atol_t = torch.tensor([-1.0, -1.0, 0.0], device=device)
     rtol_t = torch.tensor([-1.0, -1.0, 0.0], device=device)
     reference = torch.linalg.matrix_rank(
-        batch.double().cpu(), hermitian=hermitian, atol=atol_t.cpu(), rtol=rtol_t.cpu()
+        batch.cpu().double(), hermitian=hermitian, atol=atol_t.cpu(), rtol=rtol_t.cpu()
     )
     result = flag_gems.linalg_matrix_rank(
         batch, hermitian=hermitian, atol=atol_t, rtol=rtol_t
@@ -1179,7 +1179,7 @@ def test_linalg_matrix_rank_longdim_exact_power2_nb(shape, monkeypatch):
 
     rtol = max(m, n) * torch.finfo(torch.float32).eps
     reference = torch.linalg.matrix_rank(
-        matrix.to(torch.float64).cpu(), atol=0.0, rtol=rtol
+        matrix.cpu().to(torch.float64), atol=0.0, rtol=rtol
     )
     result = flag_gems.linalg_matrix_rank(matrix)
     _assert_output_metadata(result, matrix)
@@ -1209,13 +1209,13 @@ def test_linalg_matrix_rank_hermitian_deflated_spectrum(
     matrix = ((basis * values) @ basis.mT).float().to(flag_gems.device)
 
     reference = torch.linalg.matrix_rank(
-        matrix.double().cpu(), hermitian=True, atol=0.51, rtol=0.0
+        matrix.cpu().double(), hermitian=True, atol=0.51, rtol=0.0
     )
     assert reference.item() == expect_rank  # 1.0 only; +/-0.5/-0.25 excluded
     result = flag_gems.linalg_matrix_rank(
         matrix, hermitian=True, atol=0.51, rtol=0.0
     )
-    assert torch.isfinite(result.double()).all()
+    assert torch.isfinite(result.cpu().double()).all()
     utils.gems_assert_equal(result, reference.to(flag_gems.device))
 
 
@@ -1277,7 +1277,7 @@ def test_linalg_matrix_rank_dispatch_boundary(shape, rank, hermitian, kind):
     matrix = matrix.to(flag_gems.device)
     rtol = max(m, n) * torch.finfo(torch.float32).eps
     reference = torch.linalg.matrix_rank(
-        matrix.to(torch.float64).cpu(), atol=0.0, rtol=rtol, hermitian=hermitian
+        matrix.cpu().to(torch.float64), atol=0.0, rtol=rtol, hermitian=hermitian
     )
     result = flag_gems.linalg_matrix_rank(matrix, hermitian=hermitian)
     _assert_output_metadata(result, matrix)
@@ -1380,7 +1380,7 @@ def test_linalg_matrix_rank_hermitian_ignores_strict_upper_large(k):
     )
     matrix = matrix.to(flag_gems.device)
     reference = torch.linalg.matrix_rank(
-        (torch.tril(matrix.double().cpu()) + torch.tril(matrix.double().cpu(), -1).mT),
+        (torch.tril(matrix.cpu().double()) + torch.tril(matrix.cpu().double(), -1).mT),
         hermitian=True,
     )
     result = flag_gems.linalg_matrix_rank(matrix, hermitian=True)
