@@ -566,27 +566,33 @@ def test_linalg_matrix_rank_hermitian_uses_lower_triangle(dtype):
 def test_linalg_matrix_rank_hermitian_ignores_strict_upper(dtype, order, rank):
     # torch hermitian semantics: only the LOWER triangle of the input is
     # read.  Filling the strict upper triangle with huge garbage must not
-    # change the result.  The assertion compares the garbage-upper matrix
-    # against its clean twin rather than a theoretical rank: a device-side
-    # fp32 GEMM can perturb the zero eigenspace by more than atol on some
-    # platforms, so a device-constructed matrix is not guaranteed to keep
-    # the nominal rank.  Construction stays on the CPU in float64 with a
-    # single final rounding.  Covers the fused (k <= 32) and padded
-    # (33..64) tridiagonalization paths; the 2x2 closed form is above.
+    # change the result.  EVERYTHING is built on the CPU -- the low-rank
+    # product, the fp32 rounding, the indexed garbage write and the
+    # reference: device-side fp32 GEMM can perturb the zero eigenspace by
+    # more than atol, device-side advanced-indexing writes have been
+    # observed to leak into the lower triangle, and the platform native
+    # hermitian path is not a reliable arbitrator.  Covers the fused
+    # (k <= 32) and padded (33..64) tridiagonalization paths; the 2x2
+    # closed form is above.
     generator = torch.Generator().manual_seed(7)
     basis = torch.randn(order, rank, dtype=torch.float64, generator=generator)
-    clean = (basis @ basis.mT).to(dtype).to(flag_gems.device)
-    garbage = clean.clone()
-    upper_rows, upper_cols = torch.triu_indices(
-        order, order, offset=1, device=garbage.device
+    clean_cpu = (basis @ basis.mT).to(dtype)
+    garbage_cpu = clean_cpu.clone()
+    upper_rows, upper_cols = torch.triu_indices(order, order, offset=1)
+    garbage_cpu[upper_rows, upper_cols] = 1.0e6
+    expected = torch.linalg.matrix_rank(
+        garbage_cpu.double(), atol=5e-2, rtol=0.0, hermitian=True
     )
-    garbage[upper_rows, upper_cols] = 1.0e6
 
-    result = _assert_direct_and_dispatch_match_native(
-        garbage, atol=5e-2, hermitian=True
-    )
-    clean_rank = flag_gems.linalg_matrix_rank(clean, atol=5e-2, hermitian=True)
-    utils.gems_assert_equal(result, clean_rank)
+    clean = clean_cpu.to(flag_gems.device)
+    garbage = garbage_cpu.to(flag_gems.device)
+    for matrix in (clean, garbage):
+        result = flag_gems.linalg_matrix_rank(matrix, atol=5e-2, hermitian=True)
+        _assert_output_metadata(result, matrix)
+        utils.gems_assert_equal(result, expected.to(flag_gems.device))
+        with flag_gems.use_gems():
+            dispatched = torch.linalg.matrix_rank(matrix, atol=5e-2, hermitian=True)
+        utils.gems_assert_equal(dispatched, expected.to(flag_gems.device))
 
 
 @pytest.mark.linalg_matrix_rank
@@ -972,17 +978,6 @@ def test_linalg_matrix_rank_nonsquare_lowrank(dtype, shape, rank):
     utils.gems_assert_equal(result, reference.to(device=matrix.device))
 
 
-def _fp32_denormal_supported(device):
-    # FTZ (flush-to-zero) devices keep subnormals in storage but flush them
-    # in arithmetic.  Probe one multiplication on the device; the CPU fp32
-    # reference doubles exactly (2^-149 -> 2^-148).
-    minsub = torch.tensor(
-        1.401298464324817e-45, dtype=torch.float32, device=device
-    )
-    expected = torch.tensor(1.401298464324817e-45, dtype=torch.float32) * 2.0
-    return (minsub * 2.0).item() == expected.item()
-
-
 @pytest.mark.linalg_matrix_rank
 # k <= 32 is only exercised on Ascend: there the fused kernel counts with a
 # Sturm qd chain (whose tie convention this test targets), while the generic
@@ -1039,14 +1034,12 @@ def test_linalg_matrix_rank_hermitian_strict_threshold(k, monkeypatch):
     # onto -tol itself, wrongly skipping lambda = -2*tiny.
     tiny = torch.finfo(torch.float32).tiny
     diag_case(torch.tensor([1.0, -2.0 * tiny] + [0.0] * (k - 2)), tiny, 0.0)
-    if _fp32_denormal_supported(device):
-        # Same tie at the smallest SUBNORMAL.  FTZ devices flush subnormal
-        # arithmetic to zero and cannot represent this case in plain
-        # FP32/double-single math, so it runs only where denormals work.
-        minsub = 1.401298464324817e-45  # smallest positive fp32 subnormal
-        diag_case(
-            torch.tensor([1.0, -2.0 * minsub] + [0.0] * (k - 2)), minsub, 0.0
-        )
+    # NOTE: the equivalent tie at the smallest SUBNORMAL is intentionally
+    # not tested here.  The Sturm count runs in Triton kernels, and some
+    # backends flush subnormals to zero there even when the platform's
+    # native PyTorch elementwise kernels preserve them -- so a host-side
+    # torch probe cannot certify the capability.  Re-enable only behind a
+    # runtime-provided "Triton FP32 denormal" capability bit.
     # positive tie: lambda == +tol must NOT be counted
     diag_case(torch.tensor([0.5, -1.0] + [0.0] * (k - 2)), 0.5, 0.0)
     # atol == rtol == 0 on a nonzero rank-deficient spectrum: #{|lam| > 0}
