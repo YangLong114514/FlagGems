@@ -2,6 +2,7 @@ import pytest
 import torch
 
 import flag_gems
+from flag_gems.runtime import device as runtime_device
 
 from . import base, consts
 
@@ -9,12 +10,14 @@ VENDOR_NAME = getattr(flag_gems, "vendor_name", "")
 IS_ASCEND = VENDOR_NAME == "ascend"
 IS_THEAD = VENDOR_NAME == "thead"
 
-# torch.linalg.matrix_rank on Ascend is backed by aclnn svd_npu, which is
-# float32-only ("svd_npu only supported Float, but get double"). Restrict the
-# performance comparison to float32 on Ascend; float64 accuracy is still
-# exercised in tests/ against the CPU reference.
+# Skip float64 where the device lacks native FP64 (capability bit, e.g.
+# Ascend -- whose aclnn svd_npu is float32-only -- or Iluvatar without an
+# FP64 solver): neither our kernels nor the torch native baseline can run
+# there.  float64 accuracy is still exercised in tests/ against the CPU
+# reference.
+_SUPPORT_FP64 = getattr(runtime_device, "support_fp64", True)
 MATRIX_RANK_DTYPES = (
-    [torch.float32] if IS_ASCEND else [torch.float32, torch.float64]
+    [torch.float32, torch.float64] if _SUPPORT_FP64 else [torch.float32]
 )
 
 
