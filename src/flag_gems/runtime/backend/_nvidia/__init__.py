@@ -19,6 +19,7 @@ vendor_info = VendorDescriptor(
     device_name="cuda",
     device_query_cmd="",
     tle_enabled=True,
+    graph_capture_enabled=True,
 )
 
 """

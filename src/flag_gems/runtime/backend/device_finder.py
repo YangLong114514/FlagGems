@@ -57,6 +57,12 @@ class DeviceDetector:
             self.support_fp64 = self.info.fp64_enabled
             self.support_bf16 = self.info.bf16_enabled
             self.support_int64 = self.info.int64_enabled
+            # VendorDescriptor gained the flag after some backends were
+            # written; getattr keeps any stale descriptor on the safe
+            # default (no graph capture).
+            self.support_graph_capture = getattr(
+                self.info, "graph_capture_enabled", False
+            )
 
     def get_vendor(self, vendor_name=None) -> tuple:
         # Try to get the vendor name from a quick special command like 'torch.mlu'.
