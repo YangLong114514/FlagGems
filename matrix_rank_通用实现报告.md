@@ -319,6 +319,9 @@ shape ≥ 0.8x**。
 | `04ccd64b` | 天数修复：测试 reference 改 CPU 侧转 fp64（14 处） |
 | `26b83137` / `1c2f8500` | 天数修复：低秩构造 CPU 化 + CPU reference 仲裁 + 移除 subnormal 用例 |
 | `14cbef24` | benchmark fp64 按 support_fp64 能力位跳过 |
+| `8bb9730a` | 数值稳健性四项（入口缩放、容差精度、fp64 二分 64 次、ds32 图缓存 key） |
+| `f9d99a1d` | 标量容差 fast path + 小路径核内缩放（2.6 节） |
+| `60e1aea7` | barrier-free blocked WY 三对角化（2.7 节）+ amin fp64 既有 bug 修复 |
 
 ---
 
