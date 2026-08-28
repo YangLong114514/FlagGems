@@ -1136,6 +1136,13 @@ def _matrix_rank_sturm32_bidiag_final_kernel(D, E, TOL2, OUT, K):
 
 
 def _expand_tolerance(value, batch_shape, input, name):
+    # Tolerances keep their own precision instead of being rounded down to
+    # the input dtype: a float64 (or high-precision Python float) tolerance
+    # sitting next to a singular value of a float32 matrix must decide the
+    # rank at ITS precision, matching torch.  On devices without native
+    # FP64 the comparison precision is FP32 anyway (ds32 Sturm tail), so
+    # float32 tolerances lose nothing there.
+    tol_dtype = torch.float64 if _native_fp64_supported() else torch.float32
     if isinstance(value, torch.Tensor):
         if value.is_complex():
             raise RuntimeError(
@@ -1155,7 +1162,7 @@ def _expand_tolerance(value, batch_shape, input, name):
                 f"torch.linalg.matrix_rank: {name} with shape {tuple(value.shape)} "
                 f"is not broadcastable to batch shape {tuple(batch_shape)}"
             ) from error
-        return value.to(dtype=input.dtype).contiguous()
+        return value.to(dtype=tol_dtype).contiguous()
 
     try:
         scalar = float(value)
@@ -1163,7 +1170,7 @@ def _expand_tolerance(value, batch_shape, input, name):
         raise TypeError(
             f"torch.linalg.matrix_rank: {name} must be a float or Tensor"
         ) from error
-    return torch.full(batch_shape, scalar, dtype=input.dtype, device=input.device)
+    return torch.full(batch_shape, scalar, dtype=tol_dtype, device=input.device)
 
 
 def _prepare_tolerances(input, atol, rtol):
@@ -1487,6 +1494,10 @@ def _herm_tridiag_run(ws, k, batch_count, ds32):
             enable_fp_fusion=False,
         )
         return
+    # Bisection refines sigma_max inside the Gershgorin bracket; 32
+    # iterations give ~1e-10 relative convergence, enough for fp32 data
+    # (24-bit mantissa) but not for fp64 thresholds -- use 64 there.
+    bisect_iters = 64 if ws["diag"].dtype == torch.float64 else 32
     _matrix_rank_sturm_rank_kernel[(batch_count,)](
         diag,
         offdiag,
@@ -1497,7 +1508,7 @@ def _herm_tridiag_run(ws, k, batch_count, ds32):
         ws["e2_lo"],
         K=k,
         BLOCK_K=triton.next_power_of_2(k),
-        BISECT_ITERS=32,
+        BISECT_ITERS=bisect_iters,
         num_warps=1,
         GK=False,
         enable_fp_fusion=False,
@@ -1525,7 +1536,10 @@ def _launch_herm_tridiag_rank(matrix, atol_tensor, rtol_tensor, out, k, batch_co
         out.copy_(ws["rank"].reshape(out.shape))
 
     _mr_graph_cached(
-        ("herm_tridiag", k, batch_count, work_dtype, device.index),
+        # ds32 is part of the key: the same shape must not reuse a graph
+        # captured with the native-FP64 Sturm tail after the capability is
+        # switched off (e.g. by tests monkeypatching support_fp64).
+        ("herm_tridiag", k, batch_count, work_dtype, ds32, device.index),
         device,
         lambda: _herm_tridiag_workspace(
             device, batch_count, k, work_dtype, atol_tensor, rtol_tensor
@@ -1956,6 +1970,9 @@ def _bidiag_run(ws, m, n, k, rows, batch_count, ds32):
         BLOCK=triton.next_power_of_2(2 * k),
         num_warps=4,
     )
+    # See the herm tail: fp64 thresholds need more bisection iterations
+    # than fp32 to converge the sigma_max bracket to mantissa precision.
+    bisect_iters = 64 if ws["gk_diag"].dtype == torch.float64 else 32
     _matrix_rank_sturm_rank_kernel[(batch_count,)](
         ws["gk_diag"],
         ws["gk_off"],
@@ -1966,7 +1983,7 @@ def _bidiag_run(ws, m, n, k, rows, batch_count, ds32):
         ws["e2_lo"],
         K=2 * k,
         BLOCK_K=triton.next_power_of_2(2 * k),
-        BISECT_ITERS=32,
+        BISECT_ITERS=bisect_iters,
         num_warps=1,
         GK=True,
         enable_fp_fusion=False,
@@ -1995,7 +2012,8 @@ def _launch_bidiag_rank(matrix, atol_tensor, rtol_tensor, out, m, n, k, rows, ba
         out.copy_(ws["rank"].reshape(out.shape))
 
     _mr_graph_cached(
-        ("bidiag", m, n, batch_count, work_dtype, device.index),
+        # ds32 is part of the key, same reason as the herm path above.
+        ("bidiag", m, n, batch_count, work_dtype, ds32, device.index),
         device,
         lambda: _bidiag_workspace(
             device,
@@ -2049,6 +2067,23 @@ def _launch_matrix_rank(
 
     batch_count = input.numel() // (m * n)
     matrix = input.contiguous().reshape(batch_count, m, n)
+    # Per-batch scale normalization.  The Householder algebra squares the
+    # matrix scale (w = A·v is O(sigma^2)), so fp32 inputs beyond ~1e19
+    # overflow and below ~1e-19 underflow even if every norm computation
+    # were internally scaled -- scaling must happen to the matrix itself.
+    # Rank is invariant: max(atol, rtol*sigma_max)/s ==
+    # max(atol/s, rtol*(sigma_max/s)), so shrinking atol by the same
+    # factor preserves the exact threshold semantics (rtol is relative
+    # and needs no change).  For hermitian input the scale ignores the
+    # strict upper triangle, which torch never reads (it may hold
+    # garbage).
+    visible = torch.tril(matrix) if hermitian else matrix
+    scale = visible.abs().amax(dim=(-2, -1))
+    scale = torch.where(scale > 0, scale, torch.ones_like(scale))
+    matrix = matrix / scale.unsqueeze(-1).unsqueeze(-1)
+    atol_tensor = (atol_tensor.reshape(batch_count) / scale).reshape(
+        atol_tensor.shape
+    )
     out = torch.empty(output_shape, dtype=torch.int64, device=input.device)
     block_r = triton.next_power_of_2(rows)
     relative_epsilon = 1.0e-15 if is_fp64 else 1.0e-7

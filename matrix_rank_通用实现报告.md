@@ -136,6 +136,30 @@ eps·σmax，不是 Gram 矩阵方案的 √eps·σmax——附录 A.4 的选型
 图时会挂死——海光实测卡死在 `bidiag-k513` 用例（512 列 × 6 kernel ≈ 3000+ 节点），
 该用例只是测试顺序上第一个触发该 shape 图捕获的，与零矩阵输入本身无关。
 
+### 2.5 数值稳健性补强
+
+四项 correctness 边界加固（均有对应测试）：
+
+1. **入口逐 batch 缩放**（`_launch_matrix_rank`）：Householder 代数会把矩阵量级平
+   方（`w = A·v` 是 O(σ²)），所以仅在范数计算内部做缩放无法挽救 1e20（平方溢出
+   fp32）/1e-30（平方下溢为零）量级的输入。launcher 先把每个矩阵按 max|A| 归一到
+   O(1)、atol 同步缩小（`max(atol, rtol·σmax)/s == max(atol/s, rtol·σmax/s)`，语义
+   精确不变；rtol 是相对的，无需调整）。herm 路径的缩放系数只读下三角（严格上三
+   角可能是垃圾）。测试：1e20/1e-30 × (fused/tridiag/bidiag) 及 1e20、1e-30、0 混
+   合 batch。
+2. **容差保留自身精度**：`_expand_tolerance` 不再把 atol/rtol 降到输入 dtype——
+   有原生 FP64 的设备上容差张量一律 fp64（无 FP64 的设备上比较精度本来就是 FP32，
+   fp32 容差无损失）。fp32 矩阵 + 用户传入的 fp64 容差（如 `0.5 - 1e-16`，fp32 会
+   舍回 0.5）现在按 fp64 精度裁决，与 torch 一致。测试：±1e-16 邻域与 nextafter
+   边界。
+3. **FP64 Sturm 二分深度**：sigma_max 的 Gershgorin 夹逼二分，fp32 保持 32 次
+   （~1e-10 相对收敛，超过 24 位尾数所需），fp64 提到 64 次。测试：k=33/65/257 的
+   fp64 临界谱（特征值距 rtol 阈值 ±1e-12 相对量）。
+4. **图缓存 key 纳入 ds32 模式**：同一 shape 先缓存 native-FP64 尾部的图、再把
+   `support_fp64` 切为 False（ds32 测试的做法）时，旧 key 会错误复用 native 图，
+   导致 DS32 路径看似被测实际没跑。key 现在包含 ds32 位；有专门测试验证切换能力
+   位后产生第二张图且结果仍对。
+
 ## 3. 遇到的问题与解决（按平台）
 
 ### 3.1 海光：图捕获挂死

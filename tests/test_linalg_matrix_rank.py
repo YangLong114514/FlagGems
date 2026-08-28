@@ -1489,3 +1489,141 @@ def test_linalg_matrix_rank_fp64_input_requires_native_fp64(monkeypatch):
         flag_gems.linalg_matrix_rank(matrix)
     with pytest.raises(NotImplementedError, match="native FP64"):
         flag_gems.linalg_matrix_rank(matrix, hermitian=True)
+
+
+@pytest.mark.linalg_matrix_rank
+@pytest.mark.skipif(IS_ASCEND, reason="Ascend backend has its own implementation")
+@pytest.mark.parametrize("log10_scale", [20, -30], ids=lambda s: f"1e{s}")
+@pytest.mark.parametrize(
+    "shape,hermitian",
+    [
+        pytest.param((16, 16), False, id="fused"),
+        pytest.param((65, 65), True, id="herm-tridiag"),
+        pytest.param((513, 513), False, id="bidiag"),
+    ],
+)
+def test_linalg_matrix_rank_extreme_scales(shape, hermitian, log10_scale):
+    # 1e20 overflows FP32 sum-of-squares (x^2 ~ 1e40 > fp32 max) and 1e-30
+    # underflows it (x^2 ~ 1e-60 -> 0).  The Householder algebra squares the
+    # matrix scale (w = A.v is O(sigma^2)), so norm-internal scaling alone
+    # cannot fix this: the launcher normalizes each matrix to O(1) up front
+    # and shrinks atol by the same factor, which leaves the rank semantics
+    # invariant.  Reference: exact CPU fp64 SVD with fp32-default rtol.
+    scale = 10.0 ** log10_scale
+    generator = torch.Generator().manual_seed(sum(shape) + log10_scale)
+    matrix = torch.randn(*shape, generator=generator)
+    if hermitian:
+        matrix = matrix + matrix.mT
+    matrix = (matrix * scale).to(flag_gems.device)
+    rtol = max(shape[-2:]) * torch.finfo(torch.float32).eps
+    reference = torch.linalg.matrix_rank(
+        matrix.cpu().double(), hermitian=hermitian, rtol=rtol
+    )
+    result = flag_gems.linalg_matrix_rank(matrix, hermitian=hermitian)
+    utils.gems_assert_equal(result, reference.to(flag_gems.device))
+
+
+@pytest.mark.linalg_matrix_rank
+@pytest.mark.skipif(IS_ASCEND, reason="Ascend backend has its own implementation")
+def test_linalg_matrix_rank_mixed_magnitude_batch():
+    # One batch mixing 1e20, 1e-30 and exactly-zero matrices: per-batch
+    # scaling must keep each matrix independent of the others' magnitude.
+    batch = torch.stack(
+        [
+            torch.eye(65) * 1e20,
+            torch.eye(65) * 1e-30,
+            torch.zeros(65, 65),
+        ]
+    ).to(flag_gems.device)
+    expected = torch.tensor([65, 65, 0], dtype=torch.int64)
+    result = flag_gems.linalg_matrix_rank(batch, hermitian=True)
+    utils.gems_assert_equal(result, expected.to(flag_gems.device))
+
+
+@pytest.mark.linalg_matrix_rank
+@pytest.mark.skipif(not SUPPORT_FP64, reason="float64 tolerances need native FP64")
+@pytest.mark.skipif(IS_ASCEND, reason="Ascend backend has its own implementation")
+def test_linalg_matrix_rank_tolerance_precision():
+    # A float64/Python-float tolerance next to a singular value of a
+    # float32 matrix must decide the rank at ITS OWN precision, not after
+    # rounding to float32: atol = 0.5 - 1e-16 rounds back to 0.5 in fp32
+    # and would wrongly exclude the 0.5 eigenvalue (strict threshold).
+    matrix = torch.diag(torch.tensor([1.0, 0.5, 0.0, 0.0])).float()
+    matrix = matrix.to(flag_gems.device)
+    for atol in (0.5, 0.5 - 1e-16, 0.5 + 1e-16):
+        reference = torch.linalg.matrix_rank(
+            matrix.cpu().double(), hermitian=True, atol=atol
+        )
+        result = flag_gems.linalg_matrix_rank(matrix, hermitian=True, atol=atol)
+        utils.gems_assert_equal(result, reference.to(flag_gems.device))
+
+    # nextafter boundary around a non-exact fp32 singular value (0.1).
+    sigma = torch.tensor(0.1, dtype=torch.float32).item()
+    matrix = torch.diag(torch.tensor([1.0, sigma])).float().to(flag_gems.device)
+    just_below = torch.nextafter(torch.tensor(sigma), torch.tensor(0.0)).item()
+    for atol, expected_rank in ((just_below, 2), (sigma, 1)):
+        result = flag_gems.linalg_matrix_rank(
+            matrix, hermitian=True, atol=atol, rtol=0.0
+        )
+        assert result.item() == expected_rank
+
+
+@pytest.mark.linalg_matrix_rank
+@pytest.mark.skipif(not SUPPORT_FP64, reason="float64 not supported on this device")
+@pytest.mark.skipif(IS_ASCEND, reason="Ascend backend has its own implementation")
+@pytest.mark.parametrize("k", [33, 65, 257])
+def test_linalg_matrix_rank_fp64_critical_spectrum(k):
+    # An eigenvalue within ~1e-12 (relative) of the rtol threshold: the
+    # sigma_max Gershgorin bracket must be refined to fp64 mantissa depth
+    # (64 bisection iterations; 32 would leave ~1e-10 of bracket noise and
+    # could flip the rank).  Rotated spectra keep the bracket loose so the
+    # refinement really runs; the CPU fp64 oracle arbitrates.
+    generator = torch.Generator().manual_seed(k)
+    basis = torch.linalg.qr(
+        torch.randn(k, k, generator=generator, dtype=torch.float64)
+    )[0]
+    values = torch.zeros(k, dtype=torch.float64)
+    values[0] = 1.0
+    values[1] = 0.5
+    matrix = ((basis * values) @ basis.mT).to(flag_gems.device)
+    for delta, expected_rank in ((1e-12, 1), (-1e-12, 2)):
+        rtol = 0.5 * (1.0 + delta)  # threshold ~= 0.5 * (1 +/- 1e-12)
+        reference = torch.linalg.matrix_rank(
+            matrix.cpu(), hermitian=True, atol=0.0, rtol=rtol
+        )
+        assert reference.item() == expected_rank  # construction sanity
+        result = flag_gems.linalg_matrix_rank(
+            matrix, hermitian=True, atol=0.0, rtol=rtol
+        )
+        utils.gems_assert_equal(result, reference.to(flag_gems.device))
+
+
+@pytest.mark.linalg_matrix_rank
+@pytest.mark.skipif(IS_ASCEND, reason="Ascend backend has its own implementation")
+def test_linalg_matrix_rank_graph_key_includes_ds32(monkeypatch):
+    # The graph cache key must include the native-FP64/DS32 mode: switching
+    # support_fp64 off (as the ds32 fallback tests do) must NOT replay a
+    # graph captured with the native-FP64 Sturm tail, otherwise the DS32
+    # path would never actually execute on a graph-capable device.
+    if (
+        torch.device(flag_gems.device).type != "cuda"
+        or torch.version.cuda is None
+        or torch.version.hip is not None
+    ):
+        pytest.skip("graph capture only on genuine CUDA builds")
+    module = importlib.import_module("flag_gems.ops.linalg_matrix_rank")
+    module._MR_GRAPHS.clear()
+
+    matrix = torch.randn(65, 65).float()
+    matrix = (matrix + matrix.mT).to(flag_gems.device)
+    reference = torch.linalg.matrix_rank(matrix.cpu(), hermitian=True)
+
+    flag_gems.linalg_matrix_rank(matrix, hermitian=True)  # native-fp64 capture
+    assert len(module._MR_GRAPHS) == 1
+    assert list(module._MR_GRAPHS)[0][0][4] is False
+
+    monkeypatch.setattr(module.runtime_device, "support_fp64", False)
+    result = flag_gems.linalg_matrix_rank(matrix, hermitian=True)  # ds32 capture
+    utils.gems_assert_equal(result, reference.to(flag_gems.device))
+    assert len(module._MR_GRAPHS) == 2
+    assert list(module._MR_GRAPHS)[1][0][4] is True
