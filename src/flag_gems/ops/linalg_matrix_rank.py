@@ -80,16 +80,7 @@ def _mr_graph_cached(key, device, make_workspace, copy_in, run, copy_out):
     # make_workspace() allocates the persistent buffers, copy_in(ws) stages
     # the live inputs, run(ws) is the pure launch sequence, copy_out(ws)
     # publishes the result.
-    # Graph capture is a pure performance optimization, never a correctness
-    # requirement: it runs only where the runtime declares capture support
-    # (runtime capability bit, read per call so tests can monkeypatch it).
-    # ROCm-stack devices also report device.type "cuda" but their capture
-    # support is not assumed -- the backend must opt in explicitly.
-    if (
-        device.type != "cuda"
-        or not getattr(runtime_device, "support_graph_capture", False)
-        or os.environ.get("FLAGGEMS_MR_NO_GRAPH") == "1"
-    ):
+    if device.type != "cuda" or os.environ.get("FLAGGEMS_MR_NO_GRAPH") == "1":
         ws = make_workspace()
         copy_in(ws)
         run(ws)

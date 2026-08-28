@@ -1392,35 +1392,6 @@ def test_linalg_matrix_rank_hermitian_ignores_strict_upper_large(k):
 @pytest.mark.parametrize(
     "shape,hermitian",
     [
-        pytest.param((257, 257), True, id="herm-k257"),
-        pytest.param((513, 513), False, id="bidiag-k513"),
-    ],
-)
-def test_linalg_matrix_rank_graph_capture_capability_gate(
-    shape, hermitian, monkeypatch
-):
-    # Backends whose torch fork cannot capture graphs (hang or crash during
-    # capture) declare support_graph_capture=False; the launch sequences
-    # must then run direct and stay correct.  Forces the capability off and
-    # exercises both graph-eligible paths.
-    module = importlib.import_module("flag_gems.ops.linalg_matrix_rank")
-    monkeypatch.setattr(module.runtime_device, "support_graph_capture", False)
-
-    generator = torch.Generator().manual_seed(sum(shape))
-    matrix = torch.randn(*shape, generator=generator).float()
-    if hermitian:
-        matrix = matrix + matrix.mT
-    matrix = matrix.to(flag_gems.device)
-    reference = torch.linalg.matrix_rank(matrix.cpu(), hermitian=hermitian)
-    result = flag_gems.linalg_matrix_rank(matrix, hermitian=hermitian)
-    utils.gems_assert_equal(result, reference.to(flag_gems.device))
-
-
-@pytest.mark.linalg_matrix_rank
-@pytest.mark.skipif(IS_ASCEND, reason="Ascend backend has its own implementation")
-@pytest.mark.parametrize(
-    "shape,hermitian",
-    [
         pytest.param((33, 33), True, id="herm-small-tridiag"),
         pytest.param((65, 65), True, id="herm-padded-tridiag"),
         pytest.param((257, 257), True, id="herm-large-tridiag"),

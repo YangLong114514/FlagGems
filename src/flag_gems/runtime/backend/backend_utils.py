@@ -35,10 +35,6 @@ class VendorDescriptor:
     fp64_enabled: bool = True
     bf16_enabled: bool = True
     int64_enabled: bool = True
-    # Whether CUDA-graph-style capture of kernel launch sequences is known
-    # to work on this backend.  Default off: most non-NVIDIA torch forks
-    # either lack capture or hang on large graphs.
-    graph_capture_enabled: bool = False
     tle_enabled: bool = False
 
 
