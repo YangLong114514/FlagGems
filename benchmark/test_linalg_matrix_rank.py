@@ -152,6 +152,11 @@ class MatrixRankHermitianBenchmark(base.GenericBenchmark):
             # cannot provide a device-side baseline for Hermitian batches.
             # Skip those shapes instead of reporting CPU/composed speedups.
             shapes = [shape for shape in shapes if len(shape) == 2]
+        if IS_ILUVATAR:
+            # Iluvatar's native Hermitian path works for the remaining core,
+            # comprehensive and batched shapes, but the (1, 1) benchmark
+            # hangs before completing its native baseline.
+            shapes = [shape for shape in shapes if shape != (1, 1)]
         self.shapes = shapes
 
 
@@ -194,14 +199,6 @@ def test_linalg_matrix_rank():
 
 
 @pytest.mark.linalg_matrix_rank
-@pytest.mark.skipif(
-    IS_ILUVATAR,
-    reason=(
-        "Iluvatar native torch.linalg.matrix_rank(hermitian=True) fails in "
-        "cusolverDnSsyevd for dense symmetric inputs, so no comparable "
-        "device-side Torch baseline is available"
-    ),
-)
 def test_linalg_matrix_rank_hermitian():
     def matrix_rank_hermitian_input_fn(shape, cur_dtype, device):
         matrix = torch.randn(shape, dtype=cur_dtype, device=device)
