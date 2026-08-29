@@ -175,6 +175,21 @@ def _matrix_rank_zero_kernel(out, N: tl.constexpr, BLOCK_SIZE: tl.constexpr):
 
 @libentry()
 @triton.jit
+def _matrix_rank_safe_scale_kernel(scale):
+    # Per-batch scale fixup: zero scale (all-zero matrix) becomes 1 so the
+    # in-kernel 1/scale stays finite and zero matrices scale to exact zeros.
+    # This is a dedicated kernel instead of torch.clamp_min because the
+    # generic clamp op internally casts through fp32: an fp64 floor would
+    # flush to zero there, and under use_gems() the dispatch would diverge
+    # from the direct-call path (observed: zero fp64 matrix -> NaN ->
+    # Sturm sign tests all false -> rank 2k).
+    pid = tl.program_id(0)
+    value = tl.load(scale + pid)
+    tl.store(scale + pid, tl.where(value > 0.0, value, 1.0))
+
+
+@libentry()
+@triton.jit
 def _matrix_rank_rank1_kernel(
     A,
     ATOL,
@@ -2578,11 +2593,13 @@ def _launch_matrix_rank(
     # garbage).
     visible = torch.tril(matrix) if hermitian else matrix
     scale = visible.abs().amax(dim=(-2, -1))
-    # Floor the scale instead of where(scale>0, scale, 1): one clamp kernel
-    # replaces the gt/ones/where trio.  sqrt(tiny) keeps 1/scale finite and
-    # far from overflow for both fp32 (~1e-19) and fp64 (~1e-154), so zero
-    # matrices scale to exact zeros without NaN.
-    scale = torch.clamp_min(scale, torch.finfo(matrix.dtype).tiny ** 0.5)
+    # Zero scale -> 1 with a dedicated kernel (NOT torch.clamp_min: the
+    # generic clamp casts through fp32 under use_gems() dispatch, flushing
+    # any fp64 floor to zero; a zero scale then turns 0/0 into NaN and the
+    # Sturm sign counts collapse).  One kernel, identical on the direct
+    # and dispatched paths.
+    with torch_device_fn.device(input.device):
+        _matrix_rank_safe_scale_kernel[(batch_count,)](scale, num_warps=1)
     # small_path must mirror the dispatch order below exactly: hermitian
     # matrices eligible for BOTH fused Jacobi and tridiagonalization take
     # the tridiag branch (use_bidiag and fused are mutually exclusive, so

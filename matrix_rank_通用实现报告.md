@@ -168,11 +168,11 @@ eps·σmax，不是 Gram 矩阵方案的 √eps·σmax——附录 A.4 的选型
 路径的 staged-tensor 约定。
 
 - **小路径（k≤2 的 rank1/rank2 kernel 与 fused Jacobi kernel）核内缩放**：launcher
-  只算每张矩阵的 max|A|（abs+amax+clamp 三个 kernel），把原始矩阵、原始容差和
-  scale 一起交给 kernel；kernel 载入后乘 `1/scale`，atol 的 `/scale` 也在核内做。
-  矩阵预除和 atol 预除两个 elementwise kernel 被消掉。大路径（tridiag/bidiag，走
-  graph）保持"矩阵和 atol 已预除"的 staged 约定不变——graph replay 换数据换容差
-  依赖重读 workspace 缓冲，不能改成烘焙常量。
+  只算每张矩阵的 max|A|（abs+amax+scale 修正三个 kernel），把原始矩阵、原始容差
+  和 scale 一起交给 kernel；kernel 载入后乘 `1/scale`，atol 的 `/scale` 也在核内
+  做。矩阵预除和 atol 预除两个 elementwise kernel 被消掉。大路径
+  （tridiag/bidiag，走 graph）保持"矩阵和 atol 已预除"的 staged 约定不变——
+  graph replay 换数据换容差依赖重读 workspace 缓冲，不能改成烘焙常量。
 - **标量容差直传**：两个容差都是 Python 标量（含默认）时，直接作为 kernel 运行参
   数传入（`ATOL_S`/`RTOL_S` + `SCALAR_TOL` constexpr），不再 materialize 设备张
   量；有任一个是 Tensor 才走指针路径。关键坑：Triton 未标注的 Python float 参数
@@ -180,13 +180,16 @@ eps·σmax，不是 Gram 矩阵方案的 √eps·σmax——附录 A.4 的选型
   `tl.float64` 解决。无原生 FP64 的设备（天数）上标量容差改走指针路径
   （`SCALAR_TOL=False`  specialization 里 f64 代码被编译期消除，不违反纯 FP32 约
   束）。
-- **scale 下限用 clamp**：`where(scale>0, scale, 1)` 的 gt/ones/where 三个 kernel
-  换成一个 `clamp_min(sqrt(tiny))`。`sqrt(tiny)`（fp32 ~1e-19，fp64 ~1e-154）保
-  证 `1/scale` 对两种 dtype 都有限且远离上溢，零矩阵缩放出精确零、不产生 NaN。
+- **scale 修正用专用 kernel**:`_matrix_rank_safe_scale_kernel` 一项一 program，零
+  scale（全零矩阵）置 1，保证核内 `1/scale` 有限、零矩阵缩放出精确零。不能用
+  `torch.clamp_min`：通用 clamp 算子内部强制 fp32,use_gems() dispatch 下 fp64 下
+  限会被冲成 0，零矩阵 0/0 出 NaN,Sturm 符号比较全 false,rank 错成 2k（实测
+  bidiag fp64 零矩阵直调返回 0、dispatch 返回 2048);`where(gt)+ones` 组合则要多
+  两个 kernel。专用 kernel 在直调和 dispatch 下行为完全一致。
 
-效果：小 shape 一次调用 4 个 kernel（abs、amax、clamp、rank 主体；herm 多一个
-tril），回归 201 passed / 32 skipped 不变，herm (1,1) 等小 shape 加速比回到项 1
-之前水平（见第 4 节）。
+效果：小 shape 一次调用 4 个 kernel（abs、amax、scale 修正、rank 主体；herm 多一
+个 tril），回归 201 passed / 32 skipped 不变，herm (1,1) 等小 shape 加速比回到
+项 1 之前水平（见第 4 节）。
 
 ### 2.7 blocked WY 面板化三对角化（barrier-free 重写）
 
@@ -304,7 +307,8 @@ Ascend 专属用例）。
 graph 捕获把 barrier-free 重构初期的 herm fp32 回归（0.17~0.45x）全部拉回 1x 以
 上；2.6 节的标量 fast path 又把小 shape 从项 1 的缩放开销里收了回来——herm
 (1,1)/(2,2) 从 0.95x/1.2x 回到 2.16x/3.24x，非 herm (16,16) 4.69x，一次小矩阵
-调用只剩 4 个 kernel（abs、amax、clamp、rank 主体；herm 多一个 tril）。2.7 节的
+调用只剩 4 个 kernel（abs、amax、scale 修正、rank 主体；herm 多一个 tril）。2.7
+节的
 blocked WY 把 herm (1024,1024) fp32 从 0.78x 提到 0.90x——**至此 benchmark 全部
 shape ≥ 0.8x**。
 
