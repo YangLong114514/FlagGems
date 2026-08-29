@@ -52,53 +52,68 @@ def _native_fp64_supported():
     return getattr(runtime_device, "support_fp64", True)
 
 
-# One-time verdict per device for _tl_dot_fp32_ieee (see below).
-_TL_DOT_FP32_IEEE = {}
+# One-time verdict per device for _blocked_tridiag_ok (see below).
+_BLOCKED_TRIDIAG_OK = {}
 
 
-def _tl_dot_fp32_ieee(device):
-    # Probe whether tl.dot(..., input_precision="ieee") on THIS backend
-    # actually delivers IEEE fp32 (24-bit mantissa inputs).  The blocked WY
-    # tridiagonalization's rank-2k update is the only tl.dot consumer in this
-    # file; a backend that silently drops to reduced (TF32-class) precision
-    # lifts the deflated trailing block above the rank threshold -- observed
-    # as dense low-rank inputs returning ~full rank while integer-valued
-    # diagonal inputs (exact in TF32) still pass.  This probes the exact
-    # kernel feature being relied on (not a vendor check) and the blocked
-    # path falls back to the unblocked, dot-free factorization when it
-    # fails.  Cached per device; probe failure or any compile/launch error
-    # means False (safe fallback).
+def _blocked_tridiag_ok(device):
+    # One-time END-TO-END self-test of the blocked WY tridiagonalization on
+    # THIS backend: factor a rotated rank-100 spectrum (k = 768, the smallest
+    # blocked size -- exactly the input class that miscompiled backends get
+    # wrong) with a direct (non-graph) launch of the real blocked run and
+    # check the rank.  This gates the blocked path because a backend-specific
+    # kernel miscompile there produces silently wrong ranks (observed: dense
+    # low-rank inputs returning ~full rank while diagonal inputs pass, on a
+    # backend whose tl.dot IS IEEE-fine -- a cheap dot probe did NOT catch
+    # it).  Known-answer self-test of the exact execution path being relied
+    # on, not a vendor check; any failure or exception disables the blocked
+    # path permanently (unblocked fallback: slower, dot-free, correct).
+    # Cached per device.
     key = (device.type, device.index)
-    verdict = _TL_DOT_FP32_IEEE.get(key)
+    verdict = _BLOCKED_TRIDIAG_OK.get(key)
     if verdict is None:
+        verdict = False
         try:
-            a = torch.zeros((16, 16), dtype=torch.float32)
-            b = torch.zeros((16, 16), dtype=torch.float32)
-            # 1 + 2^-12 is exact in fp32 but rounds to 1.0 under TF32
-            # (ulp(1.0) = 2^-10), so the products below vanish under any
-            # reduced-precision dot and stay exact under IEEE.
-            a[0, 0] = 1.0 + 2.0**-12
-            a[0, 1] = 1.0
-            a[1, 0] = 2.0 * (1.0 + 2.0**-12)
-            a[1, 1] = 2.0
-            b[0, 0] = 1.0
-            b[0, 1] = -1.0
-            a, b = a.to(device), b.to(device)
-            out = torch.empty(2, dtype=torch.float32, device=device)
-            with torch_device_fn.device(device):
-                _matrix_rank_dot_probe_kernel[(1,)](a, b, out, num_warps=1)
-            verdict = bool(
-                out[0].item() == 2.0**-12 and out[1].item() == 2.0**-11
+            k = _HERM_TRIDIAG_BLOCKED_MIN_K
+            generator = torch.Generator().manual_seed(0)
+            basis = torch.linalg.qr(
+                torch.randn(k, k, generator=generator, dtype=torch.float64)
+            )[0]
+            spectrum = torch.zeros(k, dtype=torch.float64)
+            spectrum[:100] = torch.arange(1, 101, dtype=torch.float64)
+            a = ((basis * spectrum) @ basis.mT).float().to(device)
+            # Margins are ~100x on both sides: eigenvalues >= 1 versus
+            # threshold 1e-4 * sigma_max(~100) ~ 1e-2, zero eigenspace
+            # noise ~1e-5.  A working blocked path returns exactly 100.
+            tol_dtype = (
+                torch.float64 if _native_fp64_supported() else torch.float32
             )
+            atol_t = torch.zeros((1,), dtype=tol_dtype).to(device)
+            rtol_t = torch.full((1,), 1e-4, dtype=tol_dtype).to(device)
+            s = float(a.abs().max().item())
+            scale = torch.tensor(
+                [s if s > 0 else 1.0], dtype=torch.float32
+            ).to(device)
+            ws = _herm_tridiag_workspace(
+                device, 1, k, torch.float32, atol_t, rtol_t, True
+            )
+            ws["staging"].copy_(a.reshape(1, k, k))
+            ws["atol"].copy_(atol_t)
+            ws["rtol"].copy_(rtol_t)
+            ws["scale"].copy_(scale)
+            _herm_tridiag_blocked_run(
+                ws, k, 1, not _native_fp64_supported()
+            )
+            verdict = bool(ws["rank"][0].item() == 100)
         except Exception:
             verdict = False
         if not verdict:
             logger.warning(
-                "matrix_rank: tl.dot fp32 IEEE probe failed on %s; "
-                "blocked tridiagonalization disabled (unblocked fallback)",
+                "matrix_rank: blocked tridiagonalization self-test failed "
+                "on %s; using the unblocked path (slower but correct)",
                 device,
             )
-        _TL_DOT_FP32_IEEE[key] = verdict
+        _BLOCKED_TRIDIAG_OK[key] = verdict
     return verdict
 
 
@@ -273,24 +288,6 @@ def _matrix_rank_scale_tol_kernel(ATOL, SCALE, OUT):
     a = tl.load(ATOL + pid)
     s = tl.load(SCALE + pid).to(a.dtype)
     tl.store(OUT + pid, a / s)
-
-
-@libentry()
-@triton.jit
-def _matrix_rank_dot_probe_kernel(A, B, OUT):
-    # tl.dot IEEE probe (see _tl_dot_fp32_ieee): OUT[0] must come out exactly
-    # 2^-12 (TF32-class input rounding would make it 0) and OUT[1] exactly
-    # 2^-11 read through tl.trans of the dot result, covering output-layout
-    # transposition bugs in the same pipeline the rank2k kernel uses.
-    lr = tl.arange(0, 16)
-    a = tl.load(A + lr[:, None] * 16 + lr[None, :])
-    b = tl.load(B + lr[:, None] * 16 + lr[None, :])
-    c = tl.dot(a, tl.trans(b), input_precision="ieee")
-    ct = tl.trans(c)
-    m00 = (lr[:, None] == 0) & (lr[None, :] == 0)
-    m01 = (lr[:, None] == 0) & (lr[None, :] == 1)
-    tl.store(OUT, tl.sum(tl.where(m00, c, 0.0)))
-    tl.store(OUT + 1, tl.sum(tl.where(m01, ct, 0.0)))
 
 
 @libentry()
@@ -2186,14 +2183,14 @@ def _launch_herm_tridiag_rank(matrix, atol_tensor, rtol_tensor, scale, out, k, b
     # unblocked too: with no fast fp64 tl.dot on current hardware the
     # rank-2k falls back to an outer-product loop and the panel algebra
     # costs more than it saves (measured: blocked fp64 loses at every
-    # size).  The blocked path additionally requires tl.dot to deliver
-    # true IEEE fp32 on this backend (probed once per device): a
-    # TF32-class dot silently lifts the deflated trailing block above the
-    # rank threshold.
+    # size).  The blocked path additionally requires passing a one-time
+    # known-answer self-test on this backend (see _blocked_tridiag_ok):
+    # a backend miscompile anywhere in the panel pipeline produces
+    # silently wrong ranks, not errors.
     blocked = (
         k >= _HERM_TRIDIAG_BLOCKED_MIN_K
         and work_dtype == torch.float32
-        and _tl_dot_fp32_ieee(device)
+        and _blocked_tridiag_ok(device)
     )
 
     def copy_in(ws):

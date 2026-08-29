@@ -1704,10 +1704,10 @@ def test_linalg_matrix_rank_hermitian_blocked_dispatch(k, path, monkeypatch):
     result = flag_gems.linalg_matrix_rank(matrix, hermitian=True)
     utils.gems_assert_equal(result, reference.to(flag_gems.device))
     assert result.item() == 100
-    # Backends whose tl.dot fails the IEEE fp32 probe legitimately fall back
-    # to the unblocked run even at k >= 768 -- the boundary assertion is
-    # against the probe verdict, not the size alone.
-    dot_ok = module._tl_dot_fp32_ieee(matrix.device)
+    # Backends whose blocked pipeline fails the known-answer self-test
+    # legitimately fall back to the unblocked run even at k >= 768 -- the
+    # boundary assertion is against the self-test verdict, not size alone.
+    dot_ok = module._blocked_tridiag_ok(matrix.device)
     expect_blocked = path == "blocked" and dot_ok
     assert bool(calls["blocked"]) == expect_blocked
     assert bool(calls["unblocked"]) != expect_blocked
@@ -1715,10 +1715,10 @@ def test_linalg_matrix_rank_hermitian_blocked_dispatch(k, path, monkeypatch):
 
 @pytest.mark.linalg_matrix_rank
 @pytest.mark.skipif(IS_ASCEND, reason="Ascend backend has its own implementation")
-def test_linalg_matrix_rank_hermitian_blocked_dot_probe_fallback(monkeypatch):
-    # When the tl.dot IEEE probe fails (TF32-class backend), k >= 768 fp32
-    # hermitian inputs must fall back to the unblocked (dot-free) run and
-    # stay correct -- blocked results would be silently wrong there.
+def test_linalg_matrix_rank_hermitian_blocked_self_test_fallback(monkeypatch):
+    # When the blocked-path self-test fails (backend miscompile), k >= 768
+    # fp32 hermitian inputs must fall back to the unblocked run and stay
+    # correct -- blocked results would be silently wrong there.
     module = importlib.import_module("flag_gems.ops.linalg_matrix_rank")
     module._MR_GRAPHS.clear()
     module._MR_GRAPH_BYTES = 0
@@ -1736,7 +1736,7 @@ def test_linalg_matrix_rank_hermitian_blocked_dot_probe_fallback(monkeypatch):
 
     monkeypatch.setattr(module, "_herm_tridiag_blocked_run", spy_blocked)
     monkeypatch.setattr(module, "_herm_tridiag_run", spy_unblocked)
-    monkeypatch.setattr(module, "_tl_dot_fp32_ieee", lambda device: False)
+    monkeypatch.setattr(module, "_blocked_tridiag_ok", lambda device: False)
 
     k = 768
     matrix = _blocked_rotated_spectrum(k, list(range(1, 101)), seed=k).to(
