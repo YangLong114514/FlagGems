@@ -126,8 +126,11 @@ eps·σmax，不是 Gram 矩阵方案的 √eps·σmax——附录 A.4 的选型
   张图 replay 时换数据、换容差都正确（有专门测试 pin 住）。
 - 首次调用先完整 direct 跑一遍（编译所有 kernel、留下正确结果），再到 side
   stream 预热、捕获；捕获抛异常直接回退 direct（正确性不依赖图）。
-- 全局锁保护缓存；FIFO 淘汰时先 `torch.cuda.synchronize(受害设备)`（被踢出的图
-  可能还有在途 replay，且受害者可能在另一张卡上）。
+- 全局锁保护缓存；**按 workspace 字节数做 LRU 淘汰**（预算 512MB，不是固定条
+  目数——一个 (1024,1024) fp32 blocked 图带约 10MB workspace，固定条目数在多
+  shape/dtype/batch 组合下可能钉住数百 MB)；命中即提到最新端，淘汰前
+  先 `torch.cuda.synchronize(受害设备)`（被踢出的图可能还有在途 replay，且受害
+  者可能在另一张卡上）。
 - `FLAGGEMS_MR_NO_GRAPH=1` 可整体关闭。
 
 **门控按 torch 构建属性，不按 vendor**：只有 `torch.version.cuda` 非空且
@@ -212,6 +215,12 @@ unblocked 路径每列做"reflector + 完整尾矩阵 GEMV + 完整尾矩阵对�
 - **面板间一次 BLAS3 更新**：面板结束用 `rank2k` kernel 做
   `S -= Vp·Wpᵀ + Wp·Vpᵀ`(fp32 `tl.dot(input_precision="ieee")`)。每列主导流量从
   3(k-j)² 降到约 (k-j)²,launch 总数基本不变（3k + k/32)，照样整张图捕获。
+  rank2k 只算 **rt ≥ ct 的上半 tile**:`(c, r)` 镜像 tile 的更新恰好是
+  `tl.trans(upd)`，由同一 program 直接写回两块，tl.dot 工作量减半（pmat 读全矩
+  阵块，所以两块都必须写）；对角 tile 存一次。
+- **reflector 存储 O(k)**：任意时刻只有当前列的 reflector 存活（面板历史列在
+  pv/pw 里），所以 V 只留每 batch 一行（早期是完整 O(k²) 矩阵）；各 kernel 存
+  reflector 时显式把 J+1 以下前缀写零，下一次调用/图重放读到干净前缀。
 - **关键性能纪律（全部来自实测）**:
   - 列 J 一律按**行 J** 读（工作矩阵已对称化，行 == 列），跨步列读在 k=1024 实测
     约 30µs/列，曾主导整条路径；
@@ -220,9 +229,10 @@ unblocked 路径每列做"reflector + 完整尾矩阵 GEMV + 完整尾矩阵对�
     22µs/列，多 program 化后降到 2.7+2.4µs；
   - scratch 部分和的每个条目独占一条 128B cache line（并发原子加在共享行上会在
     L2 串行）;
-  - 每列一个 scratch 槽位避免清零竞争：`pcol` 原子累积前槽位必须为零，由**上一列
-    的 pfin** 负责清零下一列槽位（最后一列回绕清槽位 0)，保证每次调用/图重放都
-    从零开始；
+  - scratch 槽位**双缓冲**（按列奇偶两个槽位轮转，替代早期的每列一槽）：`pcol`
+    原子累积前槽位必须为零，由**上一列的 pfin** 负责清零另一奇偶性的槽位（最后
+    一列回绕清槽位 0)，保证每次调用/图重放都从零开始；清零目标与本次 launch 正
+    在读的槽位奇偶性不同，无竞争；
   - 面板槽位 q ≥ p 的过期值只保证有限（buffer 一次性零初始化），读取一律无
     mask + `tl.where`;tau 永不平方（强 deflate 谱 tau ~ 1e20,fp32 下 tau*tau 上
     溢）;`beta` 用恒等式而非额外归约。
@@ -244,6 +254,31 @@ unblocked 路径每列做"reflector + 完整尾矩阵 GEMV + 完整尾矩阵对�
 **顺带修的既有 bug**：负容差修正路径用 `visible.amin(...)`，而通用 `amin` 算子没
 有 fp64 kernel,fp64 输入 + tensor 容差直接崩；改成 `abs().amax() > 0`（语义等价，
 还省一次归约）。
+
+### 2.8 workspace 精简与图内核内缩放
+
+一轮针对内存占用与图外临时张量的收尾优化：
+
+- **面板 buffer 按需分配**:`pv/pw/pscr` 只在 blocked 路径（fp32 且 k ≥ 768）分
+  配；fp64 与小 k 的 unblocked 路径不再白占显存（k=1024 fp32 下 pscr 约 8.8MB、
+  fp64 下 17.6MB 的浪费被消除，双缓冲后又进一步缩到 2 槽）。
+- **reflector workspace 降维**：上节的 v_buf 单行化让 herm 路径省掉 O(k²) 的
+  V 矩阵，bidiag 路径的 u_buf/v_buf 同样各留一行。
+- **图内核内缩放（去 k² 临时张量）**：大路径原来在 graph 外做
+  `matrix / scale`(k² 除法，产生同尺寸临时张量）和 `atol / scale`。现在
+  staging 直接拷**未缩放**的原始矩阵与原始 atol,scale 也拷进 workspace;
+  pad-init/bidiag-init kernel 拷贝时顺带除以 scale,atol 的除法由专用
+  `_matrix_rank_scale_tol_kernel` 在捕获序列内完成（scale 向上提升到 atol 自身
+  dtype 再除，fp64 容差精度不丢；不用 torch.div——use_gems() 下会再 dispatch，
+  out= 形式也不是处处可用）。图外只剩 tril/abs/amax/safe-scale 四个小 kernel。
+- **blocked 正确性覆盖补强**(13 个新用例）：分派边界双向 pin 住（k=767 必须走
+  unblocked、768 跨界、769/1000 非 64 对齐，spy 两个 run 函数确认真实执行路
+  径）、blocked strict-upper 垃圾、强 deflation(rank 1/7)、1e20/1e-30 极端缩
+  放、距阈值 1e-4 的临界谱、forced DS32 blocked、(2,768,768) batched blocked、
+  同一临界输入连跑 20 次验证 atomic 归约顺序不确定下 rank 不波动。参考值一律
+  CPU fp64 oracle（天数教训）；默认容差的用例 oracle 用 fp32 默认 rtol
+  (k·eps_fp32)——否则 fp32 舍入噪声（~1e-5）远超 fp64 默认阈值（~1e-11),
+  oracle 自己把低秩矩阵判成满秩。
 
 ## 3. 遇到的问题与解决（按平台）
 
@@ -294,23 +329,23 @@ unblocked 路径每列做"reflector + 完整尾矩阵 GEMV + 完整尾矩阵对�
 ## 4. 当前性能（H20，分支 HEAD）
 
 `CUDA_VISIBLE_DEVICES=3 python -m pytest -s benchmark/test_linalg_matrix_rank.py`
-约 5 分钟跑完，134 个用例全部 SUCCESS；精度测试 201 passed / 32 skipped（skip 为
+约 5 分钟跑完，134 个用例全部 SUCCESS；精度测试 214 passed / 32 skipped（skip 为
 Ascend 专属用例）。
 
 | 路径 | k ≤ 512 各 shape | (1024,1024) |
 |---|---|---|
-| herm fp32 | 1.67 ~ 4.34x | 0.90x（blocked WY,2.7 节） |
-| herm fp64 | 1.06 ~ 5.21x | 0.90x |
-| 非 herm fp32 | 1.13 ~ 9.1x（batch 最高 81x） | 2.46x |
-| 非 herm fp64 | 3.0x 以上（最高 124x） | 23.8x |
+| herm fp32 | 1.67 ~ 3.74x | 0.93x（blocked WY,2.7/2.8 节） |
+| herm fp64 | 1.14 ~ 4.46x | 0.90x |
+| 非 herm fp32 | 1.14 ~ 65.6x | 2.50x |
+| 非 herm fp64 | 3.03 ~ 124.9x | 23.7x |
 
 graph 捕获把 barrier-free 重构初期的 herm fp32 回归（0.17~0.45x）全部拉回 1x 以
 上；2.6 节的标量 fast path 又把小 shape 从项 1 的缩放开销里收了回来——herm
-(1,1)/(2,2) 从 0.95x/1.2x 回到 2.16x/3.24x，非 herm (16,16) 4.69x，一次小矩阵
+(1,1)/(2,2) 从 0.95x/1.2x 回到 1.70x/2.53x，非 herm (16,16) 3.81x，一次小矩阵
 调用只剩 4 个 kernel（abs、amax、scale 修正、rank 主体；herm 多一个 tril）。2.7
-节的
-blocked WY 把 herm (1024,1024) fp32 从 0.78x 提到 0.90x——**至此 benchmark 全部
-shape ≥ 0.8x**。
+节的 blocked WY 把 herm (1024,1024) fp32 从 0.78x 提到 0.90x,2.8 节的 rank2k 半
+矩阵化与图内核内缩放再推到 0.93x——**至此 benchmark 全部 shape ≥ 0.9x**（目标
+0.8x)。
 
 ## 5. 重构提交记录
 
@@ -326,6 +361,9 @@ shape ≥ 0.8x**。
 | `8bb9730a` | 数值稳健性四项（入口缩放、容差精度、fp64 二分 64 次、ds32 图缓存 key） |
 | `f9d99a1d` | 标量容差 fast path + 小路径核内缩放（2.6 节） |
 | `60e1aea7` | barrier-free blocked WY 三对角化（2.7 节）+ amin fp64 既有 bug 修复 |
+| `9563b1ba` | 专用 safe-scale kernel 修复 dispatch 下 clamp fp32 强转致零矩阵 NaN(2.6 节） |
+| `9f1a1573` | workspace 精简 + 图缓存字节 LRU + rank2k 半矩阵 + 图内核内缩放（2.4/2.7/2.8 节） |
+| `89e11edd` | blocked WY 路径 13 个正确性用例（2.8 节） |
 
 ---
 
