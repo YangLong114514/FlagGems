@@ -196,6 +196,11 @@ eps·σmax，不是 Gram 矩阵方案的 √eps·σmax——附录 A.4 的选型
 
 ### 2.7 blocked WY 面板化三对角化（barrier-free 重写）
 
+**启用门槛**：fp32、k ≥ 768，且**设备通过 tl.dot IEEE 探针**（`_tl_dot_fp32_ieee`，
+每设备一次）：被静默降级到 TF32 级精度的后端会把 deflate 后的尾矩阵抬过 rank 阈
+值（3.3 节），探针失败即回退 unblocked（无 tl.dot，慢但正确）。这是探目标 kernel
+特性本身，不是 vendor 判断。
+
 unblocked 路径每列做"reflector + 完整尾矩阵 GEMV + 完整尾矩阵对称 rank-2 更新"，
 主要计算是 BLAS2、带宽受限；CUDA Graph 只能省 launch 提交开销，省不掉每列对尾矩
 阵的反复读写。旧版（自旋 barrier 时代）的 blocked WY 曾把 herm fp32 (1024,1024)
@@ -316,7 +321,34 @@ unblocked 路径每列做"reflector + 完整尾矩阵 GEMV + 完整尾矩阵对�
 另有 benchmark 修复：fp64 用例原来只按 vendor 名跳过 Ascend，现改为按
 `support_fp64` 能力位跳过（`14cbef24`），天数等无 FP64 平台自动只跑 fp32。
 
-### 3.3 教训沉淀
+### 3.3 天数：blocked 路径稠密低秩返回近满秩（tl.dot IEEE 探针）
+
+blocked WY 上线后天数回归出现 12 例失败，分三类：
+
+1. **blocked + 稠密低秩输入全部返回接近满秩（10 例，真问题）**：rank 100 的旋转谱
+   k=768 返回 767、rank 1/7 的 k=1024 返回 988/995、临界谱 rank 2 返回 969。关键
+   对照：同样构造在 unblocked 路径（k=767）**通过**；整数谱对角矩阵的 blocked 用
+   例（tridiag-k1024）**也通过**。blocked 相对 unblocked 唯一新增的 kernel 特性是
+   `tl.dot`（面板 rank-2k 更新）——指向天数 Triton 后端把
+   `input_precision="ieee"` 静默降级为 TF32 级精度：整数（≤2048）在 TF32 下精确表
+   示，对角用例因此幸存；稠密矩阵的零特征空间被 ~1e-3 相对误差抬过阈值，表现为近
+   满秩。
+   修复：新增 `_matrix_rank_dot_probe_kernel`/`_tl_dot_fp32_ieee`——每设备一次，
+   用 `1+2^-12`（fp32 精确、TF32 下舍入消失）构造区分性点积，并顺带校验 dot 输出
+   经 `tl.trans` 读出的一致性；probe 失败（含编译/launch 异常）即回退 unblocked
+   路径。探针探的是**实际依赖的 kernel 特性本身**，不是 vendor 判断，也不是
+   PyTorch 原生 kernel 的代理（3.4 的探针教训）。图缓存 key 同步纳入 blocked 位。
+2. **graph_key_includes_ds32 前提不成立（测试缺陷）**：该测试假设"先捕获
+   native-FP64 图、切能力位后再捕获 ds32 图"，但天数天生 `support_fp64=False`，第
+   一次捕获就是 ds32,`key[4] is False` 的断言在无 FP64 设备上必然失败。加
+   `skipif(not SUPPORT_FP64)`。
+3. **extreme_scales[bidiag-1e20] 差 1（测试构造临界）**:513 阶随机高斯矩阵的
+   sigma_min 距 rtol 阈值只有 ~20% 相对裕量（~1.1e-5 相对量级），与任何 fp32 分解
+   的向后误差同阶——H20 上通过有运气成分。非 herm 构造改为对角占优
+   （`+3√n·I`)，满秩结论对任意 fp32 噪声无歧义；测试目的（极端缩放下不溢出/不下
+   溢）不受影响。
+
+### 3.4 教训沉淀
 
 - **平台问题先分清"算子错"还是"测试错"**：26 例失败里 23 例是测试 reference 构造
   问题，7 例 remainder 也全部是测试可移植性问题，无一例指向 barrier-free 分解或
@@ -364,6 +396,7 @@ graph 捕获把 barrier-free 重构初期的 herm fp32 回归（0.17~0.45x）全
 | `9563b1ba` | 专用 safe-scale kernel 修复 dispatch 下 clamp fp32 强转致零矩阵 NaN(2.6 节） |
 | `9f1a1573` | workspace 精简 + 图缓存字节 LRU + rank2k 半矩阵 + 图内核内缩放（2.4/2.7/2.8 节） |
 | `89e11edd` | blocked WY 路径 13 个正确性用例（2.8 节） |
+| `8c487aa7` | tl.dot IEEE fp32 探针门控 blocked 路径 + 测试可移植性修复（3.3 节） |
 
 ---
 
