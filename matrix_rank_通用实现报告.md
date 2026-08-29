@@ -196,10 +196,12 @@ eps·σmax，不是 Gram 矩阵方案的 √eps·σmax——附录 A.4 的选型
 
 ### 2.7 blocked WY 面板化三对角化（barrier-free 重写）
 
-**启用门槛**：fp32、k ≥ 768，且**设备通过 tl.dot IEEE 探针**（`_tl_dot_fp32_ieee`，
-每设备一次）：被静默降级到 TF32 级精度的后端会把 deflate 后的尾矩阵抬过 rank 阈
-值（3.3 节），探针失败即回退 unblocked（无 tl.dot，慢但正确）。这是探目标 kernel
-特性本身，不是 vendor 判断。
+**启用门槛**：fp32、k ≥ 768，且**设备通过 blocked 路径的已知答案端到端自测**
+（`_blocked_tridiag_ok`，每设备一次）：用真实 blocked run（直发，不走图）分解一
+个 k=768、rank 100 的旋转谱——正是误编译后端会算错的那类输入——答案不是 100
+就永久回退 unblocked（慢但正确）。blocked 管线里任何 kernel 被后端误编译产生
+的都是静默错误而非报错，只有端到端自测能兜住（3.3 节）。这是探实际执行路径，
+不是 vendor 判断。
 
 unblocked 路径每列做"reflector + 完整尾矩阵 GEMV + 完整尾矩阵对称 rank-2 更新"，
 主要计算是 BLAS2、带宽受限；CUDA Graph 只能省 launch 提交开销，省不掉每列对尾矩
@@ -328,16 +330,22 @@ blocked WY 上线后天数回归出现 12 例失败，分三类：
 1. **blocked + 稠密低秩输入全部返回接近满秩（10 例，真问题）**：rank 100 的旋转谱
    k=768 返回 767、rank 1/7 的 k=1024 返回 988/995、临界谱 rank 2 返回 969。关键
    对照：同样构造在 unblocked 路径（k=767）**通过**；整数谱对角矩阵的 blocked 用
-   例（tridiag-k1024）**也通过**。blocked 相对 unblocked 唯一新增的 kernel 特性是
-   `tl.dot`（面板 rank-2k 更新）——指向天数 Triton 后端把
-   `input_precision="ieee"` 静默降级为 TF32 级精度：整数（≤2048）在 TF32 下精确表
-   示，对角用例因此幸存；稠密矩阵的零特征空间被 ~1e-3 相对误差抬过阈值，表现为近
-   满秩。
-   修复：新增 `_matrix_rank_dot_probe_kernel`/`_tl_dot_fp32_ieee`——每设备一次，
-   用 `1+2^-12`（fp32 精确、TF32 下舍入消失）构造区分性点积，并顺带校验 dot 输出
-   经 `tl.trans` 读出的一致性；probe 失败（含编译/launch 异常）即回退 unblocked
-   路径。探针探的是**实际依赖的 kernel 特性本身**，不是 vendor 判断，也不是
-   PyTorch 原生 kernel 的代理（3.4 的探针教训）。图缓存 key 同步纳入 blocked 位。
+   例（tridiag-k1024）**也通过**。
+   第一版修复假设天数 Triton 后端把 `input_precision="ieee"` 静默降级为 TF32 级精
+   度（整数谱 TF32 下精确、稠密谱被抬过阈值，形态吻合），加了 tl.dot IEEE 探针——
+   **重跑无效**，探针在天数上通过，说明 tl.dot 精度没有问题，误编译在 blocked 管
+   线的别处（H20 无法复现，根因待定位；定位脚本见下）。
+   最终方案：**已知答案端到端自测**(`_blocked_tridiag_ok`，每设备一次）——直发
+   （不走图）跑真实 blocked run 分解一个 k=768、rank 100 的旋转谱，答案不是 100
+   就永久回退 unblocked（无 dot、慢但正确）。两侧裕量约 100 倍（特征值 ≥ 1 vs 阈
+   值 ~1e-2，零空间噪声 ~1e-5)，健康后端不会误判。这仍然是探"实际依赖的执行路
+   径"而非 vendor 判断，且不猜测具体哪个 kernel 坏——pcol/pmat/pfin/rank2k 任一
+   被误编译都能拦住。图缓存 key 同步纳入 blocked 位。H20 自测通过、blocked 保持
+   启用（一次性开销 ~1.3s，含 CPU 侧 QR 与 JIT)。
+   根因定位脚本 `/workspace/debug_blocked_localize.py`（不进仓库）：在故障后端上对
+   比 blocked/unblocked 的 D/E 发散下标并独立对照 rank2k kernel 与 torch 参考；输
+   出可区分"面板内相位误编译"与"rank2k/tl.dot 误编译"，拿到结果后可做针对性修
+   复、拿掉回退。
 2. **graph_key_includes_ds32 前提不成立（测试缺陷）**：该测试假设"先捕获
    native-FP64 图、切能力位后再捕获 ds32 图"，但天数天生 `support_fp64=False`，第
    一次捕获就是 ds32,`key[4] is False` 的断言在无 FP64 设备上必然失败。加
