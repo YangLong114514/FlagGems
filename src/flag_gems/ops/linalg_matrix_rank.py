@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import collections
 import logging
 import os
 import threading
@@ -62,9 +63,22 @@ def _native_fp64_supported():
 # FLAGGEMS_MR_NO_GRAPH=1 or any capture failure falls back to direct
 # launches with identical results, and devices without graph support never
 # enter this path (no vendor dispatch).
-_MR_GRAPHS = {}
-_MR_GRAPH_MAX_ENTRIES = 16
+_MR_GRAPHS = collections.OrderedDict()
+# Cache budget in WORKSPACE BYTES, not entries: a (1024,1024) fp32 blocked
+# graph carries ~10 MB of workspace (padded work matrix + staging + panels),
+# so a fixed entry count can pin hundreds of MB across shape/dtype/batch
+# combinations.  Least-recently-used eviction by cumulative bytes.
+_MR_GRAPH_MAX_BYTES = 512 * 1024 * 1024
+_MR_GRAPH_BYTES = 0
 _MR_GRAPH_LOCK = threading.Lock()
+
+
+def _mr_workspace_bytes(ws):
+    return sum(
+        t.numel() * t.element_size()
+        for t in ws.values()
+        if isinstance(t, torch.Tensor)
+    )
 
 
 def _mr_current_stream_handle(device):
@@ -97,48 +111,55 @@ def _mr_graph_cached(key, device, make_workspace, copy_in, run, copy_out):
         copy_out(ws)
         return
     full_key = (key, _mr_current_stream_handle(device))
+    global _MR_GRAPH_BYTES
     with _MR_GRAPH_LOCK:
-        ent = _MR_GRAPHS.get(full_key)
-        if ent is None:
-            ws = make_workspace()
-            # A real run first: it stages the inputs, compiles every kernel
-            # in the sequence, and leaves a valid result in the workspace
-            # (used directly when capture below fails).
+        ent = _MR_GRAPHS.pop(full_key, None)
+        if ent is not None:
+            # LRU: reinsert at the most-recently-used end on every hit.
+            _MR_GRAPHS[full_key] = ent
+            ws, graph, _ = ent
             copy_in(ws)
-            run(ws)
-            try:
-                stream = torch.cuda.Stream(device)
-                stream.wait_stream(torch.cuda.current_stream(device))
-                with torch.cuda.stream(stream):
-                    run(ws)  # warmup on a side stream
-                torch.cuda.current_stream(device).wait_stream(stream)
-                torch.cuda.synchronize(device)
-                graph = torch.cuda.CUDAGraph()
-                with torch.cuda.graph(graph):
-                    run(ws)
-            except Exception:
-                logger.warning(
-                    "matrix_rank graph capture failed for %s; "
-                    "falling back to direct launches",
-                    key,
-                )
-                copy_out(ws)
-                return
-            if len(_MR_GRAPHS) >= _MR_GRAPH_MAX_ENTRIES:
-                # An evicted graph may still have an in-flight replay
-                # (replay is async); dropping the entry frees its
-                # workspace.  The FIFO victim may live on ANOTHER device,
-                # so synchronize the victim's device, not the current one.
-                victim_key = next(iter(_MR_GRAPHS))
-                torch.cuda.synchronize(_MR_GRAPHS[victim_key][0]["device_index"])
-                _MR_GRAPHS.pop(victim_key)
-            _MR_GRAPHS[full_key] = (ws, graph)
+            graph.replay()
             copy_out(ws)
             return
-        ws, graph = ent
+        ws = make_workspace()
+        # A real run first: it stages the inputs, compiles every kernel
+        # in the sequence, and leaves a valid result in the workspace
+        # (used directly when capture below fails).
         copy_in(ws)
-        graph.replay()
+        run(ws)
+        try:
+            stream = torch.cuda.Stream(device)
+            stream.wait_stream(torch.cuda.current_stream(device))
+            with torch.cuda.stream(stream):
+                run(ws)  # warmup on a side stream
+            torch.cuda.current_stream(device).wait_stream(stream)
+            torch.cuda.synchronize(device)
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                run(ws)
+        except Exception:
+            logger.warning(
+                "matrix_rank graph capture failed for %s; "
+                "falling back to direct launches",
+                key,
+            )
+            copy_out(ws)
+            return
+        nbytes = _mr_workspace_bytes(ws)
+        while _MR_GRAPHS and _MR_GRAPH_BYTES + nbytes > _MR_GRAPH_MAX_BYTES:
+            # An evicted graph may still have an in-flight replay (replay
+            # is async); dropping the entry frees its workspace.  The LRU
+            # victim may live on ANOTHER device, so synchronize the
+            # victim's device, not the current one.
+            _, (victim_ws, _, victim_bytes) = next(iter(_MR_GRAPHS.items()))
+            torch.cuda.synchronize(victim_ws["device_index"])
+            _MR_GRAPHS.popitem(last=False)
+            _MR_GRAPH_BYTES -= victim_bytes
+        _MR_GRAPHS[full_key] = (ws, graph, nbytes)
+        _MR_GRAPH_BYTES += nbytes
         copy_out(ws)
+        return
 
 
 
@@ -186,6 +207,22 @@ def _matrix_rank_safe_scale_kernel(scale):
     pid = tl.program_id(0)
     value = tl.load(scale + pid)
     tl.store(scale + pid, tl.where(value > 0.0, value, 1.0))
+
+
+@libentry()
+@triton.jit
+def _matrix_rank_scale_tol_kernel(ATOL, SCALE, OUT):
+    # atol_s = atol / scale inside the graph-captured launch sequence, at
+    # the tolerance's own precision (scale is cast UP to atol's dtype, so
+    # an fp64 tolerance keeps its fp64 quotient -- the same semantics the
+    # pre-scaling torch.div had).  A dedicated kernel instead of torch.div
+    # because under use_gems() the generic div would re-dispatch, and an
+    # out= variant is not guaranteed everywhere; this is identical on the
+    # direct and dispatched paths and capturable in a CUDA graph.
+    pid = tl.program_id(0)
+    a = tl.load(ATOL + pid)
+    s = tl.load(SCALE + pid).to(a.dtype)
+    tl.store(OUT + pid, a / s)
 
 
 @libentry()
@@ -1313,18 +1350,21 @@ def _empty_matrix_rank(input, output_shape):
 
 @libentry()
 @triton.jit
-def _matrix_rank_herm_tridiag_pad_init_kernel(A, W, K, RS, WPITCH):
+def _matrix_rank_herm_tridiag_pad_init_kernel(A, W, SCALE, K, RS, WPITCH):
     # Barrier-free tridiagonalization init: copy the SYMMETRIZED input
-    # (lower triangle read, mirrored) into the padded W work matrix.
-    # W is (KP, RS) with KP == RS == cdiv(K,64)*64 + 64 and arrives
-    # zero-initialized, so the step/mat/apply kernels can read the padding
-    # without masks; this kernel only writes the K x K corner.  A is the
-    # (batch, K, K) contiguous input.
+    # (lower triangle read, mirrored) into the padded W work matrix,
+    # dividing by the per-batch scale in-kernel (the staged input is
+    # UNSCALED; scaling here avoids an O(K^2) temporary outside the
+    # graph).  W is (KP, RS) with KP == RS == cdiv(K,64)*64 + 64 and
+    # arrives zero-initialized, so the step/mat/apply kernels can read the
+    # padding without masks; this kernel only writes the K x K corner.
+    # A is the (batch, K, K) contiguous input.
     b = tl.program_id(0)
     c0 = tl.program_id(1) * 64
     lc = tl.arange(0, 64)
     a_base = A + b * K * K
     wbase = W + b * WPITCH
+    s = tl.load(SCALE + b)
     for rb in tl.range(0, (K + 63) // 64):
         lr = rb * 64 + tl.arange(0, 64)
         cc = c0 + lc
@@ -1333,7 +1373,7 @@ def _matrix_rank_herm_tridiag_pad_init_kernel(A, W, K, RS, WPITCH):
         src_r = tl.maximum(lr[:, None], cc[None, :])
         src_c = tl.minimum(lr[:, None], cc[None, :])
         at = tl.load(a_base + src_r * K + src_c, mask=mask, other=0.0)
-        tl.store(wbase + lr[:, None] * RS + cc[None, :], at, mask=mask)
+        tl.store(wbase + lr[:, None] * RS + cc[None, :], at / s, mask=mask)
 
 
 @libentry()
@@ -1363,14 +1403,14 @@ def _matrix_rank_herm_tridiag_step_kernel(
             chf * ((r0 + lr > J - 1) & (r0 + lr < J + 1)).to(dtype), axis=0
         )
         ch = chf * ((r0 + lr) > J).to(dtype)
-        tl.store(V + pid * WPITCH + J * RS + r0 + lr, ch)
+        tl.store(V + pid * RS + r0 + lr, ch)
         ssq += tl.sum(ch * ch, axis=0)
         x0 += tl.sum(ch * ((r0 + lr > J) & (r0 + lr < J + 2)).to(dtype), axis=0)
     sigma = tl.sqrt(ssq)
     alpha = tl.where(x0 >= 0.0, -sigma, sigma)
     vnorm2 = 2.0 * sigma * (sigma + tl.abs(x0))
     tau = tl.where(vnorm2 > 0.0, 2.0 / vnorm2, 0.0)
-    tl.store(V + pid * WPITCH + J * RS + (J + 1), x0 - alpha)
+    tl.store(V + pid * RS + (J + 1), x0 - alpha)
     tl.store(D + pid * K + J, dj)
     tl.store(E + pid * K + J, alpha)
     tl.store(TAU + pid * K + J, tau)
@@ -1401,10 +1441,10 @@ def _matrix_rank_herm_tridiag_mat_kernel(
     lr = tl.arange(0, 64)
     wbase = W + pid * WPITCH
     tile = tl.load(wbase + (c0 + lc)[:, None] * RS + (r0 + lr)[None, :])
-    vc = tl.load(V + pid * WPITCH + J * RS + c0 + lc)
+    vc = tl.load(V + pid * RS + c0 + lc)
     part = tl.sum(tl.trans(tile) * vc[None, :], axis=1)
     tl.atomic_add(ACC + pid * APITCH + r0 + lr, part)
-    vp = tl.load(V + pid * WPITCH + J * RS + r0 + lr)
+    vp = tl.load(V + pid * RS + r0 + lr)
     tl.atomic_add(CSCA + pid, tl.sum(part * vp, axis=0))
 
 
@@ -1449,7 +1489,7 @@ def _matrix_rank_herm_tridiag_pcol_kernel(
     pid = tl.program_id(0)
     rb = tl.program_id(1) + J // 64
     wrow = W + pid * WPITCH + J * RS
-    vrow = V + pid * WPITCH + J * RS
+    vrow = V + pid * RS
     pvbase = PV + pid * PVP
     pwbase = PW + pid * PVP
     lr = tl.arange(0, 64)
@@ -1459,7 +1499,7 @@ def _matrix_rank_herm_tridiag_pcol_kernel(
     if tl.program_id(1) == 0:
         tl.store(CSCA + pid, tl.zeros((), dtype=dtype))
     if rb < (K + 63) // 64:
-        slot = PSCR + pid * SPITCH + J * (3 + 2 * NB_P) * SL
+        slot = PSCR + pid * SPITCH + (J % 2) * (3 + 2 * NB_P) * SL
         r = rb * 64 + lr
         col = tl.load(wrow + r)
         if P > 0:
@@ -1521,13 +1561,13 @@ def _matrix_rank_herm_tridiag_pmat_kernel(
     r0 = J + 1 + rt * 64
     lc = tl.arange(0, 64)
     lr = tl.arange(0, 64)
-    slot = PSCR + pid * SPITCH + J * (3 + 2 * NB_P) * SL
+    slot = PSCR + pid * SPITCH + (J % 2) * (3 + 2 * NB_P) * SL
     sig = tl.load(slot)
     x0 = tl.load(slot + 2 * SL)
     sigma = tl.sqrt(sig)
     alpha = tl.where(x0 >= 0.0, -sigma, sigma)
     wbase = W + pid * WPITCH
-    vrow = V + pid * WPITCH + J * RS
+    vrow = V + pid * RS
     tile = tl.load(wbase + (c0 + lc)[:, None] * RS + (r0 + lr)[None, :])
     vc = tl.load(vrow + c0 + lc)
     vc = tl.where(c0 + lc == J + 1, x0 - alpha, vc)
@@ -1565,11 +1605,11 @@ def _matrix_rank_herm_tridiag_pfin_kernel(
     rb = tl.program_id(1) + (J + 1) // 64
     pvbase = PV + pid * PVP
     pwbase = PW + pid * PVP
-    vrow = V + pid * WPITCH + J * RS
+    vrow = V + pid * RS
     lr = tl.arange(0, 64)
     qidx = tl.arange(0, NB_P)
     dtype = V.dtype.element_ty
-    slot = PSCR + pid * SPITCH + J * (3 + 2 * NB_P) * SL
+    slot = PSCR + pid * SPITCH + (J % 2) * (3 + 2 * NB_P) * SL
     sig = tl.load(slot)
     x0 = tl.load(slot + 2 * SL)
     sigma = tl.sqrt(sig)
@@ -1603,7 +1643,7 @@ def _matrix_rank_herm_tridiag_pfin_kernel(
     tl.store(pvbase + r * NB_P + P, v, mask=(r > J) & (r < K))
     if tl.program_id(1) == 0:
         jn = tl.where(J + 1 > K - 2, 0, J + 1)
-        slot_n = PSCR + pid * SPITCH + jn * (3 + 2 * NB_P) * SL
+        slot_n = PSCR + pid * SPITCH + (jn % 2) * (3 + 2 * NB_P) * SL
         eidx = tl.arange(0, 4 * NB_P)
         tl.store(
             slot_n + eidx * SL,
@@ -1621,11 +1661,17 @@ def _matrix_rank_herm_tridiag_rank2k_kernel(
     # rows/cols >= T0, one program per (col tile, row strip) of the
     # K-trimmed trailing block: T0 + 63 <= K + 62 < RS (padded) so tiles
     # never straddle the pitch and need no masks, and the zero pad rows of
-    # PV/PW make the update exactly zero in the padding.
+    # PV/PW make the update exactly zero in the padding.  Only the
+    # rt >= ct half of the tiles does any work: the update of the mirror
+    # tile (c, r) is exactly tl.trans(upd), so it is written back from the
+    # same program, halving the tl.dot work while keeping both triangles
+    # of W consistent for pmat's full-block reads.
     pid = tl.program_id(0)
     flat = tl.program_id(1)
     ct = flat // NT
     rt = flat % NT
+    if rt < ct:
+        return
     r0 = T0 + rt * 64
     c0 = T0 + ct * 64
     lr = tl.arange(0, 64)
@@ -1669,6 +1715,10 @@ def _matrix_rank_herm_tridiag_rank2k_kernel(
     ptrs = W + pid * WPITCH + r[:, None] * RS + c[None, :]
     tile = tl.load(ptrs)
     tl.store(ptrs, tile - upd)
+    if rt > ct:
+        mptrs = W + pid * WPITCH + c[:, None] * RS + r[None, :]
+        mtile = tl.load(mptrs)
+        tl.store(mptrs, mtile - tl.trans(upd))
 
 
 @libentry()
@@ -1710,9 +1760,9 @@ def _matrix_rank_herm_tridiag_apply_kernel(
     # O(1).  The regrouped form never squares tau.
     coef = 0.5 * tau * (tau * cs)
     om_r = tl.load(ACC + pid * APITCH + r0 + lr)
-    v_r = tl.load(V + pid * WPITCH + J * RS + r0 + lr)
+    v_r = tl.load(V + pid * RS + r0 + lr)
     om_c = tl.load(ACC + pid * APITCH + c0 + lc)
-    v_c = tl.load(V + pid * WPITCH + J * RS + c0 + lc)
+    v_c = tl.load(V + pid * RS + c0 + lc)
     w_r = tau * om_r - coef * v_r
     w_c = tau * om_c - coef * v_c
     ptrs = wbase + (c0 + lc)[:, None] * RS + (r0 + lr)[None, :]
@@ -1722,13 +1772,18 @@ def _matrix_rank_herm_tridiag_apply_kernel(
     tl.store(ptrs, tile)
 
 
-def _herm_tridiag_workspace(device, batch_count, k, work_dtype, atol_tensor, rtol_tensor):
+def _herm_tridiag_workspace(
+    device, batch_count, k, work_dtype, atol_tensor, rtol_tensor, blocked
+):
     # All buffers the barrier-free tridiagonalization touches, allocated up
     # front so the launch sequence is a pure function of the workspace and
     # can be graph-captured (capture requires stable buffer addresses).
+    # Panel buffers (pv/pw/pscr) are allocated ONLY for the blocked path --
+    # fp64 and k < _HERM_TRIDIAG_BLOCKED_MIN_K never take it.
     kp = triton.cdiv(k, 64) * 64 + 64
     rs = kp  # hermitian input is square: rows == k
     nb_p = _HERM_TRIDIAG_PANEL
+    slot = (3 + 2 * nb_p) * _HERM_TRIDIAG_SCRATCH_LINE
     ws = {
         "device_index": device.index,
         "kp": kp,
@@ -1736,26 +1791,40 @@ def _herm_tridiag_workspace(device, batch_count, k, work_dtype, atol_tensor, rto
         "wpitch": kp * rs,
         "apitch": kp + 64,
         "pvp": kp * nb_p,
+        "spitch": 2 * slot,
         "nb_p": nb_p,
         # Zero-init (not empty): the mat/apply kernels read the padding
         # without masks and rely on it staying zero.
         "w_buf": torch.zeros((batch_count, kp, rs), dtype=work_dtype, device=device),
-        "v_buf": torch.zeros((batch_count, kp, rs), dtype=work_dtype, device=device),
-        # Panel reflector/correction buffers (blocked path only).  Zero-init:
-        # stale slots q >= p must be finite because the kernels multiply
-        # unmasked tile loads against tl.where-zeroed values.
-        "pv": torch.zeros((batch_count, kp, nb_p), dtype=work_dtype, device=device),
-        "pw": torch.zeros((batch_count, kp, nb_p), dtype=work_dtype, device=device),
-        # Per-column reduction scratch for the blocked path: one slot per
-        # column, entries padded to 128B lines so concurrent atomics do not
+        # Only the CURRENT column's reflector is alive at any time, so a
+        # single row per batch suffices (kernels zero the prefix below J+1
+        # explicitly when they store the reflector).  Zero-init: the prefix
+        # of column 0's row must read as zeros.
+        "v_buf": torch.zeros((batch_count, rs), dtype=work_dtype, device=device),
+        # Panel reflector/correction buffers (blocked path only).
+        # Zero-init: stale slots q >= p must be finite because the kernels
+        # multiply unmasked tile loads against tl.where-zeroed values.
+        "pv": (
+            torch.zeros((batch_count, kp, nb_p), dtype=work_dtype, device=device)
+            if blocked
+            else None
+        ),
+        "pw": (
+            torch.zeros((batch_count, kp, nb_p), dtype=work_dtype, device=device)
+            if blocked
+            else None
+        ),
+        # Reduction scratch for the blocked path: TWO rotating slots (column
+        # parity), entries padded to 128B lines so concurrent atomics do not
         # serialize in the L2.  Zero-init: pcol accumulates with atomics and
-        # pfin re-zeroes the next column's slot after use (slot 0 is re-zeroed
-        # by the last column's pfin), so every call / graph replay starts
-        # from zeros.
-        "pscr": torch.zeros(
-            (batch_count, k * (3 + 2 * nb_p) * _HERM_TRIDIAG_SCRATCH_LINE),
-            dtype=work_dtype,
-            device=device,
+        # pfin re-zeroes the OTHER slot (next column's) after use, with the
+        # last column re-zeroing slot 0, so every call / graph replay starts
+        # from zeros.  Two slots are sufficient because the zeroing targets
+        # the slot parity nobody in the current launch is reading.
+        "pscr": (
+            torch.zeros((batch_count, 2 * slot), dtype=work_dtype, device=device)
+            if blocked
+            else None
         ),
         "diag": torch.empty((batch_count, k), dtype=work_dtype, device=device),
         "offdiag": torch.empty((batch_count, k), dtype=work_dtype, device=device),
@@ -1768,6 +1837,15 @@ def _herm_tridiag_workspace(device, batch_count, k, work_dtype, atol_tensor, rto
         "staging": torch.empty((batch_count, k, k), dtype=work_dtype, device=device),
         "atol": torch.empty((batch_count,), dtype=atol_tensor.dtype, device=device),
         "rtol": torch.empty((batch_count,), dtype=rtol_tensor.dtype, device=device),
+        # Staged UNSCALED per-batch scale; the pad-init kernel divides the
+        # matrix by it in-kernel and _matrix_rank_scale_tol_kernel divides
+        # atol by it into atol_s (both inside the captured sequence).
+        "scale": torch.empty((batch_count,), dtype=work_dtype, device=device),
+        "atol_s": torch.empty(
+            (batch_count,),
+            dtype=torch.promote_types(atol_tensor.dtype, work_dtype),
+            device=device,
+        ),
         "rank": torch.empty((batch_count,), dtype=torch.int64, device=device),
     }
     return ws
@@ -1786,9 +1864,13 @@ def _herm_tridiag_run(ws, k, batch_count, ds32):
     w_buf, v_buf = ws["w_buf"], ws["v_buf"]
     diag, offdiag, taul = ws["diag"], ws["offdiag"], ws["taul"]
     acc, csca = ws["acc"], ws["csca"]
+    _matrix_rank_scale_tol_kernel[(batch_count,)](
+        ws["atol"], ws["scale"], ws["atol_s"], num_warps=1
+    )
     _matrix_rank_herm_tridiag_pad_init_kernel[(batch_count, triton.cdiv(k, 64))](
         ws["staging"],
         w_buf,
+        ws["scale"],
         K=k,
         RS=rs,
         WPITCH=wpitch,
@@ -1860,14 +1942,18 @@ def _herm_tridiag_blocked_run(ws, k, batch_count, ds32):
     wpitch, apitch, pvp = ws["wpitch"], ws["apitch"], ws["pvp"]
     nb_p = ws["nb_p"]
     sl = _HERM_TRIDIAG_SCRATCH_LINE
-    spitch = k * (3 + 2 * nb_p) * sl
+    spitch = ws["spitch"]
     w_buf, v_buf = ws["w_buf"], ws["v_buf"]
     pv, pw, pscr = ws["pv"], ws["pw"], ws["pscr"]
     diag, offdiag = ws["diag"], ws["offdiag"]
     acc, csca = ws["acc"], ws["csca"]
+    _matrix_rank_scale_tol_kernel[(batch_count,)](
+        ws["atol"], ws["scale"], ws["atol_s"], num_warps=1
+    )
     _matrix_rank_herm_tridiag_pad_init_kernel[(batch_count, triton.cdiv(k, 64))](
         ws["staging"],
         w_buf,
+        ws["scale"],
         K=k,
         RS=rs,
         WPITCH=wpitch,
@@ -1975,7 +2061,7 @@ def _herm_tridiag_sturm_tail(ws, k, batch_count, ds32):
         _matrix_rank_sturm32_tridiag_bracket_kernel[(batch_count,)](
             diag,
             offdiag,
-            ws["atol"],
+            ws["atol_s"],
             ws["rtol"],
             ws["rank"],
             ws["tol2"],
@@ -2001,7 +2087,7 @@ def _herm_tridiag_sturm_tail(ws, k, batch_count, ds32):
     _matrix_rank_sturm_rank_kernel[(batch_count,)](
         diag,
         offdiag,
-        ws["atol"],
+        ws["atol_s"],
         ws["rtol"],
         ws["rank"],
         ws["e2_hi"],
@@ -2015,7 +2101,7 @@ def _herm_tridiag_sturm_tail(ws, k, batch_count, ds32):
     )
 
 
-def _launch_herm_tridiag_rank(matrix, atol_tensor, rtol_tensor, out, k, batch_count, input):
+def _launch_herm_tridiag_rank(matrix, atol_tensor, rtol_tensor, scale, out, k, batch_count, input):
     # Non-iterative hermitian path: symmetrize into a PADDED work matrix,
     # tridiagonalize with per-column barrier-free Householder steps, then
     # count eigenvalues outside [-tol, tol] with Sturm sequences.  The O(k)
@@ -2039,6 +2125,7 @@ def _launch_herm_tridiag_rank(matrix, atol_tensor, rtol_tensor, out, k, batch_co
         ws["staging"].copy_(matrix)
         ws["atol"].copy_(atol_tensor)
         ws["rtol"].copy_(rtol_tensor)
+        ws["scale"].copy_(scale)
 
     def copy_out(ws):
         out.copy_(ws["rank"].reshape(out.shape))
@@ -2050,7 +2137,7 @@ def _launch_herm_tridiag_rank(matrix, atol_tensor, rtol_tensor, out, k, batch_co
         ("herm_tridiag", k, batch_count, work_dtype, ds32, device.index),
         device,
         lambda: _herm_tridiag_workspace(
-            device, batch_count, k, work_dtype, atol_tensor, rtol_tensor
+            device, batch_count, k, work_dtype, atol_tensor, rtol_tensor, blocked
         ),
         copy_in,
         lambda ws: (
@@ -2065,12 +2152,14 @@ def _launch_herm_tridiag_rank(matrix, atol_tensor, rtol_tensor, out, k, batch_co
 @libentry()
 @triton.jit
 def _matrix_rank_bidiag_bf_init_kernel(
-    A, W, M, N, K, ROWS, RS, WPITCH, TALL: tl.constexpr
+    A, W, SCALE, M, N, K, ROWS, RS, WPITCH, TALL: tl.constexpr
 ):
     # Barrier-free bidiagonalization init: copy the input into the padded
-    # tall work matrix W (KP x RS, zero-initialized on allocation):
-    # W[c, r] = A[r, c] for tall input (M >= N), W[c, r] = A[c, r] for
-    # wide input (i.e. the tall orientation of A).  Only the K x ROWS
+    # tall work matrix W (KP x RS, zero-initialized on allocation),
+    # dividing by the per-batch scale in-kernel (the staged input is
+    # UNSCALED; scaling here avoids an O(M*N) temporary outside the
+    # graph): W[c, r] = A[r, c] for tall input (M >= N), W[c, r] = A[c, r]
+    # for wide input (i.e. the tall orientation of A).  Only the K x ROWS
     # corner is written; the padding stays zero so the step/mat/apply
     # kernels can read tiles without masks.
     b = tl.program_id(0)
@@ -2078,6 +2167,7 @@ def _matrix_rank_bidiag_bf_init_kernel(
     lc = tl.arange(0, 64)
     a_base = A + b * M * N
     wbase = W + b * WPITCH
+    s = tl.load(SCALE + b)
     for rb in tl.range(0, (RS - 64) // 64):
         rr = rb * 64 + tl.arange(0, 64)
         cc = c0 + lc
@@ -2090,7 +2180,7 @@ def _matrix_rank_bidiag_bf_init_kernel(
             at = tl.load(
                 a_base + cc[None, :] * N + rr[:, None], mask=mask, other=0.0
             )
-        tl.store(wbase + cc[None, :] * RS + rr[:, None], at, mask=mask)
+        tl.store(wbase + cc[None, :] * RS + rr[:, None], at / s, mask=mask)
 
 
 @libentry()
@@ -2112,14 +2202,14 @@ def _matrix_rank_bidiag_lstep_kernel(W, V, D, TAU, ACC, J, K, RS, WPITCH, APITCH
         r0 = rb * 64
         ch = tl.load(wbase + J * RS + r0 + lr)
         ch = ch * ((r0 + lr) >= J).to(dtype)
-        tl.store(V + pid * WPITCH + J * RS + r0 + lr, ch)
+        tl.store(V + pid * RS + r0 + lr, ch)
         ssq += tl.sum(ch * ch, axis=0)
         x0 += tl.sum(ch * ((r0 + lr > J - 1) & (r0 + lr < J + 1)).to(dtype), axis=0)
     sigma = tl.sqrt(ssq)
     alpha = tl.where(x0 >= 0.0, -sigma, sigma)
     vnorm2 = 2.0 * sigma * (sigma + tl.abs(x0))
     tau = tl.where(vnorm2 > 0.0, 2.0 / vnorm2, 0.0)
-    tl.store(V + pid * WPITCH + J * RS + J, x0 - alpha)
+    tl.store(V + pid * RS + J, x0 - alpha)
     tl.store(D + pid * K + J, alpha)
     tl.store(TAU + pid * K + J, tau)
     for cb in tl.range(0, APITCH // 64):
@@ -2143,7 +2233,7 @@ def _matrix_rank_bidiag_lmat_kernel(W, V, ACC, J, K, RS, WPITCH, APITCH, NRC, RB
     r0 = (RB0 + rc) * 64
     wbase = W + pid * WPITCH
     tile = tl.load(wbase + (c0 + lc)[:, None] * RS + (r0 + lr)[None, :])
-    v2p = tl.load(V + pid * WPITCH + J * RS + r0 + lr)
+    v2p = tl.load(V + pid * RS + r0 + lr)
     part = tl.sum(tile * v2p[None, :], axis=1)
     tl.atomic_add(ACC + pid * APITCH + c0 + lc, part)
 
@@ -2165,7 +2255,7 @@ def _matrix_rank_bidiag_lapply_kernel(W, V, TAU, ACC, J, K, RS, WPITCH, APITCH, 
     wbase = W + pid * WPITCH
     tau = tl.load(TAU + pid * K + J)
     w = tl.load(ACC + pid * APITCH + c0 + lc) * tau
-    v2p = tl.load(V + pid * WPITCH + J * RS + r0 + lr)
+    v2p = tl.load(V + pid * RS + r0 + lr)
     tile = tl.load(wbase + (c0 + lc)[:, None] * RS + (r0 + lr)[None, :])
     tile = tile - tl.reshape(w, (64, 1)) * tl.reshape(v2p, (1, 64))
     tl.store(wbase + (c0 + lc)[:, None] * RS + (r0 + lr)[None, :], tile)
@@ -2187,14 +2277,14 @@ def _matrix_rank_bidiag_rstep_kernel(W, U, E, TAU, ACC, J, K, RS, WPITCH, UPITCH
         c0 = cb * 64
         ch = tl.load(wbase + (c0 + lc) * RS + J, mask=(c0 + lc) < K, other=0.0)
         ch = ch * ((c0 + lc) > J).to(dtype)
-        tl.store(U + pid * UPITCH + J * K + c0 + lc, ch, mask=(c0 + lc) < K)
+        tl.store(U + pid * K + c0 + lc, ch, mask=(c0 + lc) < K)
         ssq += tl.sum(ch * ch, axis=0)
         x0 += tl.sum(ch * ((c0 + lc > J) & (c0 + lc < J + 2)).to(dtype), axis=0)
     sigma = tl.sqrt(ssq)
     alpha = tl.where(x0 >= 0.0, -sigma, sigma)
     vnorm2 = 2.0 * sigma * (sigma + tl.abs(x0))
     tau = tl.where(vnorm2 > 0.0, 2.0 / vnorm2, 0.0)
-    tl.store(U + pid * UPITCH + J * K + (J + 1), x0 - alpha)
+    tl.store(U + pid * K + (J + 1), x0 - alpha)
     tl.store(E + pid * K + J, alpha)
     tl.store(TAU + pid * K + J, tau)
     for cb in tl.range(0, APITCH // 64):
@@ -2226,7 +2316,7 @@ def _matrix_rank_bidiag_rmat_kernel(W, U, ACC, J, K, RS, WPITCH, UPITCH, APITCH,
         mask=rmask[None, :],
         other=0.0,
     )
-    up = tl.load(U + pid * UPITCH + J * K + c0 + lc, mask=(c0 + lc) < K, other=0.0)
+    up = tl.load(U + pid * K + c0 + lc, mask=(c0 + lc) < K, other=0.0)
     part = tl.sum(tl.trans(tile) * up[None, :], axis=1)
     tl.atomic_add(ACC + pid * APITCH + r0 + lr, part)
 
@@ -2249,7 +2339,7 @@ def _matrix_rank_bidiag_rapply_kernel(W, U, TAU, ACC, J, K, RS, WPITCH, UPITCH, 
     tau = tl.load(TAU + pid * K + J)
     rmask = (r0 + lr) < RS
     wu = tl.load(ACC + pid * APITCH + r0 + lr, mask=rmask, other=0.0) * tau
-    up = tl.load(U + pid * UPITCH + J * K + c0 + lc, mask=(c0 + lc) < K, other=0.0)
+    up = tl.load(U + pid * K + c0 + lc, mask=(c0 + lc) < K, other=0.0)
     tile = tl.load(
         wbase + (c0 + lc)[:, None] * RS + (r0 + lr)[None, :],
         mask=rmask[None, :],
@@ -2277,8 +2367,11 @@ def _bidiag_workspace(device, batch_count, m, n, k, rows, work_dtype, atol_tenso
         "wpitch": kp * rs,
         "upitch": kp * (k + 64),
         "w_buf": torch.zeros((batch_count, kp, rs), dtype=work_dtype, device=device),
-        "v_buf": torch.zeros((batch_count, kp, rs), dtype=work_dtype, device=device),
-        "u_buf": torch.zeros((batch_count, kp * (k + 64)), dtype=work_dtype, device=device),
+        # Only the CURRENT step's left/right reflector is alive at any
+        # time, so one row per batch suffices for each (the step kernels
+        # zero the prefix explicitly when storing the reflector).
+        "v_buf": torch.zeros((batch_count, rs), dtype=work_dtype, device=device),
+        "u_buf": torch.zeros((batch_count, k), dtype=work_dtype, device=device),
         "diag": torch.empty((batch_count, k), dtype=work_dtype, device=device),
         "offdiag": torch.empty((batch_count, k), dtype=work_dtype, device=device),
         "taul": torch.empty((batch_count, k), dtype=work_dtype, device=device),
@@ -2291,6 +2384,15 @@ def _bidiag_workspace(device, batch_count, m, n, k, rows, work_dtype, atol_tenso
         "staging": torch.empty((batch_count, m, n), dtype=work_dtype, device=device),
         "atol": torch.empty((batch_count,), dtype=atol_tensor.dtype, device=device),
         "rtol": torch.empty((batch_count,), dtype=rtol_tensor.dtype, device=device),
+        # Staged UNSCALED per-batch scale; the init kernel divides the
+        # matrix by it in-kernel and _matrix_rank_scale_tol_kernel divides
+        # atol by it into atol_s (both inside the captured sequence).
+        "scale": torch.empty((batch_count,), dtype=work_dtype, device=device),
+        "atol_s": torch.empty(
+            (batch_count,),
+            dtype=torch.promote_types(atol_tensor.dtype, work_dtype),
+            device=device,
+        ),
         "rank": torch.empty((batch_count,), dtype=torch.int64, device=device),
     }
     if ds32:
@@ -2326,9 +2428,13 @@ def _bidiag_run(ws, m, n, k, rows, batch_count, ds32):
     diag, offdiag = ws["diag"], ws["offdiag"]
     taul, taur = ws["taul"], ws["taur"]
     acc, uacc = ws["acc"], ws["uacc"]
+    _matrix_rank_scale_tol_kernel[(batch_count,)](
+        ws["atol"], ws["scale"], ws["atol_s"], num_warps=1
+    )
     _matrix_rank_bidiag_bf_init_kernel[(batch_count, triton.cdiv(k, 64))](
         ws["staging"],
         w_buf,
+        ws["scale"],
         m,
         n,
         k,
@@ -2454,7 +2560,7 @@ def _bidiag_run(ws, m, n, k, rows, batch_count, ds32):
         _matrix_rank_sturm32_bidiag_bracket_kernel[(batch_count,)](
             ws["gk_dd"],
             ws["gk_ee"],
-            ws["atol"],
+            ws["atol_s"],
             ws["rtol"],
             ws["rank"],
             ws["tol2"],
@@ -2488,7 +2594,7 @@ def _bidiag_run(ws, m, n, k, rows, batch_count, ds32):
     _matrix_rank_sturm_rank_kernel[(batch_count,)](
         ws["gk_diag"],
         ws["gk_off"],
-        ws["atol"],
+        ws["atol_s"],
         ws["rtol"],
         ws["rank"],
         ws["e2_hi"],
@@ -2502,7 +2608,7 @@ def _bidiag_run(ws, m, n, k, rows, batch_count, ds32):
     )
 
 
-def _launch_bidiag_rank(matrix, atol_tensor, rtol_tensor, out, m, n, k, rows, batch_count, input):
+def _launch_bidiag_rank(matrix, atol_tensor, rtol_tensor, scale, out, m, n, k, rows, batch_count, input):
     # Non-hermitian path past the fused-Jacobi size limits: copy into a
     # PADDED tall work matrix, reduce to bidiagonal form with per-column
     # barrier-free Golub-Kahan steps, then count singular values above the
@@ -2519,6 +2625,7 @@ def _launch_bidiag_rank(matrix, atol_tensor, rtol_tensor, out, m, n, k, rows, ba
         ws["staging"].copy_(matrix)
         ws["atol"].copy_(atol_tensor)
         ws["rtol"].copy_(rtol_tensor)
+        ws["scale"].copy_(scale)
 
     def copy_out(ws):
         out.copy_(ws["rank"].reshape(out.shape))
@@ -2628,14 +2735,13 @@ def _launch_matrix_rank(
             atol_s = rtol_s = 0.0
     else:
         # Large graph-captured paths keep the staged-tensor convention
-        # (replay must re-read tolerances from workspace buffers): scalars
-        # materialize here, and matrix/atol are pre-divided by the scale.
-        matrix = matrix / scale.unsqueeze(-1).unsqueeze(-1)
+        # (replay must re-read inputs from workspace buffers).  The matrix
+        # and atol are staged UNSCALED and divided by the staged scale
+        # INSIDE the captured sequence (pad/bidiag init kernels and
+        # _matrix_rank_scale_tol_kernel), so no O(k^2) scaled temporary is
+        # materialized outside the graph.
         atol_tensor = _materialize_tolerance(atol, output_shape, input)
         rtol_tensor = _materialize_tolerance(rtol, output_shape, input)
-        atol_tensor = (atol_tensor.reshape(batch_count) / scale).reshape(
-            output_shape
-        )
     out = torch.empty(output_shape, dtype=torch.int64, device=input.device)
     block_r = triton.next_power_of_2(rows)
     relative_epsilon = 1.0e-15 if is_fp64 else 1.0e-7
@@ -2683,13 +2789,14 @@ def _launch_matrix_rank(
             )
         elif herm_tridiag:
             _launch_herm_tridiag_rank(
-                matrix, atol_tensor, rtol_tensor, out, k, batch_count, input
+                matrix, atol_tensor, rtol_tensor, scale, out, k, batch_count, input
             )
         elif use_bidiag:
             _launch_bidiag_rank(
                 matrix,
                 atol_tensor,
                 rtol_tensor,
+                scale,
                 out,
                 m,
                 n,
