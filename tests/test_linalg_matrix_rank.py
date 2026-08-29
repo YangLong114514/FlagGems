@@ -1514,6 +1514,12 @@ def test_linalg_matrix_rank_extreme_scales(shape, hermitian, log10_scale):
     matrix = torch.randn(*shape, generator=generator)
     if hermitian:
         matrix = matrix + matrix.mT
+    else:
+        # A raw Gaussian's smallest singular value can sit within fp32
+        # factorization noise of the rtol threshold (observed: the rank
+        # flapping by one across backends at 1e20); diagonal dominance
+        # makes the full-rank verdict unambiguous at any fp32 noise level.
+        matrix = matrix + 3.0 * (shape[-1] ** 0.5) * torch.eye(shape[-1])
     matrix = (matrix * scale).to(flag_gems.device)
     rtol = max(shape[-2:]) * torch.finfo(torch.float32).eps
     reference = torch.linalg.matrix_rank(
@@ -1600,6 +1606,10 @@ def test_linalg_matrix_rank_fp64_critical_spectrum(k):
 
 @pytest.mark.linalg_matrix_rank
 @pytest.mark.skipif(IS_ASCEND, reason="Ascend backend has its own implementation")
+@pytest.mark.skipif(
+    not SUPPORT_FP64,
+    reason="native-FP64-first capture ordering needs native FP64",
+)
 def test_linalg_matrix_rank_graph_key_includes_ds32(monkeypatch):
     # The graph cache key must include the native-FP64/DS32 mode: switching
     # support_fp64 off (as the ds32 fallback tests do) must NOT replay a
@@ -1694,8 +1704,53 @@ def test_linalg_matrix_rank_hermitian_blocked_dispatch(k, path, monkeypatch):
     result = flag_gems.linalg_matrix_rank(matrix, hermitian=True)
     utils.gems_assert_equal(result, reference.to(flag_gems.device))
     assert result.item() == 100
-    assert bool(calls["blocked"]) == (path == "blocked")
-    assert bool(calls["unblocked"]) == (path == "unblocked")
+    # Backends whose tl.dot fails the IEEE fp32 probe legitimately fall back
+    # to the unblocked run even at k >= 768 -- the boundary assertion is
+    # against the probe verdict, not the size alone.
+    dot_ok = module._tl_dot_fp32_ieee(matrix.device)
+    expect_blocked = path == "blocked" and dot_ok
+    assert bool(calls["blocked"]) == expect_blocked
+    assert bool(calls["unblocked"]) != expect_blocked
+
+
+@pytest.mark.linalg_matrix_rank
+@pytest.mark.skipif(IS_ASCEND, reason="Ascend backend has its own implementation")
+def test_linalg_matrix_rank_hermitian_blocked_dot_probe_fallback(monkeypatch):
+    # When the tl.dot IEEE probe fails (TF32-class backend), k >= 768 fp32
+    # hermitian inputs must fall back to the unblocked (dot-free) run and
+    # stay correct -- blocked results would be silently wrong there.
+    module = importlib.import_module("flag_gems.ops.linalg_matrix_rank")
+    module._MR_GRAPHS.clear()
+    module._MR_GRAPH_BYTES = 0
+    calls = {"blocked": [], "unblocked": []}
+    orig_blocked = module._herm_tridiag_blocked_run
+    orig_unblocked = module._herm_tridiag_run
+
+    def spy_blocked(ws, k_, batch_count, ds32):
+        calls["blocked"].append(k_)
+        return orig_blocked(ws, k_, batch_count, ds32)
+
+    def spy_unblocked(ws, k_, batch_count, ds32):
+        calls["unblocked"].append(k_)
+        return orig_unblocked(ws, k_, batch_count, ds32)
+
+    monkeypatch.setattr(module, "_herm_tridiag_blocked_run", spy_blocked)
+    monkeypatch.setattr(module, "_herm_tridiag_run", spy_unblocked)
+    monkeypatch.setattr(module, "_tl_dot_fp32_ieee", lambda device: False)
+
+    k = 768
+    matrix = _blocked_rotated_spectrum(k, list(range(1, 101)), seed=k).to(
+        flag_gems.device
+    )
+    rtol = k * torch.finfo(torch.float32).eps
+    reference = torch.linalg.matrix_rank(
+        matrix.cpu().double(), hermitian=True, rtol=rtol
+    )
+    result = flag_gems.linalg_matrix_rank(matrix, hermitian=True)
+    utils.gems_assert_equal(result, reference.to(flag_gems.device))
+    assert result.item() == 100
+    assert not calls["blocked"]
+    assert calls["unblocked"]
 
 
 @pytest.mark.linalg_matrix_rank
