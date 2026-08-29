@@ -1613,6 +1613,7 @@ def test_linalg_matrix_rank_graph_key_includes_ds32(monkeypatch):
         pytest.skip("graph capture only on genuine CUDA builds")
     module = importlib.import_module("flag_gems.ops.linalg_matrix_rank")
     module._MR_GRAPHS.clear()
+    module._MR_GRAPH_BYTES = 0
 
     matrix = torch.randn(65, 65).float()
     matrix = (matrix + matrix.mT).to(flag_gems.device)
@@ -1627,3 +1628,226 @@ def test_linalg_matrix_rank_graph_key_includes_ds32(monkeypatch):
     utils.gems_assert_equal(result, reference.to(flag_gems.device))
     assert len(module._MR_GRAPHS) == 2
     assert list(module._MR_GRAPHS)[1][0][4] is True
+
+
+def _blocked_rotated_spectrum(k, values, seed):
+    # Hermitian matrix with the given eigenvalues, rotated by a random
+    # orthogonal basis so the Householder panel algebra is really exercised.
+    # Built on CPU in fp64 and rounded to fp32 ONCE (device-side fp64 is not
+    # portable); the fp64 CPU oracle on the rounded matrix arbitrates.
+    generator = torch.Generator().manual_seed(seed)
+    basis = torch.linalg.qr(
+        torch.randn(k, k, generator=generator, dtype=torch.float64)
+    )[0]
+    spectrum = torch.zeros(k, dtype=torch.float64)
+    spectrum[: len(values)] = torch.tensor(values, dtype=torch.float64)
+    return ((basis * spectrum) @ basis.mT).float()
+
+
+@pytest.mark.linalg_matrix_rank
+@pytest.mark.skipif(IS_ASCEND, reason="Ascend backend has its own implementation")
+@pytest.mark.parametrize(
+    "k,path",
+    [
+        pytest.param(767, "unblocked", id="k767-below-boundary"),
+        pytest.param(768, "blocked", id="k768-boundary"),
+        pytest.param(769, "blocked", id="k769-unaligned"),
+        pytest.param(1000, "blocked", id="k1000-unaligned"),
+    ],
+)
+def test_linalg_matrix_rank_hermitian_blocked_dispatch(k, path, monkeypatch):
+    # k == _HERM_TRIDIAG_BLOCKED_MIN_K (768) is the blocked-WY dispatch
+    # boundary: 767 must stay on the per-column unblocked run, 768 crosses
+    # over, and 769/1000 exercise the non-64-aligned padded tiles and the
+    # partial last panel.  Spy on both run functions to prove which path
+    # actually executes (a correct result alone would not catch a silent
+    # fallback).  The graph cache is cleared so every case really runs its
+    # launch sequence instead of replaying a graph captured by an earlier
+    # test with the same cache key.
+    module = importlib.import_module("flag_gems.ops.linalg_matrix_rank")
+    module._MR_GRAPHS.clear()
+    module._MR_GRAPH_BYTES = 0
+    calls = {"blocked": [], "unblocked": []}
+    orig_blocked = module._herm_tridiag_blocked_run
+    orig_unblocked = module._herm_tridiag_run
+
+    def spy_blocked(ws, k_, batch_count, ds32):
+        calls["blocked"].append(k_)
+        return orig_blocked(ws, k_, batch_count, ds32)
+
+    def spy_unblocked(ws, k_, batch_count, ds32):
+        calls["unblocked"].append(k_)
+        return orig_unblocked(ws, k_, batch_count, ds32)
+
+    monkeypatch.setattr(module, "_herm_tridiag_blocked_run", spy_blocked)
+    monkeypatch.setattr(module, "_herm_tridiag_run", spy_unblocked)
+
+    matrix = _blocked_rotated_spectrum(k, list(range(1, 101)), seed=k).to(
+        flag_gems.device
+    )
+    # fp32 rounding lifts the zero eigenspace to ~1e-5, so the fp64 oracle
+    # must use the FP32-default rtol (k * eps_fp32), not its own eps_fp64.
+    rtol = k * torch.finfo(torch.float32).eps
+    reference = torch.linalg.matrix_rank(
+        matrix.cpu().double(), hermitian=True, rtol=rtol
+    )
+    result = flag_gems.linalg_matrix_rank(matrix, hermitian=True)
+    utils.gems_assert_equal(result, reference.to(flag_gems.device))
+    assert result.item() == 100
+    assert bool(calls["blocked"]) == (path == "blocked")
+    assert bool(calls["unblocked"]) == (path == "unblocked")
+
+
+@pytest.mark.linalg_matrix_rank
+@pytest.mark.skipif(IS_ASCEND, reason="Ascend backend has its own implementation")
+def test_linalg_matrix_rank_hermitian_blocked_ignores_strict_upper():
+    # The blocked tridiagonalization must read ONLY the lower triangle:
+    # garbage in the strict upper triangle (which torch never reads for
+    # hermitian=True) must not change the result.  Both matrices are built
+    # entirely on CPU -- device-side advanced indexing is not portable --
+    # and the CPU fp64 oracle on the garbage matrix arbitrates.
+    k = 1024
+    generator = torch.Generator().manual_seed(7)
+    basis = torch.randn(k, 30, dtype=torch.float64, generator=generator)
+    clean_cpu = ((basis @ basis.mT) / k).float()  # rank 30, spectrum O(1)
+    garbage_cpu = clean_cpu.clone()
+    rows, cols = torch.triu_indices(k, k, offset=1)
+    garbage_cpu[rows, cols] = 1.0e6
+
+    clean = clean_cpu.to(flag_gems.device)
+    garbage = garbage_cpu.to(flag_gems.device)
+    # atol sits far above the fp32 rounding noise of the zero eigenspace.
+    reference = torch.linalg.matrix_rank(
+        garbage_cpu.double(), hermitian=True, atol=5e-2
+    )
+    clean_rank = flag_gems.linalg_matrix_rank(clean, hermitian=True, atol=5e-2)
+    garbage_rank = flag_gems.linalg_matrix_rank(
+        garbage, hermitian=True, atol=5e-2
+    )
+    utils.gems_assert_equal(garbage_rank, clean_rank)
+    utils.gems_assert_equal(garbage_rank, reference.to(flag_gems.device))
+
+
+@pytest.mark.linalg_matrix_rank
+@pytest.mark.skipif(IS_ASCEND, reason="Ascend backend has its own implementation")
+@pytest.mark.parametrize("rank", [1, 7])
+def test_linalg_matrix_rank_hermitian_blocked_deflated(rank):
+    # Strong deflation: k - rank columns of the panel factorization see an
+    # (almost) zero trailing block, driving tau huge -- the regrouped
+    # tau*(tau*dot) coefficient must stay finite and the rank exact.
+    k = 1024
+    generator = torch.Generator().manual_seed(rank)
+    factor = torch.randn(k, rank, dtype=torch.float64, generator=generator)
+    matrix = ((factor @ factor.mT) / k).float().to(flag_gems.device)
+    reference = torch.linalg.matrix_rank(
+        matrix.cpu().double(), hermitian=True, atol=5e-2
+    )
+    assert reference.item() == rank  # construction sanity
+    result = flag_gems.linalg_matrix_rank(matrix, hermitian=True, atol=5e-2)
+    utils.gems_assert_equal(result, reference.to(flag_gems.device))
+
+
+@pytest.mark.linalg_matrix_rank
+@pytest.mark.skipif(IS_ASCEND, reason="Ascend backend has its own implementation")
+@pytest.mark.parametrize("log10_scale", [20, -30], ids=lambda s: f"1e{s}")
+def test_linalg_matrix_rank_hermitian_blocked_extreme_scales(log10_scale):
+    # Blocked path at 1e20 / 1e-30: per-batch normalization plus the
+    # in-kernel init scaling must keep the panel algebra (which squares the
+    # matrix scale) finite, with the rank semantics invariant.
+    k = 768
+    scale = 10.0 ** log10_scale
+    generator = torch.Generator().manual_seed(k + log10_scale)
+    matrix = torch.randn(k, k, generator=generator, dtype=torch.float64)
+    matrix = ((matrix + matrix.mT) * scale).float().to(flag_gems.device)
+    rtol = k * torch.finfo(torch.float32).eps
+    reference = torch.linalg.matrix_rank(
+        matrix.cpu().double(), hermitian=True, rtol=rtol
+    )
+    result = flag_gems.linalg_matrix_rank(matrix, hermitian=True)
+    utils.gems_assert_equal(result, reference.to(flag_gems.device))
+
+
+@pytest.mark.linalg_matrix_rank
+@pytest.mark.skipif(IS_ASCEND, reason="Ascend backend has its own implementation")
+def test_linalg_matrix_rank_hermitian_blocked_critical_spectrum():
+    # An eigenvalue at relative 1e-4 from the threshold -- well above the
+    # fp32/DS32 noise floor but decisive for the Sturm count -- on a rotated
+    # (dense) blocked input; the CPU fp64 oracle arbitrates.
+    k = 1024
+    for delta, expected_rank in ((1e-4, 2), (-1e-4, 1)):
+        matrix = _blocked_rotated_spectrum(
+            k, [1.0, 0.5 * (1.0 + delta)], seed=int(delta * 1e8)
+        ).to(flag_gems.device)
+        reference = torch.linalg.matrix_rank(
+            matrix.cpu().double(), hermitian=True, atol=0.5, rtol=0.0
+        )
+        assert reference.item() == expected_rank  # construction sanity
+        result = flag_gems.linalg_matrix_rank(
+            matrix, hermitian=True, atol=0.5, rtol=0.0
+        )
+        utils.gems_assert_equal(result, reference.to(flag_gems.device))
+
+
+@pytest.mark.linalg_matrix_rank
+@pytest.mark.skipif(IS_ASCEND, reason="Ascend backend has its own implementation")
+def test_linalg_matrix_rank_hermitian_blocked_ds32(monkeypatch):
+    # Force the pure-FP32 double-single Sturm tail on the BLOCKED path: the
+    # panel factorization and the DS32 count must compose (the graph cache
+    # key includes ds32, so this cannot replay a native-FP64 graph).
+    module = importlib.import_module("flag_gems.ops.linalg_matrix_rank")
+    monkeypatch.setattr(module.runtime_device, "support_fp64", False)
+
+    k = 768
+    matrix = _blocked_rotated_spectrum(k, list(range(1, 101)), seed=0).to(
+        flag_gems.device
+    )
+    # Same fp32-default rtol as the dispatch test above.
+    rtol = k * torch.finfo(torch.float32).eps
+    reference = torch.linalg.matrix_rank(
+        matrix.cpu().double(), hermitian=True, rtol=rtol
+    )
+    assert reference.item() == 100  # construction sanity
+    result = flag_gems.linalg_matrix_rank(matrix, hermitian=True)
+    utils.gems_assert_equal(result, reference.to(flag_gems.device))
+
+
+@pytest.mark.linalg_matrix_rank
+@pytest.mark.skipif(IS_ASCEND, reason="Ascend backend has its own implementation")
+def test_linalg_matrix_rank_hermitian_blocked_batched():
+    # Batched blocked path: per-batch workspaces, scales and scratch slots
+    # must stay independent (batch 0 rank 50, batch 1 full rank).
+    k = 768
+    low_rank = _blocked_rotated_spectrum(k, list(range(1, 51)), seed=1)
+    generator = torch.Generator().manual_seed(2)
+    dense = torch.randn(k, k, generator=generator, dtype=torch.float64)
+    dense = (dense + dense.mT).float()
+    batch = torch.stack([low_rank, dense]).to(flag_gems.device)
+    reference = torch.linalg.matrix_rank(
+        batch.cpu().double(), hermitian=True, atol=5e-2
+    )
+    assert reference.tolist() == [50, k]  # construction sanity
+    result = flag_gems.linalg_matrix_rank(batch, hermitian=True, atol=5e-2)
+    utils.gems_assert_equal(result, reference.to(flag_gems.device))
+
+
+@pytest.mark.linalg_matrix_rank
+@pytest.mark.skipif(IS_ASCEND, reason="Ascend backend has its own implementation")
+def test_linalg_matrix_rank_hermitian_blocked_repeatable():
+    # The blocked kernels accumulate through atomics, so reduction ORDER is
+    # nondeterministic; the rank on a near-threshold input must still not
+    # flap across calls (first call captures the graph, the rest replay).
+    # The eigenvalue sits at relative 1e-4 from the threshold -- orders of
+    # magnitude above any ulp-level reordering noise.
+    k = 1024
+    matrix = _blocked_rotated_spectrum(k, [1.0, 0.5 * 1.0001], seed=3).to(
+        flag_gems.device
+    )
+    reference = torch.linalg.matrix_rank(
+        matrix.cpu().double(), hermitian=True, atol=0.5, rtol=0.0
+    )
+    assert reference.item() == 2  # construction sanity
+    for _ in range(20):
+        result = flag_gems.linalg_matrix_rank(
+            matrix, hermitian=True, atol=0.5, rtol=0.0
+        )
+        utils.gems_assert_equal(result, reference.to(flag_gems.device))
