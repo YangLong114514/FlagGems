@@ -162,12 +162,20 @@ def _mr_graph_cached(key, device, make_workspace, copy_in, run, copy_out):
     # Graph capture is a pure performance optimization, never a correctness
     # requirement.  Gate on the torch BUILD, not the vendor: ROCm-stack
     # builds (torch.version.hip set, torch.version.cuda empty -- this covers
-    # every HIP-compatible platform, not just AMD) hang capturing the large
-    # O(k) launch sequences, so graphs stay a genuine-CUDA-only fast path.
+    # every HIP-compatible platform, not just AMD) used to HANG capturing
+    # the large O(k) launch sequences, so graphs default to genuine-CUDA
+    # only.  A capture hang is not catchable in-process (it deadlocks the
+    # whole process), so HIP builds opt in explicitly with
+    # FLAGGEMS_MR_HIP_GRAPH=1 after validating their stack once (the
+    # current launch sequences capture+replay cleanly on the validated
+    # Hygon stack: torch 2.4.1 / hip 6.1).
     if (
         device.type != "cuda"
         or torch.version.cuda is None
-        or torch.version.hip is not None
+        or (
+            torch.version.hip is not None
+            and os.environ.get("FLAGGEMS_MR_HIP_GRAPH") != "1"
+        )
         or os.environ.get("FLAGGEMS_MR_NO_GRAPH") == "1"
     ):
         ws = make_workspace()

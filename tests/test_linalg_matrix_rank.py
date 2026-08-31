@@ -1906,3 +1906,42 @@ def test_linalg_matrix_rank_hermitian_blocked_repeatable():
             matrix, hermitian=True, atol=0.5, rtol=0.0
         )
         utils.gems_assert_equal(result, reference.to(flag_gems.device))
+
+
+@pytest.mark.linalg_matrix_rank
+@pytest.mark.skipif(IS_ASCEND, reason="Ascend backend has its own implementation")
+def test_linalg_matrix_rank_hip_graph_gate(monkeypatch):
+    # HIP-style builds (torch.version.hip set) default to NO graph capture
+    # (a capture hang deadlocks the process and is not catchable) and opt in
+    # via FLAGGEMS_MR_HIP_GRAPH=1 after stack validation.  Simulated on a
+    # genuine CUDA build by monkeypatching torch.version.hip, pinning both
+    # directions of the gate without HIP hardware.
+    if (
+        torch.device(flag_gems.device).type != "cuda"
+        or torch.version.cuda is None
+        or torch.version.hip is not None
+    ):
+        pytest.skip("genuine CUDA build required to simulate the HIP gate")
+    module = importlib.import_module("flag_gems.ops.linalg_matrix_rank")
+
+    matrix = torch.randn(65, 65).float()
+    matrix = (matrix + matrix.mT).to(flag_gems.device)
+    reference = torch.linalg.matrix_rank(matrix.cpu(), hermitian=True)
+
+    monkeypatch.setattr(torch.version, "hip", "6.1.0")  # simulate HIP build
+    # Default on HIP builds: direct launches, nothing captured.
+    module._MR_GRAPHS.clear()
+    module._MR_GRAPH_BYTES = 0
+    monkeypatch.delenv("FLAGGEMS_MR_HIP_GRAPH", raising=False)
+    result = flag_gems.linalg_matrix_rank(matrix, hermitian=True)
+    utils.gems_assert_equal(result, reference.to(flag_gems.device))
+    assert len(module._MR_GRAPHS) == 0
+
+    # Opt-in: capture happens, replay stays correct.
+    monkeypatch.setenv("FLAGGEMS_MR_HIP_GRAPH", "1")
+    result = flag_gems.linalg_matrix_rank(matrix, hermitian=True)
+    utils.gems_assert_equal(result, reference.to(flag_gems.device))
+    assert len(module._MR_GRAPHS) == 1
+    result = flag_gems.linalg_matrix_rank(matrix, hermitian=True)  # replay
+    utils.gems_assert_equal(result, reference.to(flag_gems.device))
+    assert len(module._MR_GRAPHS) == 1
