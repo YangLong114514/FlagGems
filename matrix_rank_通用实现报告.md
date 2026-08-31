@@ -133,17 +133,19 @@ eps·σmax，不是 Gram 矩阵方案的 √eps·σmax——附录 A.4 的选型
   者可能在另一张卡上）。
 - `FLAGGEMS_MR_NO_GRAPH=1` 可整体关闭。
 
-**门控按 torch 构建属性，不按 vendor**：只有 `torch.version.cuda` 非空且
-`torch.version.hip` 为空（真正的 NV CUDA 构建）才默认走图捕获。ROCm 软件栈的构建
+**门控**：图捕获对所有 GPU 构建默认开启（`device.type == "cuda"` 同时覆盖真 CUDA
+与 ROCm/HIP 栈）,`FLAGGEMS_MR_NO_GRAPH=1` 全局关闭；捕获失败一律回退直发，图只
+是性能优化、永远不是正确性前提。历史沿革：ROCm 软件栈的构建
 （`torch.version.hip` 非空，覆盖所有 HIP 兼容平台而非仅 AMD）曾在捕获 O(k) 大千节
 点图时挂死——海光实测卡死在 `bidiag-k513` 用例（512 列 × 6 kernel ≈ 3000+ 节点），
-该用例只是测试顺序上第一个触发该 shape 图捕获的，与零矩阵输入本身无关。**重构后复
-测（torch 2.4.1 / hip 6.1）：真实 matrix_rank 序列在海光上全规模捕获+replay 成功且
-结果正确，旧挂死已消失**；但挂死不可在进程内捕获（直接卡死），未验证的 HIP 栈
-（如沐曦）不能冒险，所以 HIP 构建默认仍关图，验证过的平台用
-`FLAGGEMS_MR_HIP_GRAPH=1` 显式开启（通用 opt-in，非 vendor 判断；有测试在真 CUDA
-上同时模拟 `hip` 置值 + `cuda` 置空两个版本串，双向 pin 住门控语义）。
-首版 opt-in 曾有一个门控 bug：条件链里 `torch.version.cuda is None` 在 HIP opt-in
+该用例只是测试顺序上第一个触发该 shape 图捕获的，与零矩阵输入本身无关。因此 HIP
+构建一度默认关图、用 `FLAGGEMS_MR_HIP_GRAPH=1` opt-in;**barrier-free 重构后复测
+（torch 2.4.1 / hip 6.1）：真实 matrix_rank 序列在海光上全规模捕获+replay 成功且
+结果正确，旧挂死已消失，开图后 benchmark 全 shape ≥1x（除一例待查），遂改为默
+认开图**。若某个未验证的 HIP 栈仍挂死，用 `FLAGGEMS_MR_NO_GRAPH=1` 兜底（挂死不
+可在进程内捕获，会直接卡死，这是唯一需要人工介入的场景）。门控语义有测试在真
+CUDA 上同时模拟 `hip` 置值 + `cuda` 置空两个版本串双向 pin 住。
+opt-in 时代曾有一个门控 bug：条件链里 `torch.version.cuda is None` 在 HIP opt-in
 判断**之前**就把 ROCm 构建挡死（ROCm 构建该值恒为 None)，导致 env var 形同虚设
 ——海光实测开图后性能纹丝不动、无异常无 warning，直接走直发分支。教训：多条件
 门控的每个分支都要在"完整模拟目标构建属性"的测试里 pin 住，只模拟一半
@@ -313,10 +315,11 @@ unblocked 路径每列做"reflector + 完整尾矩阵 GEMV + 完整尾矩阵对�
 - 修复（`d8904386`）：门控改为 torch 构建属性（见 2.4）。中途曾做过 runtime 能力位
   方案（改 VendorDescriptor/DeviceDetector 等后端文件），按维护要求回退
   （`6de6e1f9`），最终方案不动任何后端文件。
-- **复测与 opt-in 开图**：blocked WY 时代的序列与挂死时已完全不同，用分层探针复测
+- **复测与开图**：blocked WY 时代的序列与挂死时已完全不同，用分层探针复测
   （trivial kernel 3072 节点 OK → 真实 matrix_rank 序列 herm/bidiag k=65~1024 全部
   捕获+replay 正确），确认挂死消失；海光慢的真正原因是关图后每次调用 ~3000 次
-  launch × ~80µs。新增 `FLAGGEMS_MR_HIP_GRAPH=1` opt-in(2.4 节）。注意探针的一个
+  launch × ~80µs。先加过 `FLAGGEMS_MR_HIP_GRAPH=1` opt-in，验证有效后改为所有
+  GPU 构建默认开图（2.4 节）。注意探针的一个
   坑：不能在 import flag_gems 之前把 `torch.version.hip` 置 None——海光 Triton 的
   驱动探测依赖它，先置空会 "0 active drivers"；要先直发一次完成初始化再翻标志。
 - **开图后实测（torch 2.4.1 / hip 6.1）**：中段 shape 全面从 0.15~0.7x 回升到 1x
@@ -441,6 +444,7 @@ graph 捕获把 barrier-free 重构初期的 herm fp32 回归（0.17~0.45x）全
 | `245ec1e7` | blocked 路径改为端到端已知答案自测门控（3.3 节，探针被否定后） |
 | `aa0a2413` | HIP 构建图捕获 opt-in（`FLAGGEMS_MR_HIP_GRAPH=1`，2.4/3.1 节） |
 | `38322f2b` | 修复 opt-in 门控被 `cuda is None` 条件遮蔽（2.4 节） |
+| `dcb7971c` | HIP 构建改为默认开图，`FLAGGEMS_MR_NO_GRAPH=1` 兜底（2.4/3.1 节） |
 
 ---
 
