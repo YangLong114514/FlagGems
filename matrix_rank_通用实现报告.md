@@ -362,6 +362,12 @@ blocked WY 上线后天数回归出现 12 例失败，分三类：
    比 blocked/unblocked 的 D/E 发散下标并独立对照 rank2k kernel 与 torch 参考；输
    出可区分"面板内相位误编译"与"rank2k/tl.dot 误编译"，拿到结果后可做针对性修
    复、拿掉回退。
+   **定位结论（天数实测）**:D/E 从 idx 33 起发散（panel 1 第 1 列，即 panel 0 的
+   尾随 rank-2k 更新之后），max|ΔD|≈62.8、max|ΔE|≈108.9;rank2k kernel 独立对
+   照 torch 参考已不符（max abs diff 0.0415，参考量级 7.36，相对误差 ~5.6e-3,
+   TF32 级）。即根因是 **rank2k 尾随更新 kernel 在天数 Triton 后端被误编译/降精
+   度**，面板内因式分解（pcol/pmat/pfin）本身无恙；自测门控正确拦截并回退
+   unblocked,10 例用例全部转绿。
 2. **graph_key_includes_ds32 前提不成立（测试缺陷）**：该测试假设"先捕获
    native-FP64 图、切能力位后再捕获 ds32 图"，但天数天生 `support_fp64=False`，第
    一次捕获就是 ds32,`key[4] is False` 的断言在无 FP64 设备上必然失败。加
