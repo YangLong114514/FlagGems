@@ -160,23 +160,18 @@ def _mr_graph_cached(key, device, make_workspace, copy_in, run, copy_out):
     # the live inputs, run(ws) is the pure launch sequence, copy_out(ws)
     # publishes the result.
     # Graph capture is a pure performance optimization, never a correctness
-    # requirement.  Gate on the torch BUILD, not the vendor: ROCm-stack
-    # builds (torch.version.hip set, torch.version.cuda empty -- this covers
-    # every HIP-compatible platform, not just AMD) used to HANG capturing
-    # the large O(k) launch sequences, so graphs default to genuine-CUDA
-    # only.  A capture hang is not catchable in-process (it deadlocks the
-    # whole process), so HIP builds opt in explicitly with
-    # FLAGGEMS_MR_HIP_GRAPH=1 after validating their stack once (the
-    # current launch sequences capture+replay cleanly on the validated
-    # Hygon stack: torch 2.4.1 / hip 6.1).
-    cuda_build = torch.version.cuda is not None
-    hip_opt_in = (
-        torch.version.hip is not None
-        and os.environ.get("FLAGGEMS_MR_HIP_GRAPH") == "1"
-    )
+    # requirement: any capture failure falls back to direct launches, and
+    # FLAGGEMS_MR_NO_GRAPH=1 disables graphs entirely.  Capture is attempted
+    # on every GPU build (device.type == "cuda" covers both genuine CUDA and
+    # ROCm/HIP stacks).  Historical note: ROCm-stack builds once HANG
+    # capturing the old multi-thousand-node sequences (a hang deadlocks the
+    # process and is not catchable), so HIP builds were gated behind an
+    # opt-in env var; the barrier-free redesign shrank the graphs and the
+    # current sequences capture+replay cleanly on the validated Hygon stack
+    # (torch 2.4.1 / hip 6.1), so graphs are now on by default everywhere.
+    # If an unvalidated HIP stack still hangs, set FLAGGEMS_MR_NO_GRAPH=1.
     if (
         device.type != "cuda"
-        or (not cuda_build and not hip_opt_in)
         or os.environ.get("FLAGGEMS_MR_NO_GRAPH") == "1"
     ):
         ws = make_workspace()

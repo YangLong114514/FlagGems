@@ -1911,13 +1911,12 @@ def test_linalg_matrix_rank_hermitian_blocked_repeatable():
 @pytest.mark.linalg_matrix_rank
 @pytest.mark.skipif(IS_ASCEND, reason="Ascend backend has its own implementation")
 def test_linalg_matrix_rank_hip_graph_gate(monkeypatch):
-    # HIP-style builds (torch.version.hip set, torch.version.cuda empty)
-    # default to NO graph capture (a capture hang deadlocks the process and
-    # is not catchable) and opt in via FLAGGEMS_MR_HIP_GRAPH=1 after stack
-    # validation.  Simulated on a genuine CUDA build by monkeypatching BOTH
-    # version strings (hip alone would not exercise the cuda-is-None branch
-    # that real ROCm builds hit), pinning both directions of the gate
-    # without HIP hardware.
+    # Graph capture is ON by default on every GPU build -- including
+    # HIP-style builds (torch.version.hip set, torch.version.cuda empty) --
+    # and FLAGGEMS_MR_NO_GRAPH=1 is the global kill switch.  Simulated on a
+    # genuine CUDA build by monkeypatching BOTH version strings (hip alone
+    # would not exercise the cuda-is-None branch that real ROCm builds
+    # hit), pinning both directions of the gate without HIP hardware.
     if (
         torch.device(flag_gems.device).type != "cuda"
         or torch.version.cuda is None
@@ -1933,19 +1932,22 @@ def test_linalg_matrix_rank_hip_graph_gate(monkeypatch):
     # Simulate an ROCm-stack build: hip set AND cuda empty.
     monkeypatch.setattr(torch.version, "hip", "6.1.0")
     monkeypatch.setattr(torch.version, "cuda", None)
-    # Default on HIP builds: direct launches, nothing captured.
+    monkeypatch.delenv("FLAGGEMS_MR_NO_GRAPH", raising=False)
+
+    # Default on HIP builds: capture happens, replay stays correct.
     module._MR_GRAPHS.clear()
     module._MR_GRAPH_BYTES = 0
-    monkeypatch.delenv("FLAGGEMS_MR_HIP_GRAPH", raising=False)
-    result = flag_gems.linalg_matrix_rank(matrix, hermitian=True)
-    utils.gems_assert_equal(result, reference.to(flag_gems.device))
-    assert len(module._MR_GRAPHS) == 0
-
-    # Opt-in: capture happens, replay stays correct.
-    monkeypatch.setenv("FLAGGEMS_MR_HIP_GRAPH", "1")
     result = flag_gems.linalg_matrix_rank(matrix, hermitian=True)
     utils.gems_assert_equal(result, reference.to(flag_gems.device))
     assert len(module._MR_GRAPHS) == 1
     result = flag_gems.linalg_matrix_rank(matrix, hermitian=True)  # replay
     utils.gems_assert_equal(result, reference.to(flag_gems.device))
     assert len(module._MR_GRAPHS) == 1
+
+    # Kill switch: direct launches, nothing captured.
+    module._MR_GRAPHS.clear()
+    module._MR_GRAPH_BYTES = 0
+    monkeypatch.setenv("FLAGGEMS_MR_NO_GRAPH", "1")
+    result = flag_gems.linalg_matrix_rank(matrix, hermitian=True)
+    utils.gems_assert_equal(result, reference.to(flag_gems.device))
+    assert len(module._MR_GRAPHS) == 0
