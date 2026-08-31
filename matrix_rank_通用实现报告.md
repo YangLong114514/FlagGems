@@ -142,7 +142,12 @@ eps·σmax，不是 Gram 矩阵方案的 √eps·σmax——附录 A.4 的选型
 结果正确，旧挂死已消失**；但挂死不可在进程内捕获（直接卡死），未验证的 HIP 栈
 （如沐曦）不能冒险，所以 HIP 构建默认仍关图，验证过的平台用
 `FLAGGEMS_MR_HIP_GRAPH=1` 显式开启（通用 opt-in，非 vendor 判断；有测试在真 CUDA
-上模拟 HIP 标志双向 pin 住门控语义）。
+上同时模拟 `hip` 置值 + `cuda` 置空两个版本串，双向 pin 住门控语义）。
+首版 opt-in 曾有一个门控 bug：条件链里 `torch.version.cuda is None` 在 HIP opt-in
+判断**之前**就把 ROCm 构建挡死（ROCm 构建该值恒为 None)，导致 env var 形同虚设
+——海光实测开图后性能纹丝不动、无异常无 warning，直接走直发分支。教训：多条件
+门控的每个分支都要在"完整模拟目标构建属性"的测试里 pin 住，只模拟一半
+（hip 置值但 cuda 非空）会让测试给出虚假信心。
 
 海光 launch 开销实测（无图时的瓶颈构成）：torch 原生 enqueue ~7µs、裸 Triton 空
 kernel ~27µs、libentry 包装 +1.4µs、真实 matrix_rank kernel(10~15 个参数逐个处
@@ -429,6 +434,7 @@ graph 捕获把 barrier-free 重构初期的 herm fp32 回归（0.17~0.45x）全
 | `8c487aa7` | tl.dot IEEE fp32 探针门控 blocked 路径 + 测试可移植性修复（3.3 节） |
 | `245ec1e7` | blocked 路径改为端到端已知答案自测门控（3.3 节，探针被否定后） |
 | `aa0a2413` | HIP 构建图捕获 opt-in（`FLAGGEMS_MR_HIP_GRAPH=1`，2.4/3.1 节） |
+| `38322f2b` | 修复 opt-in 门控被 `cuda is None` 条件遮蔽（2.4 节） |
 
 ---
 
