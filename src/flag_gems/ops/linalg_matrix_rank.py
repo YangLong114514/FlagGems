@@ -169,13 +169,14 @@ def _mr_graph_cached(key, device, make_workspace, copy_in, run, copy_out):
     # FLAGGEMS_MR_HIP_GRAPH=1 after validating their stack once (the
     # current launch sequences capture+replay cleanly on the validated
     # Hygon stack: torch 2.4.1 / hip 6.1).
+    cuda_build = torch.version.cuda is not None
+    hip_opt_in = (
+        torch.version.hip is not None
+        and os.environ.get("FLAGGEMS_MR_HIP_GRAPH") == "1"
+    )
     if (
         device.type != "cuda"
-        or torch.version.cuda is None
-        or (
-            torch.version.hip is not None
-            and os.environ.get("FLAGGEMS_MR_HIP_GRAPH") != "1"
-        )
+        or (not cuda_build and not hip_opt_in)
         or os.environ.get("FLAGGEMS_MR_NO_GRAPH") == "1"
     ):
         ws = make_workspace()

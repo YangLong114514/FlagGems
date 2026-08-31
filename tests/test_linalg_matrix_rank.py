@@ -1911,11 +1911,13 @@ def test_linalg_matrix_rank_hermitian_blocked_repeatable():
 @pytest.mark.linalg_matrix_rank
 @pytest.mark.skipif(IS_ASCEND, reason="Ascend backend has its own implementation")
 def test_linalg_matrix_rank_hip_graph_gate(monkeypatch):
-    # HIP-style builds (torch.version.hip set) default to NO graph capture
-    # (a capture hang deadlocks the process and is not catchable) and opt in
-    # via FLAGGEMS_MR_HIP_GRAPH=1 after stack validation.  Simulated on a
-    # genuine CUDA build by monkeypatching torch.version.hip, pinning both
-    # directions of the gate without HIP hardware.
+    # HIP-style builds (torch.version.hip set, torch.version.cuda empty)
+    # default to NO graph capture (a capture hang deadlocks the process and
+    # is not catchable) and opt in via FLAGGEMS_MR_HIP_GRAPH=1 after stack
+    # validation.  Simulated on a genuine CUDA build by monkeypatching BOTH
+    # version strings (hip alone would not exercise the cuda-is-None branch
+    # that real ROCm builds hit), pinning both directions of the gate
+    # without HIP hardware.
     if (
         torch.device(flag_gems.device).type != "cuda"
         or torch.version.cuda is None
@@ -1928,7 +1930,9 @@ def test_linalg_matrix_rank_hip_graph_gate(monkeypatch):
     matrix = (matrix + matrix.mT).to(flag_gems.device)
     reference = torch.linalg.matrix_rank(matrix.cpu(), hermitian=True)
 
-    monkeypatch.setattr(torch.version, "hip", "6.1.0")  # simulate HIP build
+    # Simulate an ROCm-stack build: hip set AND cuda empty.
+    monkeypatch.setattr(torch.version, "hip", "6.1.0")
+    monkeypatch.setattr(torch.version, "cuda", None)
     # Default on HIP builds: direct launches, nothing captured.
     module._MR_GRAPHS.clear()
     module._MR_GRAPH_BYTES = 0
