@@ -319,6 +319,12 @@ unblocked 路径每列做"reflector + 完整尾矩阵 GEMV + 完整尾矩阵对�
   launch × ~80µs。新增 `FLAGGEMS_MR_HIP_GRAPH=1` opt-in(2.4 节）。注意探针的一个
   坑：不能在 import flag_gems 之前把 `torch.version.hip` 置 None——海光 Triton 的
   驱动探测依赖它，先置空会 "0 active drivers"；要先直发一次完成初始化再翻标志。
+- **开图后实测（torch 2.4.1 / hip 6.1）**：中段 shape 全面从 0.15~0.7x 回升到 1x
+  以上——herm fp32 33×33 0.153→2.05x、256×256 0.479→8.20x、1024×1024
+  0.821→8.26x;bidiag fp32 512×512 0.471→6.27x、1024×1024 0.924→1.44x;fp64
+  同族同步提升（herm 1024×1024 13.7x)。全 benchmark 仅 fp64 (16,512) 仍 0.173x
+  （疑似该 shape 图未捕获，待查）。torch baseline 本轮个别 shape 波动大（机器干
+  扰），但 Gems 绝对延迟实打实下降（herm 1024 fp32 325ms→32ms)，结论不受影响。
 
 ### 3.2 天数智芯：26 个测试失败 → 0
 
