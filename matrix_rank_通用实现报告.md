@@ -134,10 +134,20 @@ eps·σmax，不是 Gram 矩阵方案的 √eps·σmax——附录 A.4 的选型
 - `FLAGGEMS_MR_NO_GRAPH=1` 可整体关闭。
 
 **门控按 torch 构建属性，不按 vendor**：只有 `torch.version.cuda` 非空且
-`torch.version.hip` 为空（真正的 NV CUDA 构建）才走图捕获。ROCm 软件栈的构建
-（`torch.version.hip` 非空，覆盖所有 HIP 兼容平台而非仅 AMD）在捕获 O(k) 大千节点
-图时会挂死——海光实测卡死在 `bidiag-k513` 用例（512 列 × 6 kernel ≈ 3000+ 节点），
-该用例只是测试顺序上第一个触发该 shape 图捕获的，与零矩阵输入本身无关。
+`torch.version.hip` 为空（真正的 NV CUDA 构建）才默认走图捕获。ROCm 软件栈的构建
+（`torch.version.hip` 非空，覆盖所有 HIP 兼容平台而非仅 AMD）曾在捕获 O(k) 大千节
+点图时挂死——海光实测卡死在 `bidiag-k513` 用例（512 列 × 6 kernel ≈ 3000+ 节点），
+该用例只是测试顺序上第一个触发该 shape 图捕获的，与零矩阵输入本身无关。**重构后复
+测（torch 2.4.1 / hip 6.1）：真实 matrix_rank 序列在海光上全规模捕获+replay 成功且
+结果正确，旧挂死已消失**；但挂死不可在进程内捕获（直接卡死），未验证的 HIP 栈
+（如沐曦）不能冒险，所以 HIP 构建默认仍关图，验证过的平台用
+`FLAGGEMS_MR_HIP_GRAPH=1` 显式开启（通用 opt-in，非 vendor 判断；有测试在真 CUDA
+上模拟 HIP 标志双向 pin 住门控语义）。
+
+海光 launch 开销实测（无图时的瓶颈构成）：torch 原生 enqueue ~7µs、裸 Triton 空
+kernel ~27µs、libentry 包装 +1.4µs、真实 matrix_rank kernel(10~15 个参数逐个处
+理）~75-85µs——分解路径完全 host launch-bound，大头在他们栈的 Triton Python
+launcher,wrapper 可削空间很小；有效杠杆只有减 launch 数或开图。
 
 ### 2.5 数值稳健性补强
 
@@ -298,6 +308,12 @@ unblocked 路径每列做"reflector + 完整尾矩阵 GEMV + 完整尾矩阵对�
 - 修复（`d8904386`）：门控改为 torch 构建属性（见 2.4）。中途曾做过 runtime 能力位
   方案（改 VendorDescriptor/DeviceDetector 等后端文件），按维护要求回退
   （`6de6e1f9`），最终方案不动任何后端文件。
+- **复测与 opt-in 开图**：blocked WY 时代的序列与挂死时已完全不同，用分层探针复测
+  （trivial kernel 3072 节点 OK → 真实 matrix_rank 序列 herm/bidiag k=65~1024 全部
+  捕获+replay 正确），确认挂死消失；海光慢的真正原因是关图后每次调用 ~3000 次
+  launch × ~80µs。新增 `FLAGGEMS_MR_HIP_GRAPH=1` opt-in(2.4 节）。注意探针的一个
+  坑：不能在 import flag_gems 之前把 `torch.version.hip` 置 None——海光 Triton 的
+  驱动探测依赖它，先置空会 "0 active drivers"；要先直发一次完成初始化再翻标志。
 
 ### 3.2 天数智芯：26 个测试失败 → 0
 
@@ -405,6 +421,8 @@ graph 捕获把 barrier-free 重构初期的 herm fp32 回归（0.17~0.45x）全
 | `9f1a1573` | workspace 精简 + 图缓存字节 LRU + rank2k 半矩阵 + 图内核内缩放（2.4/2.7/2.8 节） |
 | `89e11edd` | blocked WY 路径 13 个正确性用例（2.8 节） |
 | `8c487aa7` | tl.dot IEEE fp32 探针门控 blocked 路径 + 测试可移植性修复（3.3 节） |
+| `245ec1e7` | blocked 路径改为端到端已知答案自测门控（3.3 节，探针被否定后） |
+| `aa0a2413` | HIP 构建图捕获 opt-in（`FLAGGEMS_MR_HIP_GRAPH=1`，2.4/3.1 节） |
 
 ---
 
