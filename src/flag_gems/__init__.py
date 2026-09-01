@@ -744,6 +744,8 @@ _FULL_CONFIG = (
         linalg_matrix_sqrth_out,
         lambda: torch_ge("2.15.0.dev20260627"),
     ),
+    ("linalg_norm", linalg_norm),
+    ("linalg_norm.ord_str", linalg_norm),
     ("linalg_slogdet", linalg_slogdet),
     ("linalg_solve_triangular", linalg_solve_triangular),
     ("linalg_solve_triangular.out", linalg_solve_triangular_out),
