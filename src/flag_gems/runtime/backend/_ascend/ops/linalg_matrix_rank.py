@@ -1782,7 +1782,12 @@ def _mr_rrqr_init_kernel(
     lr = tl.arange(0, 64)
     a_base = A + b * M * N
     wbase = W + b * WPITCH
-    RB = RS // 64
+    # Iterate only the tiles containing valid rows.  The bidiag/tridiag
+    # workspaces pad RS with one extra slack tile for unmasked tile
+    # addressing; those rows start as zeros (torch.zeros workspace), are
+    # never read after the step kernels' own slack trimming, and must not
+    # be written here either.
+    RB = (ROWS + 63) // 64
     nacc = tl.zeros((64,), dtype=tl.float32)
     for rb in tl.range(0, RB):
         rr = rb * 64 + lr
@@ -2354,7 +2359,7 @@ def _launch_rrqr_rank(    matrix, atol_tensor, rtol_tensor, out, m, n, k, rows, 
 # Launcher
 # ---------------------------------------------------------------------------
 @triton.jit
-def _mr_bidiag_lstep_kernel(W, V, D, TAU, ACC, J, K, RS, WPITCH, APITCH):
+def _mr_bidiag_lstep_kernel(W, V, D, TAU, ACC, J, K, RS, WPITCH, APITCH, RBV):
     pid = tl.program_id(0)
     wbase = W + pid * WPITCH
     lr = tl.arange(0, 64)
@@ -2364,7 +2369,10 @@ def _mr_bidiag_lstep_kernel(W, V, D, TAU, ACC, J, K, RS, WPITCH, APITCH):
     # provisionally while accumulating the norm, then overwrite the pivot
     # element with x0 - alpha afterwards (stores only -- no read-back, so
     # the MTE3/MTE2 ordering hazard does not apply).
-    for rb in tl.range(J // 64, RS // 64):
+    # RBV = cdiv(rows, 64) trims the padded/slack tail tiles: they are
+    # zeros by construction, contribute nothing to the norm, and the
+    # reflector entries there are never read.
+    for rb in tl.range(J // 64, RBV):
         r0 = rb * 64
         ch = tl.load(wbase + J * RS + r0 + lr)
         ch = ch * ((r0 + lr) >= J).to(tl.float32)
@@ -2965,6 +2973,11 @@ def _bidiag_run(ws, matrix, atol_tensor, rtol_tensor, m, n, k, rows,
     )
     nrc_full = (rs - 64) // 64
     ncc_full = (kp - 64) // 64
+    # Valid row tiles = cdiv(rows, 64); the workspace rs carries one extra
+    # slack tile (for unmasked addressing) plus up to 63 pad rows, all zeros
+    # forever, so iterating them in the step/mat/apply kernels is pure waste
+    # (for near-square 129^2 it doubles the right-side tile count).
+    rbv = (rows + 63) // 64
     for j in range(k):
         ntl = triton.cdiv(k - 1 - j, 64)
         # trim the matvec/apply grids to the trailing block: v/u are zero
@@ -2974,7 +2987,7 @@ def _bidiag_run(ws, matrix, atol_tensor, rtol_tensor, m, n, k, rows,
         nrct = nrc_full - rb0
         _fast_launch(
             _mr_bidiag_lstep_kernel, (batch_count,),
-            W, V, dbuf, taul, acc, j, k, rs, wpitch, kp,
+            W, V, dbuf, taul, acc, j, k, rs, wpitch, kp, rbv,
             num_warps=4, num_stages=1,
         )
         if ntl > 0:
@@ -2989,7 +3002,8 @@ def _bidiag_run(ws, matrix, atol_tensor, rtol_tensor, m, n, k, rows,
                 num_warps=4, num_stages=1,
             )
         if j + 1 < k:
-            ntr = triton.cdiv(rs - 1 - j, 64)
+            # valid row tiles only (see rbv above): rows j+1 .. rows-1
+            ntr = triton.cdiv(rows - 1 - j, 64)
             cc0 = (j + 1) // 64
             ncct = ncc_full - cc0
             _fast_launch(
