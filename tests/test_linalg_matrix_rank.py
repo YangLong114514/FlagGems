@@ -112,13 +112,14 @@ def _native_matrix_rank(matrix, **kwargs):
         for name, value in kwargs.items()
     }
 
-    # HGGC does not provide cusolverDnXsyevBatched_bufferSize.  Keep native
-    # PyTorch as the oracle on THead, but compute batched Hermitian references
-    # on CPU so the FlagGems device implementation can still be exercised.
+    # THead's device-side Hermitian solver is not a reliable correctness
+    # oracle: batched inputs may hit an unsupported syev entry point, while
+    # single rank-deficient matrices can miscount repeated zero eigenvalues.
+    # Compute every Hermitian reference on CPU so the FlagGems device
+    # implementation can still be exercised against native PyTorch semantics.
     if (
         IS_THEAD
         and kwargs.get("hermitian", False)
-        and ref_matrix.ndim > 2
         and ref_matrix.device.type != "cpu"
     ):
         cpu_kwargs = {
