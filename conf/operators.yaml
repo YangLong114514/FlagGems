@@ -7411,6 +7411,17 @@ ops:
   - LinearAlg
   stages:
   - alpha: '5.4'
+- id: linalg_matrix_rank
+  description: |
+    Computes the numerical rank of a matrix or a batch of matrices.
+  for:
+  - linalg_matrix_rank
+  labels:
+  - aten
+  kind:
+  - LinearAlg
+  stages:
+  - alpha: '5.4'
 - id: linalg_matrix_sqrth
   description: Computes the principal square root of a symmetric or Hermitian positive-definite
     matrix.
