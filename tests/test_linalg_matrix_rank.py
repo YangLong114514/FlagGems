@@ -848,7 +848,7 @@ def test_linalg_matrix_rank_rejects_complex_tolerance():
 @pytest.mark.linalg_matrix_rank
 @pytest.mark.skipif(
     not IS_ASCEND,
-    reason="FLAGGEMS_MR_EXACT_PATH is specific to the Ascend backend",
+    reason="exact-path coverage is specific to the Ascend backend",
 )
 @pytest.mark.parametrize(
     "shape,rank,hermitian",
@@ -874,10 +874,10 @@ def test_linalg_matrix_rank_exact_path(shape, rank, hermitian, monkeypatch):
     # geometrically down to 1e-4) are where the Gram path overestimates
     # rank (sigma^2 domain) and the unpivoted QR miscounts near the
     # tolerance (|R_ii| != sigma_i); the exact path must match an fp64
-    # reference with fp32-semantics tolerance exactly.  The legacy
-    # FLAGGEMS_MR_EXACT_PATH pin is redundant (no longer read) but kept
-    # for explicitness.
-    monkeypatch.setenv("FLAGGEMS_MR_EXACT_PATH", "1")
+    # reference with fp32-semantics tolerance exactly.  Clear any FAST_PATH
+    # leftover from the environment so the test really pins the exact
+    # (default) dispatch.
+    monkeypatch.delenv("FLAGGEMS_MR_FAST_PATH", raising=False)
     generator = torch.Generator().manual_seed(2026)
     *batch, m, n = shape
     if hermitian:
@@ -910,6 +910,84 @@ def test_linalg_matrix_rank_exact_path(shape, rank, hermitian, monkeypatch):
     result = flag_gems.linalg_matrix_rank(matrix, hermitian=hermitian)
     _assert_output_metadata(result, matrix)
     utils.gems_assert_equal(result, reference.to(device=matrix.device))
+
+
+@pytest.mark.linalg_matrix_rank
+@pytest.mark.skipif(not IS_ASCEND, reason="Ascend-specific dispatch coverage")
+def test_linalg_matrix_rank_fast_path_dispatch(monkeypatch):
+    # FLAGGEMS_MR_FAST_PATH=1 dispatch coverage: spy on the four band
+    # launchers to record which path each shape takes.  Spying at the
+    # launcher level (instead of relying on the fast path producing a
+    # wrong result) keeps the test deterministic -- the fast paths are
+    # exact on the clear random spectra used here.
+    mod = importlib.import_module(flag_gems.linalg_matrix_rank.__module__)
+    calls = []
+
+    def _spy(name):
+        orig = getattr(mod, name)
+
+        def wrapper(*args, **kwargs):
+            calls.append(name)
+            return orig(*args, **kwargs)
+
+        return wrapper
+
+    for name in (
+        "_launch_longdim_rank",  # exact long-dimension k <= 64 (QR compress)
+        "_launch_rrqr_rank",  # fast 65..255 unpivoted QR
+        "_launch_bidiag_rank",  # exact general k > 64
+        "_launch_tridiag_big_rank",  # exact hermitian k > 64
+    ):
+        monkeypatch.setattr(mod, name, _spy(name))
+
+    generator = torch.Generator().manual_seed(2027)
+    dev = flag_gems.device
+
+    def run(shape, hermitian=False, tensor_tol=False):
+        calls.clear()
+        a = torch.randn(*shape, generator=generator, dtype=torch.float32)
+        if hermitian:
+            a = a + a.mT
+        a = a.to(dev)
+        kwargs = {}
+        if tensor_tol:
+            # atol must broadcast to the batch shape; a non-batched input
+            # needs a 0-D tensor.
+            kwargs["atol"] = torch.zeros(a.shape[:-2], device=dev)
+        got = flag_gems.linalg_matrix_rank(a, hermitian=hermitian, **kwargs)
+        # Clear spectra: both modes must agree with the reference; this
+        # test pins the DISPATCH, not a fast-path inaccuracy.
+        ref = torch.linalg.matrix_rank(a.cpu(), hermitian=hermitian)
+        assert torch.equal(got.cpu(), ref)
+        return list(calls)
+
+    # --- default (exact) dispatch ---
+    monkeypatch.delenv("FLAGGEMS_MR_FAST_PATH", raising=False)
+    assert run((256, 64)) == ["_launch_longdim_rank"]
+    assert run((64, 64)) == []  # square k <= 64: bidiag64 inline, unaffected
+    assert run((65, 65)) == ["_launch_bidiag_rank"]
+    assert run((255, 255)) == ["_launch_bidiag_rank"]
+    assert run((256, 256)) == ["_launch_bidiag_rank"]
+    assert run((65, 65), hermitian=True) == ["_launch_tridiag_big_rank"]
+    assert run((2, 65, 65)) == ["_launch_bidiag_rank"]  # batch
+
+    # --- fast opt-in ---
+    monkeypatch.setenv("FLAGGEMS_MR_FAST_PATH", "1")
+    assert run((256, 64)) == []  # long-dim k <= 64: Gram inline
+    assert run((64, 64)) == []  # square k <= 64: still unaffected
+    assert run((65, 65)) == ["_launch_rrqr_rank"]
+    assert run((255, 255)) == ["_launch_rrqr_rank"]
+    assert run((256, 256)) == ["_launch_bidiag_rank"]  # k >= 256 stays exact
+    assert run((65, 65), hermitian=True) == ["_launch_rrqr_rank"]
+    assert run((65, 65), tensor_tol=True) == ["_launch_rrqr_rank"]
+
+    # --- runtime switching in one process (the env is read per call) ---
+    monkeypatch.delenv("FLAGGEMS_MR_FAST_PATH", raising=False)
+    assert run((65, 65)) == ["_launch_bidiag_rank"]
+    monkeypatch.setenv("FLAGGEMS_MR_FAST_PATH", "1")
+    assert run((65, 65)) == ["_launch_rrqr_rank"]
+    monkeypatch.delenv("FLAGGEMS_MR_FAST_PATH", raising=False)
+    assert run((65, 65)) == ["_launch_bidiag_rank"]
 
 
 @pytest.mark.linalg_matrix_rank
@@ -990,11 +1068,10 @@ def test_linalg_matrix_rank_nonsquare_lowrank(dtype, shape, rank):
 @pytest.mark.parametrize("k", [3, 33, 65, 128, 257] if IS_ASCEND else [33, 65, 128, 257])
 def test_linalg_matrix_rank_hermitian_strict_threshold(k, monkeypatch):
     # The exact herm paths are the default dispatch (the 65..255 fast
-    # unpivoted-QR band is opt-in via FLAGGEMS_MR_FAST_PATH=1); the legacy
-    # FLAGGEMS_MR_EXACT_PATH pin is redundant but kept for explicitness.
-    # The strict-threshold semantics live in the fused/padded/tridiag
-    # Sturm counters exercised here.
-    monkeypatch.setenv("FLAGGEMS_MR_EXACT_PATH", "1")
+    # unpivoted-QR band is opt-in via FLAGGEMS_MR_FAST_PATH=1); clear any
+    # FAST_PATH leftover so the strict-threshold cases really run the
+    # fused/padded/tridiag Sturm counters exercised here.
+    monkeypatch.delenv("FLAGGEMS_MR_FAST_PATH", raising=False)
     # torch's hermitian semantics are STRICT: rank = #{|lambda| > tol}
     # = #{lambda > tol} + #{lambda < -tol}.  The Sturm qd zero-pivot guard
     # counts #{lambda <= x}, so the positive side K - #{<= tol} is already
@@ -1185,14 +1262,14 @@ def test_linalg_matrix_rank_negative_tolerances(k, hermitian):
 @pytest.mark.parametrize("shape", [(129, 64), (64, 129), (192, 64), (64, 192)])
 def test_linalg_matrix_rank_longdim_exact_power2_nb(shape, monkeypatch):
     # Long-dimension k <= 64 QR-compresses to the k x k R factor with the
-    # register panel kernel (default since the exact-path flip; the legacy
-    # FLAGGEMS_MR_EXACT_PATH pin is redundant but kept for explicitness);
-    # for these shapes
+    # register panel kernel (default since the exact-path flip; clear any
+    # FAST_PATH leftover so the register panel is really exercised); for
+    # these shapes
     # rs = round_up(max(m, n), 64) = 192, and a raw NB = rs // 64 = 3
     # specialization is a marginal UB allocation that flip-flops between
     # fitting and "ub overflow" across compiles.  The launcher must clamp NB
     # to {1, 2, 4} (same as the main QR launcher).
-    monkeypatch.setenv("FLAGGEMS_MR_EXACT_PATH", "1")
+    monkeypatch.delenv("FLAGGEMS_MR_FAST_PATH", raising=False)
     m, n = shape
     rank = 17
     generator = torch.Generator().manual_seed(2026)
@@ -1219,7 +1296,9 @@ def test_linalg_matrix_rank_longdim_exact_power2_nb(shape, monkeypatch):
 def test_linalg_matrix_rank_hermitian_deflated_spectrum(
     k, expect_rank, monkeypatch
 ):
-    monkeypatch.setenv("FLAGGEMS_MR_EXACT_PATH", "1")
+    # Exact paths are the default; clear any FAST_PATH leftover so the
+    # large one-sided tridiagonalization path is really exercised.
+    monkeypatch.delenv("FLAGGEMS_MR_FAST_PATH", raising=False)
     # Strongly deflated spectra (a few significant eigenvalues, the rest at
     # the fp32 noise floor) drive the trailing subdiagonal to ~1e-10, where
     # tau = 2/vnorm2 ~ 1e20 and a naively grouped (tau*tau)*(v'w)/2

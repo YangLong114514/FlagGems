@@ -1299,3 +1299,14 @@ QR+GK(R) 比 default 和 exact **都慢**。原因:46% 的 FLOP 论证在本硬�
 - 官方套件(新默认分发,未设任何 env):**130 passed / 44 skipped**(sweep 文件 38 例默认 skip + fp64/complex 环境跳过),0 失败。
 - sweeps 3/3:366 例全路径扫描在**新默认(全精确)分发**下复跑通过;单独核对 50 个长维 k≤64 与 (3,3)/(7,7) 的 lowrank 用例 0 失配(Gram 地板消失);herm 压力 34/34、QR 频段对抗 22/22(env 冗余固定,语义不变)。
 - `python -m py_compile` 通过;`git diff --check` 通过。
+
+## 4. 评审驱动的测试闭环(第二轮评审,四点)
+
+第十二阶段的分发反转经评审确认逻辑正确(无路径选反、无 64/65/255/256 边界错误、NPUGraph 缓存不混模式),但测试闭环存在四个缺口,本轮全部修复:
+
+1. **失效的 EXACT env 造成"已固定精确路径"的错觉**:算子代码已不再读取 `FLAGGEMS_MR_EXACT_PATH`,但多处测试仍 `setenv` 它,且没有清除环境中可能残留的 `FLAGGEMS_MR_FAST_PATH`——若外部环境残留 FAST_PATH=1,这些名为 exact 的用例会实际运行快速路径。修复:6 处 `setenv(EXACT)` 全部删除并替换为 `monkeypatch.delenv("FLAGGEMS_MR_FAST_PATH", raising=False)`(主测试文件 4 处 + sweeps 2 处)。
+2. **366 扫描的共享 allow-list 掩盖默认路径回归**:原 allow-list 把长维 Gram 失配与 (3,3)/(7,7) 噪声区混在一起,默认分发若被错误改回 Gram 也能通过。修复:拆成 `test_sweep_all_paths_366_exact_default`(delenv FAST;只允许 (3,3)/(7,7) 噪声区失配,**长维 lowrank 全过被锁死**)与 `test_sweep_all_paths_366_fast_mode`(setenv FAST;Gram 地板 allow-list 单独管理)两个测试,共享 `_run_all_paths_sweep()` helper(新增 `assert total == 366` 锁覆盖率)。
+3. **快速模式零自动化覆盖**:新增 `test_linalg_matrix_rank_fast_path_dispatch`,monkeypatch 四个频段 launcher(`_launch_longdim_rank` / `_launch_rrqr_rank` / `_launch_bidiag_rank` / `_launch_tridiag_big_rank`)记录实际分发,而不是依赖快速路径产生错误结果(清晰谱上快速路径也是对的)。覆盖:长维 k=64(快速→Gram 内联,默认→QR 压缩)、64² 方阵(两种模式都不受影响)、k=65/255(快速→无主元 QR)、**k=256 快速模式下仍走精确路径**、herm/非 herm 分流、batch、0-D tensor atol、以及同进程"默认→快速→默认"运行时切换(env 逐次读取)。所有用例同时断言结果与 CPU 参考一致。
+4. **两处源码注释与实测矛盾**:模块 docstring 原写"fp32 matrices with 64 < k <= 255 use a pure-Triton blocked Householder QR"(易误读为 QR 是默认),改为明确"exact paths BY DEFAULT,FAST_PATH=1 opts into the QR";精确分发处"Both SVD-accurate and >= 0.8x torch at every measured size"改为如实记录:k ≥ 256 ≥ 0.8×,65~255 默认在 tile 边界低谷 < 0.8×(129² 0.58、129×2048 0.53、herm 65² 0.71),这正是快速 QR 保留为 opt-in 的原因。
+
+**验证**:目标子集(exact_path 8 + strict_threshold 5 + power2_nb 4 + deflated 4 + fast_path_dispatch 1)真机通过;tensor atol 用例首跑暴露一个测试自身的构造错误(非 batch 输入的 atol 必须是 0-D 张量,torch 语义),已修正。全量回归:官方套件 **131 passed / 44 skipped**(+1 = fast_path_dispatch),sweeps **4/4**(+1 = 366 拆分出的 fast_mode;exact_default 模式下长维 lowrank 0 失配被断言锁死)。

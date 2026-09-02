@@ -22,10 +22,12 @@ FLAGGEMS_MR_SWEEP=1 is set:
 
     FLAGGEMS_MR_SWEEP=1 pytest -s tests/test_linalg_matrix_rank_sweeps.py
 
-The hermitian stress and QR-band adversarial sweeps still pin
-FLAGGEMS_MR_EXACT_PATH=1 for historical clarity; the exact paths are the
-default dispatch, so the pin is redundant (the fast Gram/unpivoted-QR
-bands are opt-in via FLAGGEMS_MR_FAST_PATH=1).
+The exact paths are the default dispatch; the fast Gram/unpivoted-QR
+bands are opt-in via FLAGGEMS_MR_FAST_PATH=1.  The sweeps therefore clear
+any FLAGGEMS_MR_FAST_PATH leftover from the environment
+(monkeypatch.delenv) to pin the exact dispatch; the 366-case all-paths
+sweep is run twice -- once in the exact default and once in fast mode --
+with separate allow-lists.
 """
 
 import os
@@ -111,10 +113,11 @@ def _mk_herm_eigs(eigs, seed=0):
     return ((q * eigs[None, :]) @ q.mT).float()
 
 
-def test_sweep_all_paths_366():
-    # Full-dispatch sweep (366 cases): square k=3..64 x {rand,diag,lowrank},
-    # hermitian small, long-dimension tall/wide/batch, batched small.
-    # Reference: torch CPU fp32 matrix_rank (same-dtype semantics).
+def _run_all_paths_sweep():
+    """Full-dispatch sweep (366 cases): square k=3..64 x {rand,diag,lowrank},
+    hermitian small, long-dimension tall/wide/batch, batched small.
+    Reference: torch CPU fp32 matrix_rank (same-dtype semantics).  Returns
+    the mismatch list; the two wrappers below assert on it per mode."""
     torch.manual_seed(11)
     cases = []
     for k in list(range(3, 65)):
@@ -144,34 +147,69 @@ def test_sweep_all_paths_366():
                     f"shape={shape} herm={herm} kind={kind}: "
                     f"got={got.flatten().tolist()[:4]} ref={ref.flatten().tolist()[:4]}"
                 )
-    # Known, documented exceptions (report stage 0/6): with the exact
-    # paths now the default, only the (3,3)/(7,7) fp32 noise-region cases
-    # may mismatch; the long-dimension Gram sigma^2-domain floor only
-    # applies when FLAGGEMS_MR_FAST_PATH=1 opts into the fast band (the
-    # allow-list below keeps those shapes so the sweep also passes in
-    # fast mode).  Everything else must match exactly.
+    assert total == 366
+    return mismatches
+
+
+def _mismatch_shape(entry):
+    shape_str = entry.split(" herm")[0].replace("shape=", "")
+    return eval(shape_str)  # noqa: S307 (test data only)
+
+
+# fp32 noise-region boundary: the fp32 CPU reference itself disagrees with
+# fp64 on these tiny slowly-decaying spectra, so a lowrank mismatch there is
+# not a backend defect (independent of the dispatch mode).
+_NOISE_REGION_SHAPES = {(3, 3), (7, 7)}
+
+# Long-dimension k <= 64 shapes whose lowrank mismatches are the documented
+# Gram sigma^2-domain floor -- only reachable under FLAGGEMS_MR_FAST_PATH=1.
+_GRAM_FLOOR_SHAPES = {
+    (128, 3), (3, 128), (2, 128, 3), (2, 3, 128),
+    (128, 8), (8, 128), (2, 128, 8), (2, 8, 128),
+    (128, 33), (33, 128), (2, 128, 33), (2, 33, 128),
+    (128, 64), (64, 128), (2, 128, 64), (2, 64, 128),
+    (256, 3), (3, 256), (2, 256, 3), (2, 3, 256),
+    (256, 8), (8, 256), (2, 256, 8), (2, 8, 256),
+    (256, 33), (33, 256), (2, 256, 33), (2, 33, 256),
+    (256, 64), (64, 256), (2, 256, 64), (2, 64, 256),
+    (1024, 3), (3, 1024), (2, 1024, 3), (2, 3, 1024),
+    (1024, 8), (8, 1024), (2, 1024, 8), (2, 8, 1024),
+    (1024, 33), (33, 1024), (2, 1024, 33), (2, 33, 1024),
+    (1024, 64), (64, 1024), (2, 1024, 64), (2, 64, 1024),
+}
+
+
+def test_sweep_all_paths_366_exact_default(monkeypatch):
+    # Exact default dispatch: only the fp32 noise-region boundary cases may
+    # mismatch.  In particular EVERY long-dimension lowrank case must pass
+    # -- the Gram sigma^2-domain floor is gone from the default dispatch,
+    # and this test locks that in (a regression that routes the default
+    # back to Gram fails here).
+    monkeypatch.delenv("FLAGGEMS_MR_FAST_PATH", raising=False)
+    mismatches = _run_all_paths_sweep()
+    unexpected = [
+        m
+        for m in mismatches
+        if "lowrank" not in m
+        or "herm=True" in m
+        or _mismatch_shape(m) not in _NOISE_REGION_SHAPES
+    ]
+    assert not unexpected, "\n".join(unexpected)
+
+
+def test_sweep_all_paths_366_fast_mode(monkeypatch):
+    # Fast mode (FLAGGEMS_MR_FAST_PATH=1): the long-dimension Gram band
+    # overestimates rank on slowly-decaying low-rank spectra (sigma^2
+    # domain floor, documented); those mismatches are allow-listed per
+    # shape, everything else must match exactly.
+    monkeypatch.setenv("FLAGGEMS_MR_FAST_PATH", "1")
+    mismatches = _run_all_paths_sweep()
     unexpected = [m for m in mismatches if "lowrank" not in m or "herm=True" in m]
     assert not unexpected, "\n".join(unexpected)
+    allowed = _GRAM_FLOOR_SHAPES | _NOISE_REGION_SHAPES
     gram_floor = [m for m in mismatches if "lowrank" in m]
-    allowed_shapes = {
-        (128, 3), (3, 128), (2, 128, 3), (2, 3, 128),
-        (128, 8), (8, 128), (2, 128, 8), (2, 8, 128),
-        (128, 33), (33, 128), (2, 128, 33), (2, 33, 128),
-        (128, 64), (64, 128), (2, 128, 64), (2, 64, 128),
-        (256, 3), (3, 256), (2, 256, 3), (2, 3, 256),
-        (256, 8), (8, 256), (2, 256, 8), (2, 8, 256),
-        (256, 33), (33, 256), (2, 256, 33), (2, 33, 256),
-        (256, 64), (64, 256), (2, 256, 64), (2, 64, 256),
-        (1024, 3), (3, 1024), (2, 1024, 3), (2, 3, 1024),
-        (1024, 8), (8, 1024), (2, 1024, 8), (2, 8, 1024),
-        (1024, 33), (33, 1024), (2, 1024, 33), (2, 33, 1024),
-        (1024, 64), (64, 1024), (2, 1024, 64), (2, 64, 1024),
-        (3, 3), (7, 7),
-    }
     for m in gram_floor:
-        shape_str = m.split(" herm")[0].replace("shape=", "")
-        shape = eval(shape_str)  # noqa: S307 (test data only)
-        assert shape in allowed_shapes, f"unexpected mismatch: {m}"
+        assert _mismatch_shape(m) in allowed, f"unexpected mismatch: {m}"
 
 
 def test_sweep_hermitian_34(monkeypatch):
@@ -179,11 +217,10 @@ def test_sweep_hermitian_34(monkeypatch):
     # signs)/atol cluster/slow-decay through the sqrt(eps) floor/zero/
     # garbage strict upper/batch.  Reference: fp64 with fp32-semantics tol.
     # This is the acceptance scan for the exact herm path, which is the
-    # default dispatch; the FLAGGEMS_MR_EXACT_PATH=1 pin is redundant
-    # (kept for historical clarity).  Under FLAGGEMS_MR_FAST_PATH=1 the
-    # 65..255 QR band has the documented |R_ii| limitations on these
-    # spectra.
-    monkeypatch.setenv("FLAGGEMS_MR_EXACT_PATH", "1")
+    # default dispatch; clear any FAST_PATH leftover so the exact path is
+    # really exercised.  (Under FLAGGEMS_MR_FAST_PATH=1 the 65..255 QR
+    # band has the documented |R_ii| limitations on these spectra.)
+    monkeypatch.delenv("FLAGGEMS_MR_FAST_PATH", raising=False)
     torch.manual_seed(7)
     mismatches = []
     total = 0
@@ -253,10 +290,9 @@ def test_sweep_qr_band_adversarial_22(monkeypatch):
     # QR-band adversarial (22 cases): slow-decay low-rank at 65..512,
     # near-threshold atol on 256^2/512^2 random matrices (5 seeds each),
     # per-batch tensor atol.  This sweep is the acceptance scan for the
-    # exact path, which is the default dispatch; the
-    # FLAGGEMS_MR_EXACT_PATH=1 pin is redundant (kept for historical
-    # clarity).
-    monkeypatch.setenv("FLAGGEMS_MR_EXACT_PATH", "1")
+    # exact path, which is the default dispatch; clear any FAST_PATH
+    # leftover so the exact path is really exercised.
+    monkeypatch.delenv("FLAGGEMS_MR_FAST_PATH", raising=False)
     mismatches = []
     total = 0
 

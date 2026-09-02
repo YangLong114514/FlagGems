@@ -31,16 +31,18 @@ dimensions, a Householder QR compression to the k x k R factor (backward
 stable in the linear sigma domain) followed by the same bidiagonalization
 -- both ending in the shared Sturm tail whose decisive count runs in
 double-single (df64) arithmetic from the raw bidiagonal d/e; fp32 matrices
-with 64 < k <= 255 use a pure-Triton blocked Householder QR (unpivoted)
-whose |R_ii| diagonal is counted against the tolerance: rank = #{ |R_ii| >
-max(atol, rtol * sigma_max) }, with sigma_max bracketed by |R_00| and
-||A||_F and refined by power iteration only when the two bounds disagree;
-and non-hermitian fp32 matrices with k > 255 use an unblocked Golub-Kahan
-bidiagonalization plus a Sturm count whose decisive pass runs in
-double-single (df64) arithmetic (SVD-accurate); hermitian matrices with
-k > 255 use a one-sided Householder tridiagonalization instead (half the
-reflectors of Golub-Kahan) with the rank counted in the eigenvalue domain
-by a +/-tol double-chain Sturm bracket and a df64 decisive pass.
+with 64 < k <= 255 use the same exact paths BY DEFAULT (the
+tridiagonalization / bidiagonalization below), with
+FLAGGEMS_MR_FAST_PATH=1 opting into a pure-Triton blocked Householder QR
+(unpivoted) whose |R_ii| diagonal is counted against the tolerance:
+rank = #{ |R_ii| > max(atol, rtol * sigma_max) }, with sigma_max
+bracketed by |R_00| and ||A||_F and refined by power iteration only when
+the two bounds disagree; and fp32 matrices with k > 255 ALWAYS use an
+unblocked Golub-Kahan bidiagonalization (non-hermitian) or a one-sided
+Householder tridiagonalization (hermitian -- half the reflectors of
+Golub-Kahan), plus a Sturm count whose decisive pass runs in
+double-single (df64) arithmetic (SVD-accurate); hermitian ranks are
+counted in the eigenvalue domain by a +/-tol double-chain Sturm bracket.
 The exact paths are the DEFAULT; FLAGGEMS_MR_FAST_PATH=1 opts back into
 the fast approximations (Gram sigma^2-domain count for long-dimension
 k <= 64, unpivoted-QR |R_ii| count for 64 < k <= 255), which are faster
@@ -3459,9 +3461,12 @@ def _launch_matrix_rank(input, atol, rtol, hermitian):
             # hermitian: one-sided Householder tridiagonalization +
             # eigenvalue-domain Sturm count (|lambda| > tol via +/-tol qd
             # chains, decisive pass in df64).  general: unblocked Golub-Kahan
-            # bidiagonalization + df64 Sturm.  Both SVD-accurate and >= 0.8x
-            # torch at every measured size in this band (general 1.1x/1.75x
-            # at 256^2/512^2, 2.7x at 1024^2; herm 2.0x/4.0x, 6.9x at 1024^2).
+            # bidiagonalization + df64 Sturm.  Both SVD-accurate.  Performance:
+            # >= 0.8x torch for k >= 256 (general 1.1x/1.8x at 256^2/512^2,
+            # 2.8x at 1024^2; herm 2.0x/3.8x, 7.0x at 1024^2), but the 65..255
+            # default dips below 0.8x at the 64-wide tile boundaries (general
+            # 129^2 0.58, 129x2048 0.53; herm 65^2 0.71 -- report stages
+            # 8/11/12), which is why the fast QR band remains as an opt-in.
             if atol_tensor is None:
                 atol_tensor, rtol_tensor = _prepare_tolerances(input, atol, rtol)
             if hermitian:
