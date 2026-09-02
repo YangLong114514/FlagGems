@@ -41,7 +41,10 @@ double-single (df64) arithmetic (SVD-accurate); hermitian matrices with
 k > 255 use a one-sided Householder tridiagonalization instead (half the
 reflectors of Golub-Kahan) with the rank counted in the eigenvalue domain
 by a +/-tol double-chain Sturm bracket and a df64 decisive pass.
-FLAGGEMS_MR_EXACT_PATH=1 opts the 65..255 band into the same exact paths.
+The exact paths are the DEFAULT; FLAGGEMS_MR_FAST_PATH=1 opts back into
+the fast approximations (Gram sigma^2-domain count for long-dimension
+k <= 64, unpivoted-QR |R_ii| count for 64 < k <= 255), which are faster
+but less accurate on adversarial spectra.
 fp64 is rejected with NotImplementedError (this toolchain cannot compile
 fp64 Triton kernels); there is no aclnn/native decomposition fallback
 anywhere -- every rank is computed by the Triton kernels in this file (the
@@ -114,15 +117,14 @@ _FUSED_JACOBI_WIDE_MAX_ROWS = 128
 # tridiagonalization for hermitian 33..64, QR-compression to the k x k R
 # factor + bidiag64 for long dimensions.
 _TRIDIAG_MAX_K = 64
-_RRQR_MAX_K = 255  # 65..255 defaults to unpivoted QR (both hermitian and
-# general): the exact paths dip below the 0.8x bar there -- per-step GM
-# tile-op floor, with an extra step-cost jump at every 64-wide tile
-# boundary (measured on the extended benchmark: general 129^2 0.50 /
-# 160^2 0.69 / 192^2 0.90 / 129x2048 0.52, herm 65^2 0.74 / 129^2 0.72).
-# k >= 256 is exact by default (256^2 1.10x general / 2.04x herm, and
-# 2.2x/4.0x at 512^2), so the QR band keeps only the documented slow-decay
-# exception; FLAGGEMS_MR_EXACT_PATH=1 forces the exact paths for 65..255
-# (validation).
+_RRQR_MAX_K = 255  # 65..255 uses the exact paths by default; the fast
+# unpivoted-QR band (both hermitian and general) is opt-in via
+# FLAGGEMS_MR_FAST_PATH=1 because the exact paths dip below the 0.8x bar
+# there -- per-step GM tile-op floor, with an extra step-cost jump at
+# every 64-wide tile boundary (measured on the extended benchmark:
+# general 129^2 0.50 / 160^2 0.69 / 192^2 0.90 / 129x2048 0.52, herm
+# 65^2 0.74 / 129^2 0.72). k >= 256 is always exact (256^2 1.10x
+# general / 2.04x herm, and 2.2x/4.0x at 512^2).
 
 
 def _jacobi_sweeps(k, is_fp64):
@@ -959,10 +961,11 @@ def _matrix_rank_gram_kernel(
 ):
     """G[b] = A[b]^T A[b] (tall) or A[b] A[b]^T (wide) on the Cube.
 
-    Default path for long-dimension inputs (one of m, n > 64), k <= 64:
-    fast, but the sigma^2-domain floor overestimates rank on
-    slowly-decaying spectra -- FLAGGEMS_MR_EXACT_PATH=1 routes these
-    inputs to the exact QR-compression path instead.  Input is pre-padded
+    Fast opt-in path (FLAGGEMS_MR_FAST_PATH=1) for long-dimension inputs
+    (one of m, n > 64), k <= 64: fast, but the sigma^2-domain floor
+    overestimates rank on slowly-decaying spectra -- the default dispatch
+    routes these inputs to the exact QR-compression path instead.  Input
+    is pre-padded
     by the launcher to (PM, PN) multiples of 32 with the short dimension
     64, so every tl.dot operand is a full unpadded block.  The accumulator
     is summed in plain vector adds (the dot-accumulator form loses
@@ -1631,12 +1634,12 @@ def _launch_tridiag_rank(
                     num_warps=1, num_stages=1, enable_fp_fusion=False,
                 )
                 return out
-            if os.environ.get("FLAGGEMS_MR_EXACT_PATH") == "1":
-                # Exact long-dimension path (opt-in): QR-compress to the
+            if os.environ.get("FLAGGEMS_MR_FAST_PATH") != "1":
+                # Exact long-dimension path (DEFAULT): QR-compress to the
                 # k x k R factor (backward stable in the linear domain),
                 # then bidiag64 + df64 Sturm tail.  Slower than Gram on
                 # this hardware (the Householder panel is a serial O(k)
-                # chain of GM round trips), hence not the default.
+                # chain of GM round trips) but exact.
                 return _launch_longdim_rank(
                     matrix,
                     atol_tensor,
@@ -1652,11 +1655,12 @@ def _launch_tridiag_rank(
                     input,
                 )
             # Gram (Cube) + tridiagonalization + Sturm count as three
-            # separate launches -- the DEFAULT for long-dimension inputs.
-            # Fast, but the sigma^2 domain loses singular values below
-            # ~sqrt(k*eps)*sigma_max (rank overestimation on
-            # slowly-decaying low-rank spectra -- documented in the
-            # report); the exact path above removes that limitation.
+            # separate launches -- fast opt-in (FLAGGEMS_MR_FAST_PATH=1)
+            # for long-dimension inputs.  The sigma^2 domain loses
+            # singular values below ~sqrt(k*eps)*sigma_max (rank
+            # overestimation on slowly-decaying low-rank spectra --
+            # documented in the report); the exact path above removes
+            # that limitation.
             block = 64
             d = torch.empty(
                 (batch_count, block), dtype=torch.float32, device=input.device
@@ -3079,8 +3083,9 @@ def _launch_bidiag_rank(
     matrix, atol_tensor, rtol_tensor, out, m, n, k, rows, batch_count, input,
     hermitian,
 ):
-    """Unblocked Golub-Kahan bidiagonalization + Sturm count (fp32, k > 255
-    by default, or the 64 < k <= 255 band under FLAGGEMS_MR_EXACT_PATH).
+    """Unblocked Golub-Kahan bidiagonalization + Sturm count (fp32; the
+    default for every k > 64 -- k > 255 always, 64 < k <= 255 unless
+    FLAGGEMS_MR_FAST_PATH=1 opts into the fast unpivoted QR).
 
     SVD-accurate rank: unlike the RRQR path (|R_ii| only approximate sigma_i),
     the bidiagonal d/e keep every singular value at linear precision and the
@@ -3448,8 +3453,9 @@ def _launch_matrix_rank(input, atol, rtol, hermitian):
                 input,
                 hermitian,
             )
-        elif k > _RRQR_MAX_K or os.environ.get("FLAGGEMS_MR_EXACT_PATH") == "1":
-            # k >= 256 (or 65..255 under the opt-in env): the exact paths.
+        elif k > _RRQR_MAX_K or os.environ.get("FLAGGEMS_MR_FAST_PATH") != "1":
+            # k >= 256 always; 65..255 by default (the fast QR band is
+            # opt-in via FLAGGEMS_MR_FAST_PATH=1): the exact paths.
             # hermitian: one-sided Householder tridiagonalization +
             # eigenvalue-domain Sturm count (|lambda| > tol via +/-tol qd
             # chains, decisive pass in df64).  general: unblocked Golub-Kahan
@@ -3486,10 +3492,10 @@ def _launch_matrix_rank(input, atol, rtol, hermitian):
                     hermitian,
                 )
         else:
-            # 65..255 (hermitian and general): pure-Triton blocked
-            # Householder QR (unpivoted); the rank is read off the |R_ii|
-            # diagonal.  There is no aclnn/native decomposition fallback
-            # anywhere.
+            # 65..255 fast opt-in (FLAGGEMS_MR_FAST_PATH=1, hermitian and
+            # general): pure-Triton blocked Householder QR (unpivoted);
+            # the rank is read off the |R_ii| diagonal.  There is no
+            # aclnn/native decomposition fallback anywhere.
             if atol_tensor is None:
                 atol_tensor, rtol_tensor = _prepare_tolerances(input, atol, rtol)
             _launch_rrqr_rank(

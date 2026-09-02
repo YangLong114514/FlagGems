@@ -22,8 +22,10 @@ FLAGGEMS_MR_SWEEP=1 is set:
 
     FLAGGEMS_MR_SWEEP=1 pytest -s tests/test_linalg_matrix_rank_sweeps.py
 
-The hermitian stress and QR-band adversarial sweeps additionally honor
-FLAGGEMS_MR_EXACT_PATH=1 (pass it through the environment).
+The hermitian stress and QR-band adversarial sweeps still pin
+FLAGGEMS_MR_EXACT_PATH=1 for historical clarity; the exact paths are the
+default dispatch, so the pin is redundant (the fast Gram/unpivoted-QR
+bands are opt-in via FLAGGEMS_MR_FAST_PATH=1).
 """
 
 import os
@@ -142,10 +144,12 @@ def test_sweep_all_paths_366():
                     f"shape={shape} herm={herm} kind={kind}: "
                     f"got={got.flatten().tolist()[:4]} ref={ref.flatten().tolist()[:4]}"
                 )
-    # Known, documented exceptions (report stage 0/6): the long-dimension
-    # Gram band overestimates rank on slowly-decaying low-rank spectra
-    # (sigma^2 domain floor), and the (3,3)/(7,7) fp32 noise-region cases.
-    # Everything else must match exactly.
+    # Known, documented exceptions (report stage 0/6): with the exact
+    # paths now the default, only the (3,3)/(7,7) fp32 noise-region cases
+    # may mismatch; the long-dimension Gram sigma^2-domain floor only
+    # applies when FLAGGEMS_MR_FAST_PATH=1 opts into the fast band (the
+    # allow-list below keeps those shapes so the sweep also passes in
+    # fast mode).  Everything else must match exactly.
     unexpected = [m for m in mismatches if "lowrank" not in m or "herm=True" in m]
     assert not unexpected, "\n".join(unexpected)
     gram_floor = [m for m in mismatches if "lowrank" in m]
@@ -174,9 +178,11 @@ def test_sweep_hermitian_34(monkeypatch):
     # Hermitian stress (34 cases): rand/lowrank/near-default-tol (both
     # signs)/atol cluster/slow-decay through the sqrt(eps) floor/zero/
     # garbage strict upper/batch.  Reference: fp64 with fp32-semantics tol.
-    # This is the acceptance scan for the EXACT herm path, so it pins
-    # FLAGGEMS_MR_EXACT_PATH=1 (in the default dispatch the 65..255 QR
-    # band has the documented |R_ii| limitations on these spectra).
+    # This is the acceptance scan for the exact herm path, which is the
+    # default dispatch; the FLAGGEMS_MR_EXACT_PATH=1 pin is redundant
+    # (kept for historical clarity).  Under FLAGGEMS_MR_FAST_PATH=1 the
+    # 65..255 QR band has the documented |R_ii| limitations on these
+    # spectra.
     monkeypatch.setenv("FLAGGEMS_MR_EXACT_PATH", "1")
     torch.manual_seed(7)
     mismatches = []
@@ -247,13 +253,10 @@ def test_sweep_qr_band_adversarial_22(monkeypatch):
     # QR-band adversarial (22 cases): slow-decay low-rank at 65..512,
     # near-threshold atol on 256^2/512^2 random matrices (5 seeds each),
     # per-batch tensor atol.  This sweep is the acceptance scan for the
-    # EXACT path, so it pins FLAGGEMS_MR_EXACT_PATH=1 (in the default
-    # dispatch the 65..128 RRQR band has the documented slow-decay
-    # undercount, which is not what this sweep measures).
+    # exact path, which is the default dispatch; the
+    # FLAGGEMS_MR_EXACT_PATH=1 pin is redundant (kept for historical
+    # clarity).
     monkeypatch.setenv("FLAGGEMS_MR_EXACT_PATH", "1")
-    # QR-band adversarial (22 cases, honors FLAGGEMS_MR_EXACT_PATH=1):
-    # slow-decay low-rank at 65..512, near-threshold atol on 256^2/512^2
-    # random matrices (5 seeds each), per-batch tensor atol.
     mismatches = []
     total = 0
 

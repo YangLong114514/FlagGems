@@ -866,13 +866,17 @@ def test_linalg_matrix_rank_rejects_complex_tolerance():
     ],
 )
 def test_linalg_matrix_rank_exact_path(shape, rank, hermitian, monkeypatch):
-    # Opt-in exact reference path (FLAGGEMS_MR_EXACT_PATH=1): routes the
-    # Gram/RRQR bands through the SVD-accurate Golub-Kahan bidiagonalization
-    # + df64 Sturm count.  Slowly-decaying low-rank spectra (singular values
-    # from 1 geometrically down to 1e-4) are where the Gram path
-    # overestimates rank (sigma^2 domain) and the unpivoted QR miscounts
-    # near the tolerance (|R_ii| != sigma_i); the exact path must match an
-    # fp64 reference with fp32-semantics tolerance exactly.
+    # Exact reference path coverage: the exact path is the DEFAULT dispatch
+    # (the Gram/unpivoted-QR fast bands are opt-in via
+    # FLAGGEMS_MR_FAST_PATH=1), so this test runs the SVD-accurate
+    # Golub-Kahan bidiagonalization + df64 Sturm count on every band.
+    # Slowly-decaying low-rank spectra (singular values from 1
+    # geometrically down to 1e-4) are where the Gram path overestimates
+    # rank (sigma^2 domain) and the unpivoted QR miscounts near the
+    # tolerance (|R_ii| != sigma_i); the exact path must match an fp64
+    # reference with fp32-semantics tolerance exactly.  The legacy
+    # FLAGGEMS_MR_EXACT_PATH pin is redundant (no longer read) but kept
+    # for explicitness.
     monkeypatch.setenv("FLAGGEMS_MR_EXACT_PATH", "1")
     generator = torch.Generator().manual_seed(2026)
     *batch, m, n = shape
@@ -985,10 +989,11 @@ def test_linalg_matrix_rank_nonsquare_lowrank(dtype, shape, rank):
 # (and its fp32 sum-of-squares cannot represent the subnormal-tie case).
 @pytest.mark.parametrize("k", [3, 33, 65, 128, 257] if IS_ASCEND else [33, 65, 128, 257])
 def test_linalg_matrix_rank_hermitian_strict_threshold(k, monkeypatch):
-    # Pin the exact herm paths: k > 64 defaults to unpivoted QR (whose
-    # |R_ii| count has the documented slow-decay/tie limitations); the
-    # strict-threshold semantics live in the fused/padded/tridiag Sturm
-    # counters exercised here.
+    # The exact herm paths are the default dispatch (the 65..255 fast
+    # unpivoted-QR band is opt-in via FLAGGEMS_MR_FAST_PATH=1); the legacy
+    # FLAGGEMS_MR_EXACT_PATH pin is redundant but kept for explicitness.
+    # The strict-threshold semantics live in the fused/padded/tridiag
+    # Sturm counters exercised here.
     monkeypatch.setenv("FLAGGEMS_MR_EXACT_PATH", "1")
     # torch's hermitian semantics are STRICT: rank = #{|lambda| > tol}
     # = #{lambda > tol} + #{lambda < -tol}.  The Sturm qd zero-pivot guard
@@ -1179,8 +1184,10 @@ def test_linalg_matrix_rank_negative_tolerances(k, hermitian):
 @pytest.mark.skipif(not IS_ASCEND, reason="Ascend-specific path coverage")
 @pytest.mark.parametrize("shape", [(129, 64), (64, 129), (192, 64), (64, 192)])
 def test_linalg_matrix_rank_longdim_exact_power2_nb(shape, monkeypatch):
-    # Long-dimension k <= 64 under FLAGGEMS_MR_EXACT_PATH=1 QR-compresses to
-    # the k x k R factor with the register panel kernel; for these shapes
+    # Long-dimension k <= 64 QR-compresses to the k x k R factor with the
+    # register panel kernel (default since the exact-path flip; the legacy
+    # FLAGGEMS_MR_EXACT_PATH pin is redundant but kept for explicitness);
+    # for these shapes
     # rs = round_up(max(m, n), 64) = 192, and a raw NB = rs // 64 = 3
     # specialization is a marginal UB allocation that flip-flops between
     # fitting and "ub overflow" across compiles.  The launcher must clamp NB
