@@ -76,7 +76,6 @@ def _v_norm(x, ord, dim, keepdim, dtype):
     dispatch to v_norm_kernel there (any ord other than 2, ±inf, 0 with an
     explicit dim).
     """
-    logger.debug("GEMS LINALG_NORM (fixed v_norm_kernel)")
     if dtype is not None:
         if isinstance(dtype, str):
             dtype = getattr(torch, dtype)
