@@ -32,9 +32,7 @@ SUPPORT_FP64 = flag_gems.runtime.device.support_fp64
 # actually supports fp64 (Ascend does not).
 SUPPORTED_DTYPE_CASES = [
     pytest.param(torch.float32, id="float32"),
-] + (
-    [pytest.param(torch.float64, id="float64")] if SUPPORT_FP64 else []
-)
+] + ([pytest.param(torch.float64, id="float64")] if SUPPORT_FP64 else [])
 
 OFFICIAL_DTYPE_CASES = [
     pytest.param(torch.float32, True, id="float32-supported"),
@@ -92,9 +90,7 @@ EMPTY_SHAPES = [
 def _make_matrix_with_rank(shape, rank, dtype=torch.float32):
     matrix = torch.zeros(shape, dtype=dtype, device=flag_gems.device)
     diagonal = torch.arange(rank, device=matrix.device)
-    values = torch.arange(
-        1, rank + 1, dtype=dtype, device=matrix.device
-    )
+    values = torch.arange(1, rank + 1, dtype=dtype, device=matrix.device)
     matrix[..., diagonal, diagonal] = values
     return matrix
 
@@ -103,6 +99,10 @@ def _to_reference_value(value, device):
     if isinstance(value, torch.Tensor):
         return value.to(device=device)
     return value
+
+
+def _assert_equal(result, reference):
+    utils.gems_assert_equal(result, utils.to_reference(reference))
 
 
 def _native_matrix_rank(matrix, **kwargs):
@@ -117,11 +117,7 @@ def _native_matrix_rank(matrix, **kwargs):
     # single rank-deficient matrices can miscount repeated zero eigenvalues.
     # Compute every Hermitian reference on CPU so the FlagGems device
     # implementation can still be exercised against native PyTorch semantics.
-    if (
-        IS_THEAD
-        and kwargs.get("hermitian", False)
-        and ref_matrix.device.type != "cpu"
-    ):
+    if IS_THEAD and kwargs.get("hermitian", False) and ref_matrix.device.type != "cpu":
         cpu_kwargs = {
             name: _to_reference_value(value, torch.device("cpu"))
             for name, value in ref_kwargs.items()
@@ -138,20 +134,18 @@ def _assert_output_metadata(result, matrix):
     assert result.device == matrix.device
 
 
-def _assert_direct_and_dispatch_match_native(
-    matrix, *, check_dispatch=False, **kwargs
-):
+def _assert_direct_and_dispatch_match_native(matrix, *, check_dispatch=False, **kwargs):
     native = _native_matrix_rank(matrix, **kwargs)
 
     direct = flag_gems.linalg_matrix_rank(matrix, **kwargs)
     _assert_output_metadata(direct, matrix)
-    utils.gems_assert_equal(direct, native)
+    _assert_equal(direct, native)
 
     if check_dispatch:
         with flag_gems.use_gems():
             dispatched = torch.linalg.matrix_rank(matrix, **kwargs)
         _assert_output_metadata(dispatched, matrix)
-        utils.gems_assert_equal(dispatched, native)
+        _assert_equal(dispatched, native)
     return direct
 
 
@@ -161,10 +155,8 @@ def test_linalg_matrix_rank_default_identity(dtype):
     matrix = torch.eye(8, dtype=dtype, device=flag_gems.device)
     expected = torch.tensor(8, dtype=torch.int64, device=matrix.device)
 
-    result = _assert_direct_and_dispatch_match_native(
-        matrix, check_dispatch=True
-    )
-    utils.gems_assert_equal(result, expected)
+    result = _assert_direct_and_dispatch_match_native(matrix, check_dispatch=True)
+    _assert_equal(result, expected)
 
 
 @pytest.mark.linalg_matrix_rank
@@ -178,7 +170,7 @@ def test_linalg_matrix_rank_float64_preserves_small_singular_value():
     expected = torch.tensor(2, dtype=torch.int64, device=matrix.device)
 
     result = _assert_direct_and_dispatch_match_native(matrix)
-    utils.gems_assert_equal(result, expected)
+    _assert_equal(result, expected)
 
 
 @pytest.mark.linalg_matrix_rank
@@ -191,13 +183,11 @@ def test_linalg_matrix_rank_float64_tolerance_precision():
             device=flag_gems.device,
         )
     )
-    atol = torch.tensor(
-        0.50000000000005, dtype=torch.float64, device=matrix.device
-    )
+    atol = torch.tensor(0.50000000000005, dtype=torch.float64, device=matrix.device)
     expected = torch.tensor(1, dtype=torch.int64, device=matrix.device)
 
     result = _assert_direct_and_dispatch_match_native(matrix, atol=atol)
-    utils.gems_assert_equal(result, expected)
+    _assert_equal(result, expected)
 
 
 @pytest.mark.linalg_matrix_rank
@@ -233,14 +223,12 @@ def test_linalg_matrix_rank_well_separated_spectrum(dtype, k, tiny, atol):
     expected = torch.tensor(k - 1, dtype=torch.int64, device=matrix.device)
 
     result = _assert_direct_and_dispatch_match_native(matrix, atol=atol)
-    utils.gems_assert_equal(result, expected)
+    _assert_equal(result, expected)
 
 
 @pytest.mark.linalg_matrix_rank
 @pytest.mark.parametrize("dtype", SUPPORTED_DTYPE_CASES)
-def test_linalg_matrix_rank_does_not_call_torch_decomposition(
-    dtype, monkeypatch
-):
+def test_linalg_matrix_rank_does_not_call_torch_decomposition(dtype, monkeypatch):
     matrix = _make_matrix_with_rank((4, 4), 3, dtype)
     expected = _native_matrix_rank(matrix, atol=5e-2)
 
@@ -260,8 +248,8 @@ def test_linalg_matrix_rank_does_not_call_torch_decomposition(
         atol=5e-2,
         hermitian=True,
     )
-    utils.gems_assert_equal(result, expected)
-    utils.gems_assert_equal(hermitian_result, expected)
+    _assert_equal(result, expected)
+    _assert_equal(hermitian_result, expected)
 
 
 @pytest.mark.linalg_matrix_rank
@@ -273,7 +261,7 @@ def test_linalg_matrix_rank_rank_deficient(dtype):
     result = _assert_direct_and_dispatch_match_native(
         matrix, atol=5e-2, hermitian=False
     )
-    utils.gems_assert_equal(result, expected)
+    _assert_equal(result, expected)
 
 
 @pytest.mark.linalg_matrix_rank
@@ -292,9 +280,7 @@ def test_linalg_matrix_rank_nonempty_zero_matrix(dtype, shape):
     # whose zero-matrix shortcut must still hand defined state to the
     # (unconditionally launched) final Sturm kernel.
     matrix = torch.zeros(shape, dtype=dtype, device=flag_gems.device)
-    expected = torch.zeros(
-        shape[:-2], dtype=torch.int64, device=matrix.device
-    )
+    expected = torch.zeros(shape[:-2], dtype=torch.int64, device=matrix.device)
 
     if flag_gems.vendor_name in ("metax", "hygon"):
         # The MetaX and Hygon torch native references (matrix_rank via SVD)
@@ -305,12 +291,10 @@ def test_linalg_matrix_rank_nonempty_zero_matrix(dtype, shape):
         with flag_gems.use_gems():
             dispatched = torch.linalg.matrix_rank(matrix, hermitian=False)
         _assert_output_metadata(dispatched, matrix)
-        utils.gems_assert_equal(dispatched, result)
+        _assert_equal(dispatched, result)
     else:
-        result = _assert_direct_and_dispatch_match_native(
-            matrix, hermitian=False
-        )
-    utils.gems_assert_equal(result, expected)
+        result = _assert_direct_and_dispatch_match_native(matrix, hermitian=False)
+    _assert_equal(result, expected)
 
 
 @pytest.mark.linalg_matrix_rank
@@ -328,7 +312,7 @@ def test_linalg_matrix_rank_shapes(dtype, shape, expected_rank):
     result = _assert_direct_and_dispatch_match_native(
         matrix, atol=5e-2, hermitian=False
     )
-    utils.gems_assert_equal(result, expected)
+    _assert_equal(result, expected)
 
 
 @pytest.mark.linalg_matrix_rank
@@ -344,13 +328,11 @@ def test_linalg_matrix_rank_shapes(dtype, shape, expected_rank):
 def test_linalg_matrix_rank_matches_adjoint(dtype, shape, expected_rank):
     matrix = _make_matrix_with_rank(shape, expected_rank, dtype)
 
-    rank = _assert_direct_and_dispatch_match_native(
-        matrix, atol=5e-2, hermitian=False
-    )
+    rank = _assert_direct_and_dispatch_match_native(matrix, atol=5e-2, hermitian=False)
     adjoint_rank = _assert_direct_and_dispatch_match_native(
         matrix.mH, atol=5e-2, hermitian=False
     )
-    utils.gems_assert_equal(rank, adjoint_rank)
+    _assert_equal(rank, adjoint_rank)
 
 
 @pytest.mark.linalg_matrix_rank
@@ -370,15 +352,13 @@ def test_linalg_matrix_rank_aah_svd_matches_hermitian(dtype):
     aah = matrix @ matrix.mH
     expected = torch.full((2,), 3, dtype=torch.int64, device=matrix.device)
 
-    svd_rank = _assert_direct_and_dispatch_match_native(
-        aah, atol=5e-2, hermitian=False
-    )
+    svd_rank = _assert_direct_and_dispatch_match_native(aah, atol=5e-2, hermitian=False)
     hermitian_rank = _assert_direct_and_dispatch_match_native(
         aah, atol=5e-2, hermitian=True
     )
 
-    utils.gems_assert_equal(svd_rank, hermitian_rank)
-    utils.gems_assert_equal(svd_rank, expected)
+    _assert_equal(svd_rank, hermitian_rank)
+    _assert_equal(svd_rank, expected)
 
 
 @pytest.mark.linalg_matrix_rank
@@ -389,14 +369,10 @@ def test_linalg_matrix_rank_aah_svd_matches_hermitian(dtype):
         pytest.param({}, 4, id="default"),
         pytest.param({"rtol": 0.75}, 2, id="rtol-only"),
         pytest.param({"atol": 0.75}, 3, id="atol-only"),
-        pytest.param(
-            {"atol": 0.75, "rtol": 0.75}, 2, id="atol-and-rtol"
-        ),
+        pytest.param({"atol": 0.75, "rtol": 0.75}, 2, id="atol-and-rtol"),
     ],
 )
-def test_linalg_matrix_rank_tolerance_combinations(
-    dtype, kwargs, expected_rank
-):
+def test_linalg_matrix_rank_tolerance_combinations(dtype, kwargs, expected_rank):
     spectrum = torch.tensor(
         [1.5, 1.25, 0.8, 0.1],
         dtype=dtype,
@@ -405,10 +381,8 @@ def test_linalg_matrix_rank_tolerance_combinations(
     matrix = torch.diag(spectrum)
 
     result = _assert_direct_and_dispatch_match_native(matrix, **kwargs)
-    expected = torch.tensor(
-        expected_rank, dtype=torch.int64, device=matrix.device
-    )
-    utils.gems_assert_equal(result, expected)
+    expected = torch.tensor(expected_rank, dtype=torch.int64, device=matrix.device)
+    _assert_equal(result, expected)
 
 
 @pytest.mark.linalg_matrix_rank
@@ -417,17 +391,11 @@ def test_linalg_matrix_rank_tolerance_combinations(
     "kwargs,expected_rank",
     [
         pytest.param({"atol": 0.75}, 3, id="python-float"),
-        pytest.param(
-            {"atol": torch.tensor(0.75)}, 3, id="zero-dim-atol-tensor"
-        ),
-        pytest.param(
-            {"rtol": torch.tensor(0.75)}, 2, id="zero-dim-rtol-tensor"
-        ),
+        pytest.param({"atol": torch.tensor(0.75)}, 3, id="zero-dim-atol-tensor"),
+        pytest.param({"rtol": torch.tensor(0.75)}, 2, id="zero-dim-rtol-tensor"),
     ],
 )
-def test_linalg_matrix_rank_scalar_tolerance_types(
-    dtype, kwargs, expected_rank
-):
+def test_linalg_matrix_rank_scalar_tolerance_types(dtype, kwargs, expected_rank):
     spectrum = torch.tensor(
         [1.5, 1.25, 0.8, 0.1],
         dtype=dtype,
@@ -435,17 +403,17 @@ def test_linalg_matrix_rank_scalar_tolerance_types(
     )
     matrix = torch.diag(spectrum)
     kwargs = {
-        name: value.to(device=matrix.device, dtype=dtype)
-        if isinstance(value, torch.Tensor)
-        else value
+        name: (
+            value.to(device=matrix.device, dtype=dtype)
+            if isinstance(value, torch.Tensor)
+            else value
+        )
         for name, value in kwargs.items()
     }
 
     result = _assert_direct_and_dispatch_match_native(matrix, **kwargs)
-    expected = torch.tensor(
-        expected_rank, dtype=torch.int64, device=matrix.device
-    )
-    utils.gems_assert_equal(result, expected)
+    expected = torch.tensor(expected_rank, dtype=torch.int64, device=matrix.device)
+    _assert_equal(result, expected)
 
 
 @pytest.mark.linalg_matrix_rank
@@ -461,11 +429,11 @@ def test_linalg_matrix_rank_legacy_float_tolerance(dtype):
     native = torch.linalg.matrix_rank(ref_matrix, 0.75)
 
     direct = flag_gems.linalg_matrix_rank_tol(matrix, 0.75)
-    utils.gems_assert_equal(direct, native)
+    _assert_equal(direct, native)
 
     with flag_gems.use_gems():
         dispatched = torch.linalg.matrix_rank(matrix, 0.75)
-    utils.gems_assert_equal(dispatched, native)
+    _assert_equal(dispatched, native)
 
 
 @pytest.mark.linalg_matrix_rank
@@ -481,7 +449,7 @@ def test_linalg_matrix_rank_per_batch_tolerance(dtype):
     expected = torch.tensor([3, 1], dtype=torch.int64, device=matrix.device)
 
     result = _assert_direct_and_dispatch_match_native(matrix, atol=atol)
-    utils.gems_assert_equal(result, expected)
+    _assert_equal(result, expected)
 
 
 @pytest.mark.linalg_matrix_rank
@@ -494,15 +462,13 @@ def test_linalg_matrix_rank_broadcast_tolerance(dtype):
     )
     base = torch.diag(spectrum)
     matrix = base.expand(2, 3, 4, 4).clone()
-    atol = torch.tensor(
-        [[0.75], [1.3]], dtype=dtype, device=matrix.device
-    )
+    atol = torch.tensor([[0.75], [1.3]], dtype=dtype, device=matrix.device)
     expected = torch.tensor(
         [[3, 3, 3], [1, 1, 1]], dtype=torch.int64, device=matrix.device
     )
 
     result = _assert_direct_and_dispatch_match_native(matrix, atol=atol)
-    utils.gems_assert_equal(result, expected)
+    _assert_equal(result, expected)
 
 
 @pytest.mark.linalg_matrix_rank
@@ -518,7 +484,7 @@ def test_linalg_matrix_rank_hermitian_false(dtype):
     result = _assert_direct_and_dispatch_match_native(
         matrix, atol=5e-2, hermitian=False
     )
-    utils.gems_assert_equal(result, expected)
+    _assert_equal(result, expected)
 
 
 @pytest.mark.linalg_matrix_rank
@@ -531,10 +497,8 @@ def test_linalg_matrix_rank_hermitian_true(dtype):
     )
     expected = torch.tensor(2, dtype=torch.int64, device=matrix.device)
 
-    result = _assert_direct_and_dispatch_match_native(
-        matrix, atol=5e-2, hermitian=True
-    )
-    utils.gems_assert_equal(result, expected)
+    result = _assert_direct_and_dispatch_match_native(matrix, atol=5e-2, hermitian=True)
+    _assert_equal(result, expected)
 
 
 @pytest.mark.linalg_matrix_rank
@@ -547,10 +511,8 @@ def test_linalg_matrix_rank_hermitian_uses_lower_triangle(dtype):
     )
     expected = torch.tensor(1, dtype=torch.int64, device=matrix.device)
 
-    result = _assert_direct_and_dispatch_match_native(
-        matrix, atol=5e-2, hermitian=True
-    )
-    utils.gems_assert_equal(result, expected)
+    result = _assert_direct_and_dispatch_match_native(matrix, atol=5e-2, hermitian=True)
+    _assert_equal(result, expected)
 
 
 @pytest.mark.linalg_matrix_rank
@@ -590,10 +552,10 @@ def test_linalg_matrix_rank_hermitian_ignores_strict_upper(dtype, order, rank):
     for matrix in (clean, garbage):
         result = flag_gems.linalg_matrix_rank(matrix, atol=5e-2, hermitian=True)
         _assert_output_metadata(result, matrix)
-        utils.gems_assert_equal(result, expected.to(flag_gems.device))
+        _assert_equal(result, expected.to(flag_gems.device))
         with flag_gems.use_gems():
             dispatched = torch.linalg.matrix_rank(matrix, atol=5e-2, hermitian=True)
-        utils.gems_assert_equal(dispatched, expected.to(flag_gems.device))
+        _assert_equal(dispatched, expected.to(flag_gems.device))
 
 
 @pytest.mark.linalg_matrix_rank
@@ -602,10 +564,8 @@ def test_linalg_matrix_rank_hermitian_blocked(dtype):
     matrix = _make_matrix_with_rank((33, 33), 32, dtype)
     expected = torch.tensor(32, dtype=torch.int64, device=matrix.device)
 
-    result = _assert_direct_and_dispatch_match_native(
-        matrix, atol=5e-2, hermitian=True
-    )
-    utils.gems_assert_equal(result, expected)
+    result = _assert_direct_and_dispatch_match_native(matrix, atol=5e-2, hermitian=True)
+    _assert_equal(result, expected)
 
 
 @pytest.mark.linalg_matrix_rank
@@ -633,10 +593,8 @@ def test_linalg_matrix_rank_hermitian_tridiag(dtype, shape, expected_rank):
         device=matrix.device,
     )
 
-    result = _assert_direct_and_dispatch_match_native(
-        matrix, atol=5e-2, hermitian=True
-    )
-    utils.gems_assert_equal(result, expected)
+    result = _assert_direct_and_dispatch_match_native(matrix, atol=5e-2, hermitian=True)
+    _assert_equal(result, expected)
 
 
 @pytest.mark.linalg_matrix_rank
@@ -663,7 +621,7 @@ def test_linalg_matrix_rank_bidiag(dtype, shape, expected_rank):
     )
 
     result = _assert_direct_and_dispatch_match_native(matrix, atol=5e-2)
-    utils.gems_assert_equal(result, expected)
+    _assert_equal(result, expected)
 
 
 @pytest.mark.linalg_matrix_rank
@@ -694,10 +652,10 @@ def test_linalg_matrix_rank_bidiag_dense(dtype):
 
     result = flag_gems.linalg_matrix_rank(matrix, atol=5e-2)
     _assert_output_metadata(result, matrix)
-    utils.gems_assert_equal(result, reference.to(flag_gems.device))
+    _assert_equal(result, reference.to(flag_gems.device))
     with flag_gems.use_gems():
         dispatched = torch.linalg.matrix_rank(matrix, atol=5e-2)
-    utils.gems_assert_equal(dispatched, reference.to(flag_gems.device))
+    _assert_equal(dispatched, reference.to(flag_gems.device))
 
 
 @pytest.mark.linalg_matrix_rank
@@ -711,16 +669,12 @@ def test_linalg_matrix_rank_hermitian_tridiag_dense(dtype):
     basis = torch.randn(
         n, rank, dtype=dtype, device=flag_gems.device, generator=generator
     )
-    weights = torch.linspace(
-        2.0, 1.0, rank, dtype=dtype, device=flag_gems.device
-    )
+    weights = torch.linspace(2.0, 1.0, rank, dtype=dtype, device=flag_gems.device)
     matrix = basis @ torch.diag(weights) @ basis.mT
     expected = torch.tensor(rank, dtype=torch.int64, device=matrix.device)
 
-    result = _assert_direct_and_dispatch_match_native(
-        matrix, atol=5e-2, hermitian=True
-    )
-    utils.gems_assert_equal(result, expected)
+    result = _assert_direct_and_dispatch_match_native(matrix, atol=5e-2, hermitian=True)
+    _assert_equal(result, expected)
 
 
 @pytest.mark.linalg_matrix_rank
@@ -728,14 +682,10 @@ def test_linalg_matrix_rank_hermitian_tridiag_dense(dtype):
 @pytest.mark.parametrize("shape", EMPTY_SHAPES)
 def test_linalg_matrix_rank_empty(dtype, shape):
     matrix = torch.empty(shape, dtype=dtype, device=flag_gems.device)
-    expected = torch.zeros(
-        shape[:-2], dtype=torch.int64, device=flag_gems.device
-    )
+    expected = torch.zeros(shape[:-2], dtype=torch.int64, device=flag_gems.device)
 
-    result = _assert_direct_and_dispatch_match_native(
-        matrix, hermitian=False
-    )
-    utils.gems_assert_equal(result, expected)
+    result = _assert_direct_and_dispatch_match_native(matrix, hermitian=False)
+    _assert_equal(result, expected)
 
 
 @pytest.mark.linalg_matrix_rank
@@ -751,7 +701,7 @@ def test_linalg_matrix_rank_out(dtype):
     )
     assert result.data_ptr() == out.data_ptr()
     _assert_output_metadata(result, matrix)
-    utils.gems_assert_equal(result, expected)
+    _assert_equal(result, expected)
 
     dispatch_out = torch.empty((), dtype=torch.int64, device=matrix.device)
     with flag_gems.use_gems():
@@ -760,7 +710,7 @@ def test_linalg_matrix_rank_out(dtype):
         )
     assert dispatch_result.data_ptr() == dispatch_out.data_ptr()
     _assert_output_metadata(dispatch_result, matrix)
-    utils.gems_assert_equal(dispatch_result, expected)
+    _assert_equal(dispatch_result, expected)
 
 
 @pytest.mark.linalg_matrix_rank
@@ -794,7 +744,7 @@ def test_linalg_matrix_rank_out_wrong_shape_warns_and_resizes():
 
     assert result.data_ptr() == out.data_ptr()
     assert out.shape == torch.Size([])
-    utils.gems_assert_equal(result, expected)
+    _assert_equal(result, expected)
 
 
 @pytest.mark.linalg_matrix_rank
@@ -805,11 +755,9 @@ def test_linalg_matrix_rank_official_dtype_contract(dtype, is_supported):
     if is_supported:
         result = _assert_direct_and_dispatch_match_native(matrix)
         expected = torch.tensor(3, dtype=torch.int64, device=matrix.device)
-        utils.gems_assert_equal(result, expected)
+        _assert_equal(result, expected)
     else:
-        with pytest.raises(
-            NotImplementedError, match="float32 and float64"
-        ):
+        with pytest.raises(NotImplementedError, match="float32 and float64"):
             flag_gems.linalg_matrix_rank(matrix)
 
 
@@ -910,7 +858,7 @@ def test_linalg_matrix_rank_exact_path(shape, rank, hermitian, monkeypatch):
 
     result = flag_gems.linalg_matrix_rank(matrix, hermitian=hermitian)
     _assert_output_metadata(result, matrix)
-    utils.gems_assert_equal(result, reference.to(device=matrix.device))
+    _assert_equal(result, reference.to(device=matrix.device))
 
 
 @pytest.mark.linalg_matrix_rank
@@ -1018,7 +966,7 @@ def test_linalg_matrix_rank_nonsquare_tail_energy(dtype, shape, fill_row, fill_c
     expected = torch.tensor(min(m, n), dtype=torch.int64, device=matrix.device)
 
     result = _assert_direct_and_dispatch_match_native(matrix)
-    utils.gems_assert_equal(result, expected)
+    _assert_equal(result, expected)
 
 
 @pytest.mark.linalg_matrix_rank
@@ -1058,7 +1006,7 @@ def test_linalg_matrix_rank_nonsquare_lowrank(dtype, shape, rank):
 
     result = flag_gems.linalg_matrix_rank(matrix)
     _assert_output_metadata(result, matrix)
-    utils.gems_assert_equal(result, reference.to(device=matrix.device))
+    _assert_equal(result, reference.to(device=matrix.device))
 
 
 @pytest.mark.linalg_matrix_rank
@@ -1066,7 +1014,9 @@ def test_linalg_matrix_rank_nonsquare_lowrank(dtype, shape, rank):
 # Sturm qd chain (whose tie convention this test targets), while the generic
 # path uses one-sided Jacobi whose column-norm comparison is directly strict
 # (and its fp32 sum-of-squares cannot represent the subnormal-tie case).
-@pytest.mark.parametrize("k", [3, 33, 65, 128, 257] if IS_ASCEND else [33, 65, 128, 257])
+@pytest.mark.parametrize(
+    "k", [3, 33, 65, 128, 257] if IS_ASCEND else [33, 65, 128, 257]
+)
 def test_linalg_matrix_rank_hermitian_strict_threshold(k, monkeypatch):
     # The exact herm paths are the default dispatch (the 65..255 fast
     # unpivoted-QR band is opt-in via FLAGGEMS_MR_FAST_PATH=1); clear any
@@ -1094,7 +1044,7 @@ def test_linalg_matrix_rank_hermitian_strict_threshold(k, monkeypatch):
         result = flag_gems.linalg_matrix_rank(
             matrix, hermitian=True, atol=atol, rtol=rtol
         )
-        utils.gems_assert_equal(result, reference.to(device))
+        _assert_equal(result, reference.to(device))
 
     # negative tie: lambda == -tol must NOT be counted
     diag_case(torch.tensor([1.0, -0.5] + [0.0] * (k - 2)), 0.5, 0.0)
@@ -1146,7 +1096,7 @@ def test_linalg_matrix_rank_hermitian_strict_threshold(k, monkeypatch):
         result = flag_gems.linalg_matrix_rank(
             matrix, hermitian=True, atol=atol, rtol=0.0
         )
-        utils.gems_assert_equal(result, reference.to(device))
+        _assert_equal(result, reference.to(device))
 
     # batch + per-batch tensor tolerance
     matrix = torch.stack(
@@ -1163,7 +1113,7 @@ def test_linalg_matrix_rank_hermitian_strict_threshold(k, monkeypatch):
     result = flag_gems.linalg_matrix_rank(
         matrix.to(device), hermitian=True, atol=atol, rtol=rtol
     )
-    utils.gems_assert_equal(result, reference.to(device))
+    _assert_equal(result, reference.to(device))
 
 
 @pytest.mark.linalg_matrix_rank
@@ -1192,7 +1142,7 @@ def test_linalg_matrix_rank_negative_tolerances(k, hermitian):
         result = flag_gems.linalg_matrix_rank(
             mat, hermitian=hermitian, atol=atol, rtol=rtol
         )
-        utils.gems_assert_equal(result, reference.to(device))
+        _assert_equal(result, reference.to(device))
 
     # negative atol alone: behaves as atol = 0
     check(matrix, -1.0, 0.0)
@@ -1216,7 +1166,7 @@ def test_linalg_matrix_rank_negative_tolerances(k, hermitian):
         result = flag_gems.linalg_matrix_rank(
             upper_only, hermitian=True, atol=-1.0, rtol=-1.0
         )
-        utils.gems_assert_equal(result, reference.to(device))
+        _assert_equal(result, reference.to(device))
         # ... and a lower-triangle-only nonzero DOES give full rank under
         # tol < 0 (eigenvalues +1/-1 of the symmetrized matrix).
         lower_only = torch.zeros(k, k, dtype=torch.float32, device=device)
@@ -1228,7 +1178,7 @@ def test_linalg_matrix_rank_negative_tolerances(k, hermitian):
         result = flag_gems.linalg_matrix_rank(
             lower_only, hermitian=True, atol=-1.0, rtol=-1.0
         )
-        utils.gems_assert_equal(result, reference.to(device))
+        _assert_equal(result, reference.to(device))
 
         # Same three regimes through the TENSOR-tolerance branch (the async
         # early-exit fixup kernel): strict-upper garbage -> 0, lower-only
@@ -1243,7 +1193,7 @@ def test_linalg_matrix_rank_negative_tolerances(k, hermitian):
         result = flag_gems.linalg_matrix_rank(
             mixed, hermitian=True, atol=atol_t, rtol=rtol_t
         )
-        utils.gems_assert_equal(result, reference.to(device))
+        _assert_equal(result, reference.to(device))
 
     # batch + per-batch tensor tolerances mixing all three regimes
     batch = torch.stack([matrix, zero, matrix])
@@ -1255,7 +1205,7 @@ def test_linalg_matrix_rank_negative_tolerances(k, hermitian):
     result = flag_gems.linalg_matrix_rank(
         batch, hermitian=hermitian, atol=atol_t, rtol=rtol_t
     )
-    utils.gems_assert_equal(result, reference.to(device))
+    _assert_equal(result, reference.to(device))
 
 
 @pytest.mark.linalg_matrix_rank
@@ -1289,14 +1239,12 @@ def test_linalg_matrix_rank_longdim_exact_power2_nb(shape, monkeypatch):
     )
     result = flag_gems.linalg_matrix_rank(matrix)
     _assert_output_metadata(result, matrix)
-    utils.gems_assert_equal(result, reference.to(device=matrix.device))
+    _assert_equal(result, reference.to(device=matrix.device))
 
 
 @pytest.mark.linalg_matrix_rank
 @pytest.mark.parametrize("k,expect_rank", [(65, 1), (128, 1), (257, 1), (513, 1)])
-def test_linalg_matrix_rank_hermitian_deflated_spectrum(
-    k, expect_rank, monkeypatch
-):
+def test_linalg_matrix_rank_hermitian_deflated_spectrum(k, expect_rank, monkeypatch):
     # Exact paths are the default; clear any FAST_PATH leftover so the
     # large one-sided tridiagonalization path is really exercised.
     monkeypatch.delenv("FLAGGEMS_MR_FAST_PATH", raising=False)
@@ -1320,11 +1268,9 @@ def test_linalg_matrix_rank_hermitian_deflated_spectrum(
         matrix.cpu().double(), hermitian=True, atol=0.51, rtol=0.0
     )
     assert reference.item() == expect_rank  # 1.0 only; +/-0.5/-0.25 excluded
-    result = flag_gems.linalg_matrix_rank(
-        matrix, hermitian=True, atol=0.51, rtol=0.0
-    )
+    result = flag_gems.linalg_matrix_rank(matrix, hermitian=True, atol=0.51, rtol=0.0)
     assert torch.isfinite(result.cpu().double()).all()
-    utils.gems_assert_equal(result, reference.to(flag_gems.device))
+    _assert_equal(result, reference.to(flag_gems.device))
 
 
 @pytest.mark.linalg_matrix_rank
@@ -1365,9 +1311,7 @@ def test_linalg_matrix_rank_dispatch_boundary(shape, rank, hermitian, kind):
             nonzero = torch.ones(rank, dtype=torch.float64)
         else:
             nonzero = torch.logspace(0, -4, rank, dtype=torch.float64)
-        full = torch.cat(
-            [nonzero, torch.zeros(m - rank, dtype=torch.float64)]
-        )
+        full = torch.cat([nonzero, torch.zeros(m - rank, dtype=torch.float64)])
         matrix = ((basis * full) @ basis.mT).to(torch.float32)
     else:
         left = torch.linalg.qr(
@@ -1389,13 +1333,14 @@ def test_linalg_matrix_rank_dispatch_boundary(shape, rank, hermitian, kind):
     )
     result = flag_gems.linalg_matrix_rank(matrix, hermitian=hermitian)
     _assert_output_metadata(result, matrix)
-    utils.gems_assert_equal(result, reference.to(flag_gems.device))
+    _assert_equal(result, reference.to(flag_gems.device))
 
 
 @pytest.mark.linalg_matrix_rank
 @pytest.mark.skipif(not IS_ASCEND, reason="Ascend-specific path coverage")
-@pytest.mark.parametrize("k,hermitian", [(256, False), (513, False), (256, True),
-                                          (513, True)])
+@pytest.mark.parametrize(
+    "k,hermitian", [(256, False), (513, False), (256, True), (513, True)]
+)
 def test_linalg_matrix_rank_graph_vs_nograph(k, hermitian, monkeypatch):
     # The NPUGraph-replayed launch sequence must produce bit-identical
     # results to direct launches (FLAGGEMS_MR_NO_GRAPH=1).
@@ -1419,8 +1364,8 @@ def test_linalg_matrix_rank_graph_vs_nograph(k, hermitian, monkeypatch):
     monkeypatch.delenv("FLAGGEMS_MR_NO_GRAPH")
     graphed = flag_gems.linalg_matrix_rank(matrix, hermitian=hermitian)  # captures
     replayed = flag_gems.linalg_matrix_rank(matrix, hermitian=hermitian)  # replays
-    utils.gems_assert_equal(direct, graphed)
-    utils.gems_assert_equal(direct, replayed)
+    _assert_equal(direct, graphed)
+    _assert_equal(direct, replayed)
 
 
 @pytest.mark.linalg_matrix_rank
@@ -1447,13 +1392,13 @@ def test_linalg_matrix_rank_generic_graph_vs_nograph(shape, hermitian, monkeypat
 
     monkeypatch.setenv("FLAGGEMS_MR_NO_GRAPH", "1")
     direct = flag_gems.linalg_matrix_rank(matrix, hermitian=hermitian)
-    utils.gems_assert_equal(direct, reference.to(flag_gems.device))
+    _assert_equal(direct, reference.to(flag_gems.device))
 
     monkeypatch.delenv("FLAGGEMS_MR_NO_GRAPH")
     captured = flag_gems.linalg_matrix_rank(matrix, hermitian=hermitian)  # captures
     replayed = flag_gems.linalg_matrix_rank(matrix, hermitian=hermitian)  # replays
-    utils.gems_assert_equal(captured, reference.to(flag_gems.device))
-    utils.gems_assert_equal(replayed, reference.to(flag_gems.device))
+    _assert_equal(captured, reference.to(flag_gems.device))
+    _assert_equal(replayed, reference.to(flag_gems.device))
 
     # Replay with fresh data: the graph must re-read the staging buffers.
     fresh = torch.randn(*shape, generator=generator).float()
@@ -1461,13 +1406,13 @@ def test_linalg_matrix_rank_generic_graph_vs_nograph(shape, hermitian, monkeypat
         fresh = fresh + fresh.mT
     fresh = fresh.to(flag_gems.device)
     fresh_ref = torch.linalg.matrix_rank(fresh.cpu(), hermitian=hermitian)
-    utils.gems_assert_equal(
+    _assert_equal(
         flag_gems.linalg_matrix_rank(fresh, hermitian=hermitian),
         fresh_ref.to(flag_gems.device),
     )
     # Replay with a changed tolerance: tolerances are staging inputs too.
     tol_ref = torch.linalg.matrix_rank(fresh.cpu(), hermitian=hermitian, atol=0.5)
-    utils.gems_assert_equal(
+    _assert_equal(
         flag_gems.linalg_matrix_rank(fresh, hermitian=hermitian, atol=0.5),
         tol_ref.to(flag_gems.device),
     )
@@ -1483,16 +1428,14 @@ def test_linalg_matrix_rank_hermitian_ignores_strict_upper_large(k):
     generator = torch.Generator().manual_seed(k)
     lower = torch.tril(torch.randn(k, k, generator=generator))
     matrix = lower.clone()
-    matrix.masked_fill_(
-        torch.triu(torch.ones(k, k, dtype=torch.bool), 1), 1e6
-    )
+    matrix.masked_fill_(torch.triu(torch.ones(k, k, dtype=torch.bool), 1), 1e6)
     matrix = matrix.to(flag_gems.device)
     reference = torch.linalg.matrix_rank(
         (torch.tril(matrix.cpu().double()) + torch.tril(matrix.cpu().double(), -1).mT),
         hermitian=True,
     )
     result = flag_gems.linalg_matrix_rank(matrix, hermitian=True)
-    utils.gems_assert_equal(result, reference.to(flag_gems.device))
+    _assert_equal(result, reference.to(flag_gems.device))
 
 
 @pytest.mark.linalg_matrix_rank
@@ -1546,7 +1489,7 @@ def test_linalg_matrix_rank_ds32_fallback(shape, hermitian, monkeypatch):
         matrix = matrix.float().to(device)
         reference = torch.linalg.matrix_rank(matrix.cpu(), **kwargs)
         result = flag_gems.linalg_matrix_rank(matrix, **kwargs)
-        utils.gems_assert_equal(result, reference.to(device))
+        _assert_equal(result, reference.to(device))
 
     # full-rank dense
     check(dense, hermitian=hermitian)
@@ -1596,7 +1539,7 @@ def test_linalg_matrix_rank_extreme_scales(shape, hermitian, log10_scale):
     # cannot fix this: the launcher normalizes each matrix to O(1) up front
     # and shrinks atol by the same factor, which leaves the rank semantics
     # invariant.  Reference: exact CPU fp64 SVD with fp32-default rtol.
-    scale = 10.0 ** log10_scale
+    scale = 10.0**log10_scale
     generator = torch.Generator().manual_seed(sum(shape) + log10_scale)
     matrix = torch.randn(*shape, generator=generator)
     if hermitian:
@@ -1613,7 +1556,7 @@ def test_linalg_matrix_rank_extreme_scales(shape, hermitian, log10_scale):
         matrix.cpu().double(), hermitian=hermitian, rtol=rtol
     )
     result = flag_gems.linalg_matrix_rank(matrix, hermitian=hermitian)
-    utils.gems_assert_equal(result, reference.to(flag_gems.device))
+    _assert_equal(result, reference.to(flag_gems.device))
 
 
 @pytest.mark.linalg_matrix_rank
@@ -1630,7 +1573,7 @@ def test_linalg_matrix_rank_mixed_magnitude_batch():
     ).to(flag_gems.device)
     expected = torch.tensor([65, 65, 0], dtype=torch.int64)
     result = flag_gems.linalg_matrix_rank(batch, hermitian=True)
-    utils.gems_assert_equal(result, expected.to(flag_gems.device))
+    _assert_equal(result, expected.to(flag_gems.device))
 
 
 @pytest.mark.linalg_matrix_rank
@@ -1648,7 +1591,7 @@ def test_linalg_matrix_rank_tolerance_precision():
             matrix.cpu().double(), hermitian=True, atol=atol
         )
         result = flag_gems.linalg_matrix_rank(matrix, hermitian=True, atol=atol)
-        utils.gems_assert_equal(result, reference.to(flag_gems.device))
+        _assert_equal(result, reference.to(flag_gems.device))
 
     # nextafter boundary around a non-exact fp32 singular value (0.1).
     sigma = torch.tensor(0.1, dtype=torch.float32).item()
@@ -1688,7 +1631,7 @@ def test_linalg_matrix_rank_fp64_critical_spectrum(k):
         result = flag_gems.linalg_matrix_rank(
             matrix, hermitian=True, atol=0.0, rtol=rtol
         )
-        utils.gems_assert_equal(result, reference.to(flag_gems.device))
+        _assert_equal(result, reference.to(flag_gems.device))
 
 
 @pytest.mark.linalg_matrix_rank
@@ -1722,7 +1665,7 @@ def test_linalg_matrix_rank_graph_key_includes_ds32(monkeypatch):
 
     monkeypatch.setattr(module.runtime_device, "support_fp64", False)
     result = flag_gems.linalg_matrix_rank(matrix, hermitian=True)  # ds32 capture
-    utils.gems_assert_equal(result, reference.to(flag_gems.device))
+    _assert_equal(result, reference.to(flag_gems.device))
     assert len(module._MR_GRAPHS) == 2
     assert list(module._MR_GRAPHS)[1][0][4] is True
 
@@ -1789,7 +1732,7 @@ def test_linalg_matrix_rank_hermitian_blocked_dispatch(k, path, monkeypatch):
         matrix.cpu().double(), hermitian=True, rtol=rtol
     )
     result = flag_gems.linalg_matrix_rank(matrix, hermitian=True)
-    utils.gems_assert_equal(result, reference.to(flag_gems.device))
+    _assert_equal(result, reference.to(flag_gems.device))
     assert result.item() == 100
     # Backends whose blocked pipeline fails the known-answer self-test
     # legitimately fall back to the unblocked run even at k >= 768 -- the
@@ -1834,7 +1777,7 @@ def test_linalg_matrix_rank_hermitian_blocked_self_test_fallback(monkeypatch):
         matrix.cpu().double(), hermitian=True, rtol=rtol
     )
     result = flag_gems.linalg_matrix_rank(matrix, hermitian=True)
-    utils.gems_assert_equal(result, reference.to(flag_gems.device))
+    _assert_equal(result, reference.to(flag_gems.device))
     assert result.item() == 100
     assert not calls["blocked"]
     assert calls["unblocked"]
@@ -1863,11 +1806,9 @@ def test_linalg_matrix_rank_hermitian_blocked_ignores_strict_upper():
         garbage_cpu.double(), hermitian=True, atol=5e-2
     )
     clean_rank = flag_gems.linalg_matrix_rank(clean, hermitian=True, atol=5e-2)
-    garbage_rank = flag_gems.linalg_matrix_rank(
-        garbage, hermitian=True, atol=5e-2
-    )
-    utils.gems_assert_equal(garbage_rank, clean_rank)
-    utils.gems_assert_equal(garbage_rank, reference.to(flag_gems.device))
+    garbage_rank = flag_gems.linalg_matrix_rank(garbage, hermitian=True, atol=5e-2)
+    _assert_equal(garbage_rank, clean_rank)
+    _assert_equal(garbage_rank, reference.to(flag_gems.device))
 
 
 @pytest.mark.linalg_matrix_rank
@@ -1886,7 +1827,7 @@ def test_linalg_matrix_rank_hermitian_blocked_deflated(rank):
     )
     assert reference.item() == rank  # construction sanity
     result = flag_gems.linalg_matrix_rank(matrix, hermitian=True, atol=5e-2)
-    utils.gems_assert_equal(result, reference.to(flag_gems.device))
+    _assert_equal(result, reference.to(flag_gems.device))
 
 
 @pytest.mark.linalg_matrix_rank
@@ -1897,7 +1838,7 @@ def test_linalg_matrix_rank_hermitian_blocked_extreme_scales(log10_scale):
     # in-kernel init scaling must keep the panel algebra (which squares the
     # matrix scale) finite, with the rank semantics invariant.
     k = 768
-    scale = 10.0 ** log10_scale
+    scale = 10.0**log10_scale
     generator = torch.Generator().manual_seed(k + log10_scale)
     matrix = torch.randn(k, k, generator=generator, dtype=torch.float64)
     matrix = ((matrix + matrix.mT) * scale).float().to(flag_gems.device)
@@ -1906,7 +1847,7 @@ def test_linalg_matrix_rank_hermitian_blocked_extreme_scales(log10_scale):
         matrix.cpu().double(), hermitian=True, rtol=rtol
     )
     result = flag_gems.linalg_matrix_rank(matrix, hermitian=True)
-    utils.gems_assert_equal(result, reference.to(flag_gems.device))
+    _assert_equal(result, reference.to(flag_gems.device))
 
 
 @pytest.mark.linalg_matrix_rank
@@ -1927,7 +1868,7 @@ def test_linalg_matrix_rank_hermitian_blocked_critical_spectrum():
         result = flag_gems.linalg_matrix_rank(
             matrix, hermitian=True, atol=0.5, rtol=0.0
         )
-        utils.gems_assert_equal(result, reference.to(flag_gems.device))
+        _assert_equal(result, reference.to(flag_gems.device))
 
 
 @pytest.mark.linalg_matrix_rank
@@ -1950,7 +1891,7 @@ def test_linalg_matrix_rank_hermitian_blocked_ds32(monkeypatch):
     )
     assert reference.item() == 100  # construction sanity
     result = flag_gems.linalg_matrix_rank(matrix, hermitian=True)
-    utils.gems_assert_equal(result, reference.to(flag_gems.device))
+    _assert_equal(result, reference.to(flag_gems.device))
 
 
 @pytest.mark.linalg_matrix_rank
@@ -1969,7 +1910,7 @@ def test_linalg_matrix_rank_hermitian_blocked_batched():
     )
     assert reference.tolist() == [50, k]  # construction sanity
     result = flag_gems.linalg_matrix_rank(batch, hermitian=True, atol=5e-2)
-    utils.gems_assert_equal(result, reference.to(flag_gems.device))
+    _assert_equal(result, reference.to(flag_gems.device))
 
 
 @pytest.mark.linalg_matrix_rank
@@ -1992,7 +1933,7 @@ def test_linalg_matrix_rank_hermitian_blocked_repeatable():
         result = flag_gems.linalg_matrix_rank(
             matrix, hermitian=True, atol=0.5, rtol=0.0
         )
-        utils.gems_assert_equal(result, reference.to(flag_gems.device))
+        _assert_equal(result, reference.to(flag_gems.device))
 
 
 @pytest.mark.linalg_matrix_rank
@@ -2025,10 +1966,10 @@ def test_linalg_matrix_rank_hip_graph_gate(monkeypatch):
     module._MR_GRAPHS.clear()
     module._MR_GRAPH_BYTES = 0
     result = flag_gems.linalg_matrix_rank(matrix, hermitian=True)
-    utils.gems_assert_equal(result, reference.to(flag_gems.device))
+    _assert_equal(result, reference.to(flag_gems.device))
     assert len(module._MR_GRAPHS) == 1
     result = flag_gems.linalg_matrix_rank(matrix, hermitian=True)  # replay
-    utils.gems_assert_equal(result, reference.to(flag_gems.device))
+    _assert_equal(result, reference.to(flag_gems.device))
     assert len(module._MR_GRAPHS) == 1
 
     # Kill switch: direct launches, nothing captured.
@@ -2036,5 +1977,5 @@ def test_linalg_matrix_rank_hip_graph_gate(monkeypatch):
     module._MR_GRAPH_BYTES = 0
     monkeypatch.setenv("FLAGGEMS_MR_NO_GRAPH", "1")
     result = flag_gems.linalg_matrix_rank(matrix, hermitian=True)
-    utils.gems_assert_equal(result, reference.to(flag_gems.device))
+    _assert_equal(result, reference.to(flag_gems.device))
     assert len(module._MR_GRAPHS) == 0

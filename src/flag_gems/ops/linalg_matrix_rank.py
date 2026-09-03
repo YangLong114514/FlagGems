@@ -76,15 +76,11 @@ def _blocked_tridiag_ok(device):
             # Margins are ~100x on both sides: eigenvalues >= 1 versus
             # threshold 1e-4 * sigma_max(~100) ~ 1e-2, zero eigenspace
             # noise ~1e-5.  A working blocked path returns exactly 100.
-            tol_dtype = (
-                torch.float64 if _native_fp64_supported() else torch.float32
-            )
+            tol_dtype = torch.float64 if _native_fp64_supported() else torch.float32
             atol_t = torch.zeros((1,), dtype=tol_dtype).to(device)
             rtol_t = torch.full((1,), 1e-4, dtype=tol_dtype).to(device)
             s = float(a.abs().max().item())
-            scale = torch.tensor(
-                [s if s > 0 else 1.0], dtype=torch.float32
-            ).to(device)
+            scale = torch.tensor([s if s > 0 else 1.0], dtype=torch.float32).to(device)
             ws = _herm_tridiag_workspace(
                 device, 1, k, torch.float32, atol_t, rtol_t, True
             )
@@ -92,9 +88,7 @@ def _blocked_tridiag_ok(device):
             ws["atol"].copy_(atol_t)
             ws["rtol"].copy_(rtol_t)
             ws["scale"].copy_(scale)
-            _herm_tridiag_blocked_run(
-                ws, k, 1, not _native_fp64_supported()
-            )
+            _herm_tridiag_blocked_run(ws, k, 1, not _native_fp64_supported())
             verdict = bool(ws["rank"][0].item() == 100)
         except Exception:
             verdict = False
@@ -131,9 +125,7 @@ _MR_GRAPH_LOCK = threading.Lock()
 
 def _mr_workspace_bytes(ws):
     return sum(
-        t.numel() * t.element_size()
-        for t in ws.values()
-        if isinstance(t, torch.Tensor)
+        t.numel() * t.element_size() for t in ws.values() if isinstance(t, torch.Tensor)
     )
 
 
@@ -152,10 +144,7 @@ def _mr_graph_cached(key, device, make_workspace, copy_in, run, copy_out):
     # publishes the result.
     # Graph capture is only a performance optimization. Any capture failure
     # falls back to direct launches, and FLAGGEMS_MR_NO_GRAPH=1 disables it.
-    if (
-        device.type != "cuda"
-        or os.environ.get("FLAGGEMS_MR_NO_GRAPH") == "1"
-    ):
+    if device.type != "cuda" or os.environ.get("FLAGGEMS_MR_NO_GRAPH") == "1":
         ws = make_workspace()
         copy_in(ws)
         run(ws)
@@ -538,9 +527,7 @@ def _matrix_rank_fused_jacobi_kernel(
                     -ab_h * eps2,
                     -(ab_l * eps2 + ABS_EPS * eps2),
                 )
-                active = valid_pair & (
-                    (d_h > 0.0) | ((d_h == 0.0) & (d_l > 0.0))
-                )
+                active = valid_pair & ((d_h > 0.0) | ((d_h == 0.0) & (d_l > 0.0)))
                 diff_h, diff_l = _df64_add(b_h, b_l, -a_h, -a_l)
                 d2_h, d2_l = _df64_mul_ds(diff_h, diff_l, diff_h, diff_l)
                 u_h, u_l = _df64_add(d2_h, d2_l, 4.0 * g2_h, 4.0 * g2_l)
@@ -575,15 +562,12 @@ def _matrix_rank_fused_jacobi_kernel(
                 s = s_h.to(tl.float64) + s_l.to(tl.float64)
             else:
                 active = valid_pair & (
-                    tl.abs(gamma)
-                    > REL_EPS * tl.sqrt(alpha * beta + ABS_EPS)
+                    tl.abs(gamma) > REL_EPS * tl.sqrt(alpha * beta + ABS_EPS)
                 )
                 safe_gamma = tl.where(active, gamma, 1.0)
                 tau = (beta - alpha) / (2.0 * safe_gamma)
                 sign_tau = tl.where(tau >= 0.0, 1.0, -1.0)
-                t = sign_tau / (
-                    tl.abs(tau) + tl.sqrt(1.0 + tau * tau)
-                )
+                t = sign_tau / (tl.abs(tau) + tl.sqrt(1.0 + tau * tau))
                 c = 1.0 / tl.sqrt(1.0 + t * t)
                 s = t * c
             rotations += tl.sum(active.to(tl.int32), axis=0)
@@ -650,10 +634,7 @@ def _matrix_rank_fused_jacobi_kernel(
     max_value = tl.max(singular_values, axis=0)
     threshold = tl.maximum(atol, rtol * max_value)
     rank = tl.sum(
-        (
-            (singular_values > threshold)
-            & (singular_indices < K)
-        ).to(tl.int32),
+        ((singular_values > threshold) & (singular_indices < K)).to(tl.int32),
         axis=0,
     )
     tl.store(OUT + batch, rank.to(tl.int64))
@@ -678,8 +659,8 @@ def _df64_mul_ds(a_h, a_l, b_h, b_l):
     p = a_h * b_h
     e = tl.fma(a_h, b_h, -p) + a_h * b_l + a_l * b_h
     h = p + e
-    l = e - (h - p)
-    return h, l
+    lo = e - (h - p)
+    return h, lo
 
 
 @triton.jit
@@ -691,8 +672,8 @@ def _df64_div_ds(a_h, a_l, b_h, b_l):
     r_h, r_l = _df64_add(a_h, a_l, -p, -(pe + q1 * b_l))
     q2 = r_h / b_h
     h = q1 + q2
-    l = q2 - (h - q1)
-    return h, l
+    lo = q2 - (h - q1)
+    return h, lo
 
 
 @triton.jit
@@ -704,11 +685,11 @@ def _df64_sqrt_ds(a_h, a_l):
     r_h, r_l = _df64_add(a_h, a_l, -p, -pe)
     corr = r_h / (2.0 * x)
     h = x + corr
-    l = corr - (h - x)
+    lo = corr - (h - x)
     not_positive = a_h <= 0.0
     h = tl.where(not_positive, 0.0, h)
-    l = tl.where(not_positive, 0.0, l)
-    return h, l
+    lo = tl.where(not_positive, 0.0, lo)
+    return h, lo
 
 
 # ===========================================================================
@@ -892,9 +873,7 @@ def _matrix_rank_sturm_rank_kernel(
                 it = 0
                 while it < BISECT_ITERS:
                     mid = 0.5 * (lo + hi_p)
-                    cnt = _sturm_count_less(
-                        D, E2H, E2L, base, K, mid, STRICT=False
-                    )
+                    cnt = _sturm_count_less(D, E2H, E2L, base, K, mid, STRICT=False)
                     if cnt > 0:
                         hi_p = mid
                     else:
@@ -1262,9 +1241,7 @@ def _expand_tolerance(value, batch_shape, input, name):
             ) from error
         return value.to(dtype=tol_dtype).contiguous()
 
-    raise TypeError(
-        f"torch.linalg.matrix_rank: {name} must be a float or Tensor"
-    )
+    raise TypeError(f"torch.linalg.matrix_rank: {name} must be a float or Tensor")
 
 
 def _scalar_tolerance(value, name):
@@ -1409,9 +1386,7 @@ def _matrix_rank_herm_tridiag_step_kernel(
     for rb in tl.range(J // 64, (K + 63) // 64):
         r0 = rb * 64
         chf = tl.load(wbase + J * RS + r0 + lr)
-        dj += tl.sum(
-            chf * ((r0 + lr > J - 1) & (r0 + lr < J + 1)).to(dtype), axis=0
-        )
+        dj += tl.sum(chf * ((r0 + lr > J - 1) & (r0 + lr < J + 1)).to(dtype), axis=0)
         ch = chf * ((r0 + lr) > J).to(dtype)
         tl.store(V + pid * RS + r0 + lr, ch)
         ssq += tl.sum(ch * ch, axis=0)
@@ -1431,9 +1406,7 @@ def _matrix_rank_herm_tridiag_step_kernel(
 
 @libentry()
 @triton.jit
-def _matrix_rank_herm_tridiag_mat_kernel(
-    W, V, ACC, CSCA, J, RS, WPITCH, APITCH, NRT
-):
+def _matrix_rank_herm_tridiag_mat_kernel(W, V, ACC, CSCA, J, RS, WPITCH, APITCH, NRT):
     # omega = W_trailing @ v (symmetric matvec), multi-program over
     # (col tile, row strip) with atomic accumulation.  NRT counts the
     # K-trimmed trailing tiles (cdiv(K-1-J, 64)): with c0/r0 = J+1+tile*64
@@ -1468,8 +1441,23 @@ _HERM_TRIDIAG_SCRATCH_LINE = 32  # one 128B cache line per scratch entry
 @libentry()
 @triton.jit
 def _matrix_rank_herm_tridiag_pcol_kernel(
-    W, V, PV, PW, ACC, CSCA, PSCR, J, P, K, RS, WPITCH, APITCH, PVP, SPITCH,
-    NB_P: tl.constexpr, SL: tl.constexpr,
+    W,
+    V,
+    PV,
+    PW,
+    ACC,
+    CSCA,
+    PSCR,
+    J,
+    P,
+    K,
+    RS,
+    WPITCH,
+    APITCH,
+    PVP,
+    SPITCH,
+    NB_P: tl.constexpr,
+    SL: tl.constexpr,
 ):
     # Blocked WY tridiagonalization (LAPACK DSYTRD), column J = panel slot
     # P, phase A -- MULTI-PROGRAM over 64-row chunks: apply the deferred
@@ -1552,8 +1540,22 @@ def _matrix_rank_herm_tridiag_pcol_kernel(
 @libentry()
 @triton.jit
 def _matrix_rank_herm_tridiag_pmat_kernel(
-    W, V, D, E, ACC, CSCA, PSCR, J, K, RS, WPITCH, APITCH, SPITCH, NRT,
-    NB_P: tl.constexpr, SL: tl.constexpr,
+    W,
+    V,
+    D,
+    E,
+    ACC,
+    CSCA,
+    PSCR,
+    J,
+    K,
+    RS,
+    WPITCH,
+    APITCH,
+    SPITCH,
+    NRT,
+    NB_P: tl.constexpr,
+    SL: tl.constexpr,
 ):
     # Blocked WY column J, phase B: omega = W_trailing @ v (symmetric
     # matvec, multi-program with atomic accumulation into ACC, plus the
@@ -1594,8 +1596,21 @@ def _matrix_rank_herm_tridiag_pmat_kernel(
 @libentry()
 @triton.jit
 def _matrix_rank_herm_tridiag_pfin_kernel(
-    V, PV, PW, ACC, CSCA, PSCR, J, P, K, RS, APITCH, PVP, SPITCH,
-    NB_P: tl.constexpr, SL: tl.constexpr,
+    V,
+    PV,
+    PW,
+    ACC,
+    CSCA,
+    PSCR,
+    J,
+    P,
+    K,
+    RS,
+    APITCH,
+    PVP,
+    SPITCH,
+    NB_P: tl.constexpr,
+    SL: tl.constexpr,
 ):
     # Blocked WY column J = panel slot P, phase C -- MULTI-PROGRAM over
     # 64-row chunks: finish the corrected w and store the panel columns.
@@ -1869,7 +1884,7 @@ def _herm_tridiag_run(ws, k, batch_count, ds32):
     # barrier, so the launch never depends on SM count or block
     # co-residency.  Pure function of the workspace so it can be
     # graph-captured.
-    kp, rs = ws["kp"], ws["rs"]
+    rs = ws["rs"]
     wpitch, apitch = ws["wpitch"], ws["apitch"]
     w_buf, v_buf = ws["w_buf"], ws["v_buf"]
     diag, offdiag, taul = ws["diag"], ws["offdiag"], ws["taul"]
@@ -1947,7 +1962,7 @@ def _herm_tridiag_blocked_run(ws, k, batch_count, ds32):
     # (BLAS2, bandwidth-bound) with a per-panel BLAS3 pass.  Kernel launch
     # boundaries remain the ONLY cross-program ordering.  Pure function of
     # the workspace so it can be graph-captured.
-    kp, rs = ws["kp"], ws["rs"]
+    rs = ws["rs"]
     wpitch, apitch, pvp = ws["wpitch"], ws["apitch"], ws["pvp"]
     nb_p = ws["nb_p"]
     sl = _HERM_TRIDIAG_SCRATCH_LINE
@@ -2191,13 +2206,9 @@ def _matrix_rank_bidiag_bf_init_kernel(
         cc = c0 + lc
         mask = (rr < ROWS)[:, None] & (cc < K)[None, :]
         if TALL:
-            at = tl.load(
-                a_base + rr[:, None] * N + cc[None, :], mask=mask, other=0.0
-            )
+            at = tl.load(a_base + rr[:, None] * N + cc[None, :], mask=mask, other=0.0)
         else:
-            at = tl.load(
-                a_base + cc[None, :] * N + rr[:, None], mask=mask, other=0.0
-            )
+            at = tl.load(a_base + cc[None, :] * N + rr[:, None], mask=mask, other=0.0)
         tl.store(wbase + cc[None, :] * RS + rr[:, None], at / s, mask=mask)
 
 
@@ -2972,12 +2983,8 @@ def _copy_rank_to_out(input, result, out):
     return out
 
 
-def linalg_matrix_rank_out(
-    input, *, atol=None, rtol=None, hermitian=False, out=None
-):
-    result = linalg_matrix_rank(
-        input, atol=atol, rtol=rtol, hermitian=hermitian
-    )
+def linalg_matrix_rank_out(input, *, atol=None, rtol=None, hermitian=False, out=None):
+    result = linalg_matrix_rank(input, atol=atol, rtol=rtol, hermitian=hermitian)
     return _copy_rank_to_out(input, result, out)
 
 
