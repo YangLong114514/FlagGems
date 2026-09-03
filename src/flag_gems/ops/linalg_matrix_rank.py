@@ -15,6 +15,7 @@
 import collections
 import logging
 import os
+import struct
 import threading
 import warnings
 
@@ -1251,6 +1252,14 @@ def _scalar_tolerance(value, name):
         raise TypeError(
             f"torch.linalg.matrix_rank: {name} must be a float or Tensor"
         ) from error
+
+
+def _is_exact_float32(value):
+    try:
+        rounded = struct.unpack("f", struct.pack("f", value))[0]
+    except (OverflowError, struct.error):
+        return False
+    return rounded == value
 
 
 def _materialize_tolerance(value, batch_shape, input):
@@ -2751,11 +2760,15 @@ def _launch_matrix_rank(
     # Scalar tolerances are passed as tl.float64 kernel arguments; on
     # devices without native FP64 the f64 kernel code is off-limits even
     # under a constexpr guard that never fires, so fall back to the pointer
-    # path there.
+    # path there. Some Triton backends still lower scalar arguments to fp32,
+    # so a value that is not exactly representable in fp32 also uses an fp64
+    # pointer instead.
     scalar_tol = (
         not isinstance(atol, torch.Tensor)
         and not isinstance(rtol, torch.Tensor)
         and _native_fp64_supported()
+        and _is_exact_float32(atol)
+        and _is_exact_float32(rtol)
     )
     if small_path:
         # Small single-kernel paths take RAW tolerances and the scale, and
