@@ -57,18 +57,9 @@ _BLOCKED_TRIDIAG_OK = {}
 
 
 def _blocked_tridiag_ok(device):
-    # One-time END-TO-END self-test of the blocked WY tridiagonalization on
-    # THIS backend: factor a rotated rank-100 spectrum (k = 768, the smallest
-    # blocked size -- exactly the input class that miscompiled backends get
-    # wrong) with a direct (non-graph) launch of the real blocked run and
-    # check the rank.  This gates the blocked path because a backend-specific
-    # kernel miscompile there produces silently wrong ranks (observed: dense
-    # low-rank inputs returning ~full rank while diagonal inputs pass, on a
-    # backend whose tl.dot IS IEEE-fine -- a cheap dot probe did NOT catch
-    # it).  Known-answer self-test of the exact execution path being relied
-    # on, not a vendor check; any failure or exception disables the blocked
-    # path permanently (unblocked fallback: slower, dot-free, correct).
-    # Cached per device.
+    # Run the real blocked path once per device on a dense rank-100 input.
+    # Some backends silently miscompile this pipeline even when a small
+    # tl.dot probe passes, so any failure selects the slower unblocked path.
     key = (device.type, device.index)
     verdict = _BLOCKED_TRIDIAG_OK.get(key)
     if verdict is None:
@@ -159,17 +150,8 @@ def _mr_graph_cached(key, device, make_workspace, copy_in, run, copy_out):
     # make_workspace() allocates the persistent buffers, copy_in(ws) stages
     # the live inputs, run(ws) is the pure launch sequence, copy_out(ws)
     # publishes the result.
-    # Graph capture is a pure performance optimization, never a correctness
-    # requirement: any capture failure falls back to direct launches, and
-    # FLAGGEMS_MR_NO_GRAPH=1 disables graphs entirely.  Capture is attempted
-    # on every GPU build (device.type == "cuda" covers both genuine CUDA and
-    # ROCm/HIP stacks).  Historical note: ROCm-stack builds once HANG
-    # capturing the old multi-thousand-node sequences (a hang deadlocks the
-    # process and is not catchable), so HIP builds were gated behind an
-    # opt-in env var; the barrier-free redesign shrank the graphs and the
-    # current sequences capture+replay cleanly on the validated Hygon stack
-    # (torch 2.4.1 / hip 6.1), so graphs are now on by default everywhere.
-    # If an unvalidated HIP stack still hangs, set FLAGGEMS_MR_NO_GRAPH=1.
+    # Graph capture is only a performance optimization. Any capture failure
+    # falls back to direct launches, and FLAGGEMS_MR_NO_GRAPH=1 disables it.
     if (
         device.type != "cuda"
         or os.environ.get("FLAGGEMS_MR_NO_GRAPH") == "1"
@@ -231,14 +213,9 @@ def _mr_graph_cached(key, device, make_workspace, copy_in, run, copy_out):
         return
 
 
-
-
 def _jacobi_sweeps(k, is_fp64):
-    # Numerical rank is more sensitive to residual column correlation than
-    # returning approximate singular values. Keep a few more sweeps than the
-    # general SVD path, especially for float64. These are worst-case caps:
-    # the kernels stop as soon as the Weyl bound on the residual off-diagonal
-    # energy proves that no singular value can cross the rank threshold.
+    # These are worst-case caps; the kernel may stop earlier when the residual
+    # cannot change the rank.
     if is_fp64:
         if k <= 16:
             return 12
@@ -441,7 +418,6 @@ def _matrix_rank_fused_jacobi_kernel(
     BLOCK_R: tl.constexpr,
     BLOCK_P: tl.constexpr,
     BLOCK_K: tl.constexpr,
-    BLOCK_C: tl.constexpr,
     SWEEPS,
     REL_EPS: tl.constexpr,
     ABS_EPS: tl.constexpr,
@@ -683,16 +659,6 @@ def _matrix_rank_fused_jacobi_kernel(
     tl.store(OUT + batch, rank.to(tl.int64))
 
 
-
-
-
-
-
-
-
-
-
-
 @triton.jit
 def _df64_add(h1, l1, h2, l2):
     # Error-free addition of two double-single numbers (Knuth TwoSum on the
@@ -745,34 +711,9 @@ def _df64_sqrt_ds(a_h, a_l):
     return h, l
 
 
-
-
-
-
-
-
-
-
-
-
-
 # ===========================================================================
-# Hermitian fast path for large matrices: Householder tridiagonalization
-# followed by Sturm-sequence eigenvalue counting (Sylvester's law of
-# inertia). Unlike the iterative Jacobi sweeps this is non-iterative:
-# O(k^3) dense fp64 work spread over many blocks plus an O(k) counting
-# pass, with no convergence sweeps and no per-step full-column exchange.
+# Tridiagonal spectral counting helpers
 # ===========================================================================
-
-
-
-
-
-
-
-
-
-
 
 
 @libentry()
@@ -1491,7 +1432,7 @@ def _matrix_rank_herm_tridiag_step_kernel(
 @libentry()
 @triton.jit
 def _matrix_rank_herm_tridiag_mat_kernel(
-    W, V, ACC, CSCA, J, K, RS, WPITCH, APITCH, NRT
+    W, V, ACC, CSCA, J, RS, WPITCH, APITCH, NRT
 ):
     # omega = W_trailing @ v (symmetric matvec), multi-program over
     # (col tile, row strip) with atomic accumulation.  NRT counts the
@@ -1653,7 +1594,7 @@ def _matrix_rank_herm_tridiag_pmat_kernel(
 @libentry()
 @triton.jit
 def _matrix_rank_herm_tridiag_pfin_kernel(
-    V, PV, PW, ACC, CSCA, PSCR, J, P, K, RS, WPITCH, APITCH, PVP, SPITCH,
+    V, PV, PW, ACC, CSCA, PSCR, J, P, K, RS, APITCH, PVP, SPITCH,
     NB_P: tl.constexpr, SL: tl.constexpr,
 ):
     # Blocked WY column J = panel slot P, phase C -- MULTI-PROGRAM over
@@ -1724,7 +1665,7 @@ def _matrix_rank_herm_tridiag_pfin_kernel(
 @libentry()
 @triton.jit
 def _matrix_rank_herm_tridiag_rank2k_kernel(
-    W, PV, PW, T0, PE, K, RS, WPITCH, PVP, NT, NB_P: tl.constexpr
+    W, PV, PW, T0, PE, RS, WPITCH, PVP, NT, NB_P: tl.constexpr
 ):
     # Trailing symmetric rank-2k update S -= Vp Wp^T + Wp Vp^T over
     # rows/cols >= T0, one program per (col tile, row strip) of the
@@ -1970,7 +1911,6 @@ def _herm_tridiag_run(ws, k, batch_count, ds32):
                 acc,
                 csca,
                 j,
-                k,
                 rs,
                 wpitch,
                 apitch,
@@ -2090,7 +2030,6 @@ def _herm_tridiag_blocked_run(ws, k, batch_count, ds32):
                 p,
                 k,
                 rs,
-                wpitch,
                 apitch,
                 pvp,
                 spitch,
@@ -2108,7 +2047,6 @@ def _herm_tridiag_blocked_run(ws, k, batch_count, ds32):
                 pw,
                 t0,
                 pe,
-                k,
                 rs,
                 wpitch,
                 pvp,
@@ -2170,7 +2108,9 @@ def _herm_tridiag_sturm_tail(ws, k, batch_count, ds32):
     )
 
 
-def _launch_herm_tridiag_rank(matrix, atol_tensor, rtol_tensor, scale, out, k, batch_count, input):
+def _launch_herm_tridiag_rank(
+    matrix, atol_tensor, rtol_tensor, scale, out, k, batch_count, input
+):
     # Non-iterative hermitian path: symmetrize into a PADDED work matrix,
     # tridiagonalize with per-column barrier-free Householder steps, then
     # count eigenvalues outside [-tol, tol] with Sturm sequences.  The O(k)
@@ -2296,7 +2236,7 @@ def _matrix_rank_bidiag_lstep_kernel(W, V, D, TAU, ACC, J, K, RS, WPITCH, APITCH
 
 @libentry()
 @triton.jit
-def _matrix_rank_bidiag_lmat_kernel(W, V, ACC, J, K, RS, WPITCH, APITCH, NRC, RB0):
+def _matrix_rank_bidiag_lmat_kernel(W, V, ACC, J, RS, WPITCH, APITCH, NRC, RB0):
     # Left matvec omega[c] = sum_r W[c, r] * v[r] over trailing columns
     # c > J, multi-program over (col tile, row strip) with atomic
     # accumulation.  Row tiles below RB0 = J // 64 are skipped: v is zero
@@ -2318,7 +2258,9 @@ def _matrix_rank_bidiag_lmat_kernel(W, V, ACC, J, K, RS, WPITCH, APITCH, NRC, RB
 
 @libentry()
 @triton.jit
-def _matrix_rank_bidiag_lapply_kernel(W, V, TAU, ACC, J, K, RS, WPITCH, APITCH, NRC, RB0):
+def _matrix_rank_bidiag_lapply_kernel(
+    W, V, TAU, ACC, J, K, RS, WPITCH, APITCH, NRC, RB0
+):
     # Left trailing rank-1 update W[c, r] -= tau * omega[c] * v[r].
     # Row tiles below RB0 are skipped: v is zero there, so the update
     # would be a no-op (and the load+store is pure waste).
@@ -2341,7 +2283,7 @@ def _matrix_rank_bidiag_lapply_kernel(W, V, TAU, ACC, J, K, RS, WPITCH, APITCH, 
 
 @libentry()
 @triton.jit
-def _matrix_rank_bidiag_rstep_kernel(W, U, E, TAU, ACC, J, K, RS, WPITCH, UPITCH, APITCH):
+def _matrix_rank_bidiag_rstep_kernel(W, U, E, TAU, ACC, J, K, RS, WPITCH, APITCH):
     # Right reflector step J: row J on columns > J defines the reflector;
     # E[J] = +/-sigma.  Columns <= J contribute nothing (u has support on
     # c > J), so the pass starts at the (J+1)'s tile.
@@ -2371,7 +2313,7 @@ def _matrix_rank_bidiag_rstep_kernel(W, U, E, TAU, ACC, J, K, RS, WPITCH, UPITCH
 
 @libentry()
 @triton.jit
-def _matrix_rank_bidiag_rmat_kernel(W, U, ACC, J, K, RS, WPITCH, UPITCH, APITCH, NCC, CC0):
+def _matrix_rank_bidiag_rmat_kernel(W, U, ACC, J, K, RS, WPITCH, APITCH, NCC, CC0):
     # Right matvec omega[r] = sum_c W[c, r] * u[c] over trailing rows
     # r > J, multi-program over (row tile, col strip) with atomic
     # accumulation.  Column tiles below CC0 = (J+1) // 64 are skipped: u
@@ -2401,7 +2343,7 @@ def _matrix_rank_bidiag_rmat_kernel(W, U, ACC, J, K, RS, WPITCH, UPITCH, APITCH,
 
 @libentry()
 @triton.jit
-def _matrix_rank_bidiag_rapply_kernel(W, U, TAU, ACC, J, K, RS, WPITCH, UPITCH, APITCH, NTR):
+def _matrix_rank_bidiag_rapply_kernel(W, U, TAU, ACC, J, K, RS, WPITCH, APITCH, NTR):
     # Right trailing rank-1 update W[c, r] -= u[c] * (tau * omega[r]),
     # one program per (col tile, row strip).  Same RS-straddle mask as
     # the right matvec.
@@ -2431,7 +2373,9 @@ def _matrix_rank_bidiag_rapply_kernel(W, U, TAU, ACC, J, K, RS, WPITCH, UPITCH, 
     )
 
 
-def _bidiag_workspace(device, batch_count, m, n, k, rows, work_dtype, atol_tensor, rtol_tensor, ds32):
+def _bidiag_workspace(
+    device, batch_count, m, n, k, rows, work_dtype, atol_tensor, rtol_tensor, ds32
+):
     # All buffers the barrier-free bidiagonalization touches, allocated up
     # front so the launch sequence is a pure function of the workspace and
     # can be graph-captured (capture requires stable buffer addresses).
@@ -2443,7 +2387,6 @@ def _bidiag_workspace(device, batch_count, m, n, k, rows, work_dtype, atol_tenso
         "kp": kp,
         "rs": rs,
         "wpitch": kp * rs,
-        "upitch": kp * (k + 64),
         "w_buf": torch.zeros((batch_count, kp, rs), dtype=work_dtype, device=device),
         # Only the CURRENT step's left/right reflector is alive at any
         # time, so one row per batch suffices for each (the step kernels
@@ -2486,9 +2429,15 @@ def _bidiag_workspace(device, batch_count, m, n, k, rows, work_dtype, atol_tenso
         )
         # Keep the per-batch stride at 2K (one slack entry): the Sturm kernel
         # indexes the off-diagonal with stride K == 2k.
-        ws["gk_off"] = torch.empty((batch_count, 2 * k), dtype=work_dtype, device=device)
-        ws["e2_hi"] = torch.empty((batch_count, 2 * k), dtype=torch.float32, device=device)
-        ws["e2_lo"] = torch.empty((batch_count, 2 * k), dtype=torch.float32, device=device)
+        ws["gk_off"] = torch.empty(
+            (batch_count, 2 * k), dtype=work_dtype, device=device
+        )
+        ws["e2_hi"] = torch.empty(
+            (batch_count, 2 * k), dtype=torch.float32, device=device
+        )
+        ws["e2_lo"] = torch.empty(
+            (batch_count, 2 * k), dtype=torch.float32, device=device
+        )
     return ws
 
 
@@ -2501,7 +2450,7 @@ def _bidiag_run(ws, m, n, k, rows, batch_count, ds32):
     # block co-residency.  Pure function of the workspace so it can be
     # graph-captured.
     kp, rs = ws["kp"], ws["rs"]
-    wpitch, upitch = ws["wpitch"], ws["upitch"]
+    wpitch = ws["wpitch"]
     w_buf, v_buf, u_buf = ws["w_buf"], ws["v_buf"], ws["u_buf"]
     diag, offdiag = ws["diag"], ws["offdiag"]
     taul, taur = ws["taul"], ws["taur"]
@@ -2552,7 +2501,6 @@ def _bidiag_run(ws, m, n, k, rows, batch_count, ds32):
                 v_buf,
                 acc,
                 j,
-                k,
                 rs,
                 wpitch,
                 kp,
@@ -2590,7 +2538,6 @@ def _bidiag_run(ws, m, n, k, rows, batch_count, ds32):
                 k,
                 rs,
                 wpitch,
-                upitch,
                 rs,
                 num_warps=4,
                 num_stages=1,
@@ -2603,7 +2550,6 @@ def _bidiag_run(ws, m, n, k, rows, batch_count, ds32):
                 k,
                 rs,
                 wpitch,
-                upitch,
                 rs,
                 ncct,
                 cc0,
@@ -2619,7 +2565,6 @@ def _bidiag_run(ws, m, n, k, rows, batch_count, ds32):
                 k,
                 rs,
                 wpitch,
-                upitch,
                 rs,
                 ntr,
                 num_warps=4,
@@ -2686,7 +2631,9 @@ def _bidiag_run(ws, m, n, k, rows, batch_count, ds32):
     )
 
 
-def _launch_bidiag_rank(matrix, atol_tensor, rtol_tensor, scale, out, m, n, k, rows, batch_count, input):
+def _launch_bidiag_rank(
+    matrix, atol_tensor, rtol_tensor, scale, out, m, n, k, rows, batch_count, input
+):
     # Non-hermitian path past the fused-Jacobi size limits: copy into a
     # PADDED tall work matrix, reduce to bidiagonal form with per-column
     # barrier-free Golub-Kahan steps, then count singular values above the
@@ -2920,7 +2867,6 @@ def _launch_matrix_rank(
                 BLOCK_R=block_r,
                 BLOCK_P=block_p,
                 BLOCK_K=block_k,
-                BLOCK_C=block_c,
                 SWEEPS=sweeps,
                 REL_EPS=relative_epsilon,
                 ABS_EPS=absolute_epsilon,
@@ -2971,7 +2917,7 @@ def _correct_negative_tolerance_rank(input, result, atol, rtol, hermitian):
 
 
 def linalg_matrix_rank(input, *, atol=None, rtol=None, hermitian=False):
-    """Computes numerical matrix rank with shape-specialized Triton Jacobi."""
+    """Computes numerical matrix rank using shape-specialized Triton kernels."""
     logger.debug("GEMS LINALG_MATRIX_RANK")
     _check_input(input, hermitian)
 
