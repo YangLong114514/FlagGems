@@ -510,8 +510,9 @@ def _kslice_trsm_kernel_notle(
         tl.debug_barrier()
 
 
-def linalg_solve_triangular(A, B, *, upper, left=True, unitriangular=False, out=None):
-    logger.debug("GEMS_HYGON LINALG_SOLVE_TRIANGULAR")
+def linalg_solve_triangular_impl(
+    A, B, *, upper, left=True, unitriangular=False, out=None
+):
     if A.dtype not in (torch.float32, torch.float64):
         raise ValueError("linalg_solve_triangular only supports float32 and float64")
     if B.dtype != A.dtype:
@@ -675,9 +676,17 @@ def linalg_solve_triangular(A, B, *, upper, left=True, unitriangular=False, out=
     return B_view
 
 
+def linalg_solve_triangular(A, B, *, upper, left=True, unitriangular=False, out=None):
+    logger.debug("GEMS_HYGON LINALG_SOLVE_TRIANGULAR")
+    return linalg_solve_triangular_impl(
+        A, B, upper=upper, left=left, unitriangular=unitriangular, out=out
+    )
+
+
 def linalg_solve_triangular_out(
     A, B, *, upper, left=True, unitriangular=False, out=None
 ):
-    return linalg_solve_triangular(
+    logger.debug("GEMS_HYGON LINALG_SOLVE_TRIANGULAR_OUT")
+    return linalg_solve_triangular_impl(
         A, B, upper=upper, left=left, unitriangular=unitriangular, out=out
     )
