@@ -511,7 +511,7 @@ def _kslice_trsm_kernel_notle(
 
 
 def linalg_solve_triangular(A, B, *, upper, left=True, unitriangular=False, out=None):
-    logger.debug("GEMS LINALG_SOLVE_TRIANGULAR")
+    logger.debug("GEMS_HYGON LINALG_SOLVE_TRIANGULAR")
     if A.dtype not in (torch.float32, torch.float64):
         raise ValueError("linalg_solve_triangular only supports float32 and float64")
     if B.dtype != A.dtype:
