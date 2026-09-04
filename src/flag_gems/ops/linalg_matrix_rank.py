@@ -53,53 +53,62 @@ def _native_fp64_supported():
     return getattr(runtime_device, "support_fp64", True)
 
 
-# One-time verdict per device for _blocked_tridiag_ok (see below).
+# One-time verdict per device for _blocked_tridiag_ok (see below).  The
+# lock makes concurrent first calls run the probe exactly once.
 _BLOCKED_TRIDIAG_OK = {}
+_BLOCKED_TRIDIAG_LOCK = threading.Lock()
 
 
-def _blocked_tridiag_ok(device):
+def _blocked_tridiag_probe(device):
     # Run the real blocked path once per device on a dense rank-100 input.
     # Some backends silently miscompile this pipeline even when a small
     # tl.dot probe passes, so any failure selects the slower unblocked path.
+    try:
+        k = _HERM_TRIDIAG_BLOCKED_MIN_K
+        generator = torch.Generator().manual_seed(0)
+        # Rank-100 by construction: F @ F.mT / k with F in R^{k x 100} has
+        # exactly 100 nonzero eigenvalues; the smallest sits near the
+        # Wishart lower edge (~0.4), far above the atol=5e-2 threshold,
+        # while the zero eigenspace only sees fp32 rounding noise (~1e-5).
+        # Margins are wide on both sides: a working blocked path returns
+        # exactly 100.  A single fp64 GEMM (not a full k x k QR) keeps the
+        # one-time cold-call cost small.
+        factor = torch.randn(k, 100, generator=generator, dtype=torch.float64)
+        a = ((factor @ factor.mT) / k).float().to(device)
+        tol_dtype = torch.float64 if _native_fp64_supported() else torch.float32
+        atol_t = torch.full((1,), 5e-2, dtype=tol_dtype).to(device)
+        rtol_t = torch.zeros((1,), dtype=tol_dtype).to(device)
+        s = float(a.abs().max().item())
+        scale = torch.tensor([s if s > 0 else 1.0], dtype=torch.float32).to(device)
+        ws = _herm_tridiag_workspace(device, 1, k, torch.float32, atol_t, rtol_t, True)
+        ws["staging"].copy_(a.reshape(1, k, k))
+        ws["atol"].copy_(atol_t)
+        ws["rtol"].copy_(rtol_t)
+        ws["scale"].copy_(scale)
+        _herm_tridiag_blocked_run(ws, k, 1, not _native_fp64_supported())
+        verdict = bool(ws["rank"][0].item() == 100)
+    except Exception:
+        verdict = False
+    if not verdict:
+        logger.warning(
+            "matrix_rank: blocked tridiagonalization self-test failed "
+            "on %s; using the unblocked path (slower but correct)",
+            device,
+        )
+    return verdict
+
+
+def _blocked_tridiag_ok(device):
+    # Double-checked locking: the probe ends in a synchronizing .item(), so
+    # concurrent first calls must not repeat it.
     key = (device.type, device.index)
     verdict = _BLOCKED_TRIDIAG_OK.get(key)
     if verdict is None:
-        verdict = False
-        try:
-            k = _HERM_TRIDIAG_BLOCKED_MIN_K
-            generator = torch.Generator().manual_seed(0)
-            basis = torch.linalg.qr(
-                torch.randn(k, k, generator=generator, dtype=torch.float64)
-            )[0]
-            spectrum = torch.zeros(k, dtype=torch.float64)
-            spectrum[:100] = torch.arange(1, 101, dtype=torch.float64)
-            a = ((basis * spectrum) @ basis.mT).float().to(device)
-            # Margins are ~100x on both sides: eigenvalues >= 1 versus
-            # threshold 1e-4 * sigma_max(~100) ~ 1e-2, zero eigenspace
-            # noise ~1e-5.  A working blocked path returns exactly 100.
-            tol_dtype = torch.float64 if _native_fp64_supported() else torch.float32
-            atol_t = torch.zeros((1,), dtype=tol_dtype).to(device)
-            rtol_t = torch.full((1,), 1e-4, dtype=tol_dtype).to(device)
-            s = float(a.abs().max().item())
-            scale = torch.tensor([s if s > 0 else 1.0], dtype=torch.float32).to(device)
-            ws = _herm_tridiag_workspace(
-                device, 1, k, torch.float32, atol_t, rtol_t, True
-            )
-            ws["staging"].copy_(a.reshape(1, k, k))
-            ws["atol"].copy_(atol_t)
-            ws["rtol"].copy_(rtol_t)
-            ws["scale"].copy_(scale)
-            _herm_tridiag_blocked_run(ws, k, 1, not _native_fp64_supported())
-            verdict = bool(ws["rank"][0].item() == 100)
-        except Exception:
-            verdict = False
-        if not verdict:
-            logger.warning(
-                "matrix_rank: blocked tridiagonalization self-test failed "
-                "on %s; using the unblocked path (slower but correct)",
-                device,
-            )
-        _BLOCKED_TRIDIAG_OK[key] = verdict
+        with _BLOCKED_TRIDIAG_LOCK:
+            verdict = _BLOCKED_TRIDIAG_OK.get(key)
+            if verdict is None:
+                verdict = _blocked_tridiag_probe(device)
+                _BLOCKED_TRIDIAG_OK[key] = verdict
     return verdict
 
 
@@ -2788,9 +2797,15 @@ def _launch_matrix_rank(
         # and atol are staged UNSCALED and divided by the staged scale
         # INSIDE the captured sequence (pad/bidiag init kernels and
         # _matrix_rank_scale_tol_kernel), so no O(k^2) scaled temporary is
-        # materialized outside the graph.
+        # materialized outside the graph.  The workspace buffers are flat
+        # (batch_count,), so flatten the staged metadata the same way the
+        # matrix was flattened: a (2, 3, 65, 65) input arrives with
+        # tolerances shaped (2, 3), and Tensor.copy_ does not reshape
+        # equal-numel tensors.
         atol_tensor = _materialize_tolerance(atol, output_shape, input)
         rtol_tensor = _materialize_tolerance(rtol, output_shape, input)
+        atol_tensor = atol_tensor.reshape(batch_count)
+        rtol_tensor = rtol_tensor.reshape(batch_count)
     out = torch.empty(output_shape, dtype=torch.int64, device=input.device)
     block_r = triton.next_power_of_2(rows)
     relative_epsilon = 1.0e-15 if is_fp64 else 1.0e-7
@@ -2946,10 +2961,12 @@ def linalg_matrix_rank(input, *, atol=None, rtol=None, hermitian=False):
     _check_input(input, hermitian)
 
     output_shape = input.shape[:-2]
+    # Validate tolerances BEFORE the empty-input return: native torch runs
+    # its same-device / non-complex tolerance checks first, so an empty
+    # matrix must still reject an invalid tensor tolerance.
+    atol_val, rtol_val = _prepare_tolerances(input, atol, rtol)
     if input.numel() == 0:
         return _empty_matrix_rank(input, output_shape)
-
-    atol_val, rtol_val = _prepare_tolerances(input, atol, rtol)
     result = _launch_matrix_rank(
         input,
         atol_val,

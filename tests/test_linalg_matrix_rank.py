@@ -1942,3 +1942,129 @@ def test_linalg_matrix_rank_hip_graph_gate(monkeypatch):
     result = module.linalg_matrix_rank(matrix, hermitian=True)
     _assert_equal(result, reference.to(flag_gems.device))
     assert len(module._MR_GRAPHS) == 0
+
+
+@pytest.mark.linalg_matrix_rank
+@pytest.mark.skipif(IS_ASCEND, reason="Ascend backend has its own implementation")
+def test_linalg_matrix_rank_empty_validates_tolerances():
+    # Native torch runs its same-device / non-complex tolerance checks
+    # BEFORE its empty-input return; FlagGems must match, so an empty
+    # matrix still rejects invalid tensor tolerances.
+    matrix = torch.empty(2, 0, 5, device=flag_gems.device)
+    result = flag_gems.linalg_matrix_rank(matrix)
+    reference = torch.linalg.matrix_rank(matrix.cpu())
+    _assert_equal(result, reference.to(flag_gems.device))
+
+    complex_tol = torch.ones(2, dtype=torch.complex64, device=matrix.device)
+    with pytest.raises(RuntimeError, match="complex"):
+        flag_gems.linalg_matrix_rank(matrix, atol=complex_tol)
+    if matrix.device.type != "cpu":
+        cpu_tol = torch.ones(2)
+        with pytest.raises(RuntimeError, match="same device"):
+            flag_gems.linalg_matrix_rank(matrix, rtol=cpu_tol)
+
+
+@pytest.mark.linalg_matrix_rank
+@pytest.mark.skipif(IS_ASCEND, reason="Ascend backend has its own implementation")
+@pytest.mark.parametrize("hermitian", [False, True], ids=["bidiag", "herm"])
+@pytest.mark.parametrize(
+    "tol_kind", ["scalar", "broadcast"], ids=["scalar-tol", "broadcast-tol"]
+)
+def test_linalg_matrix_rank_multidim_batch_large_path(
+    hermitian, tol_kind, monkeypatch
+):
+    # A (2, 3, 65, 65) input flattens to batch_count 6 on the large
+    # decomposition paths; the staged atol/rtol metadata must be flattened
+    # to (6,) as well, or the copy into the (6,) workspace buffer fails
+    # (Tensor.copy_ does not reshape equal-numel tensors).  The small
+    # single-kernel paths never hit this -- they index raw pointers.  Both
+    # direct (no-graph) and graph capture+replay executions are checked.
+    module = importlib.import_module("flag_gems.ops.linalg_matrix_rank")
+    k = 65
+    generator = torch.Generator().manual_seed(13)
+    # Batch member 0 is rank 10 by construction (FF.mT/k: smallest nonzero
+    # eigenvalue near the Wishart lower edge ~0.4, far above atol); the
+    # rest are diagonal-dominant dense (singular values far above atol),
+    # so the fp64 CPU oracle and the fp32 result agree without ambiguity.
+    factor = torch.randn(k, 10, dtype=torch.float64, generator=generator)
+    base = torch.empty(6, k, k, dtype=torch.float64)
+    base[0] = (factor @ factor.mT) / k
+    dense = torch.randn(5, k, k, dtype=torch.float64, generator=generator)
+    if hermitian:
+        dense = dense + dense.mT
+        shift = 6.0 * k ** 0.5
+    else:
+        shift = 3.0 * k ** 0.5
+    dense += torch.eye(k, dtype=torch.float64) * shift
+    base[1:] = dense
+    matrix = base.float().reshape(2, 3, k, k).to(flag_gems.device)
+
+    atol = 5e-2
+    kwargs = {"hermitian": hermitian, "atol": atol}
+    if tol_kind == "broadcast":
+        # Broadcastable tensor tolerance: (3,) -> batch shape (2, 3).
+        kwargs["atol"] = torch.full((3,), atol, device=flag_gems.device)
+    reference = torch.linalg.matrix_rank(base, hermitian=hermitian, atol=atol)
+    reference = reference.reshape(2, 3).to(flag_gems.device)
+    assert reference.flatten()[0].item() == 10  # construction sanity
+
+    expected_shape = (2, 3)
+
+    # Direct launches (kill switch on): nothing captured.
+    module._MR_GRAPHS.clear()
+    module._MR_GRAPH_BYTES = 0
+    monkeypatch.setenv("FLAGGEMS_MR_NO_GRAPH", "1")
+    result = flag_gems.linalg_matrix_rank(matrix, **kwargs)
+    assert result.shape == expected_shape
+    _assert_equal(result, reference)
+
+    # Graph capture + replay (skipped silently on no-graph builds).
+    monkeypatch.delenv("FLAGGEMS_MR_NO_GRAPH", raising=False)
+    module._MR_GRAPHS.clear()
+    module._MR_GRAPH_BYTES = 0
+    first = flag_gems.linalg_matrix_rank(matrix, **kwargs)
+    replay = flag_gems.linalg_matrix_rank(matrix, **kwargs)
+    assert first.shape == expected_shape
+    _assert_equal(first, reference)
+    _assert_equal(replay, reference)
+
+
+@pytest.mark.linalg_matrix_rank
+@pytest.mark.skipif(IS_ASCEND, reason="Ascend backend has its own implementation")
+def test_linalg_matrix_rank_blocked_probe_runs_once(monkeypatch):
+    # Cold-call coverage for the blocked-path dispatch: the first eligible
+    # call runs the one-time known-answer probe exactly once (the verdict
+    # cache is double-checked under a lock), and the dispatched result is
+    # correct whether the verdict enables blocked (healthy backend) or
+    # falls back to unblocked.
+    module = importlib.import_module("flag_gems.ops.linalg_matrix_rank")
+    module._BLOCKED_TRIDIAG_OK.clear()
+    module._MR_GRAPHS.clear()
+    module._MR_GRAPH_BYTES = 0
+    calls = []
+    orig_probe = module._blocked_tridiag_probe
+
+    def spy_probe(device):
+        calls.append(device)
+        return orig_probe(device)
+
+    monkeypatch.setattr(module, "_blocked_tridiag_probe", spy_probe)
+
+    k = 768
+    matrix = _blocked_rotated_spectrum(k, list(range(1, 101)), seed=5).to(
+        flag_gems.device
+    )
+    # fp32 rounding lifts the zero eigenspace to ~1e-5, so the fp64 oracle
+    # uses the FP32-default rtol.
+    rtol = k * torch.finfo(torch.float32).eps
+    reference = torch.linalg.matrix_rank(
+        matrix.cpu().double(), hermitian=True, rtol=rtol
+    )
+    assert reference.item() == 100  # construction sanity
+
+    first = flag_gems.linalg_matrix_rank(matrix, hermitian=True)
+    _assert_equal(first, reference.to(flag_gems.device))
+    assert len(calls) == 1  # cold call probed exactly once
+    second = flag_gems.linalg_matrix_rank(matrix, hermitian=True)
+    _assert_equal(second, reference.to(flag_gems.device))
+    assert len(calls) == 1  # verdict cached, no repeat
