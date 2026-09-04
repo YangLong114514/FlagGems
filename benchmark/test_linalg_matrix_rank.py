@@ -160,6 +160,17 @@ class MatrixRankHermitianBenchmark(base.GenericBenchmark):
         self.shapes = shapes
 
 
+class MatrixRankOverloadBenchmark(base.GenericBenchmark):
+    """Core-shape benchmark for matrix_rank overload adapters."""
+
+    DEFAULT_SHAPE_DESC = "*, M, N"
+
+    def set_shapes(self, shape_file_path=None):
+        # Overloads share the same decomposition kernels, so core shapes are
+        # sufficient to measure tolerance conversion and out-copy overhead.
+        self.shapes = MATRIX_RANK_CORE_SHAPES.copy()
+
+
 def _composed_matrix_rank(matrix, atol=None, rtol=None, hermitian=False):
     """matrix_rank composed from native NPU ops (svdvals + reduction).
 
@@ -182,7 +193,7 @@ def _composed_matrix_rank(matrix, atol=None, rtol=None, hermitian=False):
     return (svals > tol).sum(dim=-1)
 
 
-@pytest.mark.linalg_matrix_rank
+@pytest.mark.linalg_matrix_rank_atol_rtol_float
 def test_linalg_matrix_rank():
     def matrix_rank_input_fn(shape, cur_dtype, device):
         matrix = torch.randn(shape, dtype=cur_dtype, device=device)
@@ -198,7 +209,7 @@ def test_linalg_matrix_rank():
     bench.run()
 
 
-@pytest.mark.linalg_matrix_rank
+@pytest.mark.linalg_matrix_rank_atol_rtol_float
 def test_linalg_matrix_rank_hermitian():
     def matrix_rank_hermitian_input_fn(shape, cur_dtype, device):
         matrix = torch.randn(shape, dtype=cur_dtype, device=device)
@@ -221,4 +232,108 @@ def test_linalg_matrix_rank_hermitian():
         dtypes=MATRIX_RANK_DTYPES,
     )
     bench.set_gems(flag_gems.linalg_matrix_rank)
+    bench.run()
+
+
+@pytest.mark.parametrize(
+    "op_name,legacy,tensor_tolerance,use_out,gems_op",
+    [
+        pytest.param(
+            "linalg_matrix_rank",
+            True,
+            False,
+            False,
+            flag_gems.linalg_matrix_rank_tol,
+            marks=pytest.mark.linalg_matrix_rank,
+            id="legacy-float",
+        ),
+        pytest.param(
+            "linalg_matrix_rank_tol_tensor",
+            True,
+            True,
+            False,
+            flag_gems.linalg_matrix_rank_tol,
+            marks=pytest.mark.linalg_matrix_rank_tol_tensor,
+            id="legacy-tensor",
+        ),
+        pytest.param(
+            "linalg_matrix_rank_out",
+            True,
+            False,
+            True,
+            flag_gems.linalg_matrix_rank_tol_out,
+            marks=pytest.mark.linalg_matrix_rank_out,
+            id="legacy-float-out",
+        ),
+        pytest.param(
+            "linalg_matrix_rank_out_tol_tensor",
+            True,
+            True,
+            True,
+            flag_gems.linalg_matrix_rank_tol_out,
+            marks=pytest.mark.linalg_matrix_rank_out_tol_tensor,
+            id="legacy-tensor-out",
+        ),
+        pytest.param(
+            "linalg_matrix_rank_atol_rtol_tensor",
+            False,
+            True,
+            False,
+            flag_gems.linalg_matrix_rank,
+            marks=pytest.mark.linalg_matrix_rank_atol_rtol_tensor,
+            id="atol-rtol-tensor",
+        ),
+        pytest.param(
+            "linalg_matrix_rank_atol_rtol_float_out",
+            False,
+            False,
+            True,
+            flag_gems.linalg_matrix_rank_out,
+            marks=pytest.mark.linalg_matrix_rank_atol_rtol_float_out,
+            id="atol-rtol-float-out",
+        ),
+        pytest.param(
+            "linalg_matrix_rank_atol_rtol_tensor_out",
+            False,
+            True,
+            True,
+            flag_gems.linalg_matrix_rank_out,
+            marks=pytest.mark.linalg_matrix_rank_atol_rtol_tensor_out,
+            id="atol-rtol-tensor-out",
+        ),
+    ],
+)
+def test_linalg_matrix_rank_overloads(
+    op_name,
+    legacy,
+    tensor_tolerance,
+    use_out,
+    gems_op,
+):
+    def matrix_rank_overload_input_fn(shape, cur_dtype, device):
+        matrix = torch.randn(shape, dtype=cur_dtype, device=device)
+        tolerance = (
+            torch.tensor(0.0, dtype=cur_dtype, device=device)
+            if tensor_tolerance
+            else 0.0
+        )
+        args = [matrix]
+        kwargs = {}
+        if legacy:
+            args.append(tolerance)
+        else:
+            kwargs["atol"] = tolerance
+        if use_out:
+            kwargs["out"] = torch.empty(shape[:-2], dtype=torch.int64, device=device)
+        if kwargs:
+            args.append(kwargs)
+        yield tuple(args)
+
+    bench = MatrixRankOverloadBenchmark(
+        input_fn=matrix_rank_overload_input_fn,
+        op_name=op_name,
+        torch_op=torch.linalg.matrix_rank,
+        dtypes=MATRIX_RANK_DTYPES,
+    )
+    bench.set_gems(gems_op)
     bench.run()

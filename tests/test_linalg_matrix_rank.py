@@ -343,6 +343,7 @@ def test_linalg_matrix_rank_aah_svd_matches_hermitian(dtype):
 
 
 @pytest.mark.linalg_matrix_rank
+@pytest.mark.linalg_matrix_rank_atol_rtol_float
 @pytest.mark.parametrize("dtype", SUPPORTED_DTYPE_CASES)
 @pytest.mark.parametrize(
     "kwargs,expected_rank",
@@ -414,6 +415,27 @@ def test_linalg_matrix_rank_legacy_float_tolerance(dtype):
 
 
 @pytest.mark.linalg_matrix_rank
+@pytest.mark.linalg_matrix_rank_tol_tensor
+@pytest.mark.parametrize("dtype", SUPPORTED_DTYPE_CASES)
+def test_linalg_matrix_rank_legacy_tensor_tolerance(dtype):
+    spectrum = torch.tensor(
+        [1.5, 1.25, 0.8, 0.1],
+        dtype=dtype,
+        device=flag_gems.device,
+    )
+    matrix = torch.diag(spectrum)
+    tolerance = torch.tensor(0.75, dtype=dtype, device=matrix.device)
+    ref_matrix = utils.to_reference(matrix, True)
+    native = torch.linalg.matrix_rank(
+        ref_matrix, _to_reference_value(tolerance, ref_matrix.device)
+    )
+
+    direct = flag_gems.linalg_matrix_rank_tol(matrix, tolerance)
+    _assert_equal(direct, native)
+
+
+@pytest.mark.linalg_matrix_rank
+@pytest.mark.linalg_matrix_rank_atol_rtol_tensor
 @pytest.mark.parametrize("dtype", SUPPORTED_DTYPE_CASES)
 def test_linalg_matrix_rank_per_batch_tolerance(dtype):
     spectrum = torch.tensor(
@@ -658,6 +680,7 @@ def test_linalg_matrix_rank_empty(dtype, shape):
 
 
 @pytest.mark.linalg_matrix_rank
+@pytest.mark.linalg_matrix_rank_atol_rtol_float_out
 @pytest.mark.parametrize("dtype", SUPPORTED_DTYPE_CASES)
 def test_linalg_matrix_rank_out(dtype):
     matrix = _make_matrix_with_rank((3, 5), 2, dtype).mT
@@ -668,6 +691,59 @@ def test_linalg_matrix_rank_out(dtype):
     result = flag_gems.linalg_matrix_rank_out(
         matrix, atol=5e-2, hermitian=False, out=out
     )
+    assert result.data_ptr() == out.data_ptr()
+    _assert_output_metadata(result, matrix)
+    _assert_equal(result, expected)
+
+
+@pytest.mark.linalg_matrix_rank
+@pytest.mark.linalg_matrix_rank_atol_rtol_tensor_out
+@pytest.mark.parametrize("dtype", SUPPORTED_DTYPE_CASES)
+def test_linalg_matrix_rank_tensor_tolerance_out(dtype):
+    matrix = torch.diag(
+        torch.tensor([1.5, 1.25, 0.8, 0.1], dtype=dtype, device=flag_gems.device)
+    )
+    tolerance = torch.tensor(0.75, dtype=dtype, device=matrix.device)
+    expected = torch.tensor(3, dtype=torch.int64, device=matrix.device)
+    out = torch.empty((), dtype=torch.int64, device=matrix.device)
+
+    result = flag_gems.linalg_matrix_rank_out(matrix, atol=tolerance, out=out)
+
+    assert result.data_ptr() == out.data_ptr()
+    _assert_output_metadata(result, matrix)
+    _assert_equal(result, expected)
+
+
+@pytest.mark.linalg_matrix_rank
+@pytest.mark.linalg_matrix_rank_out
+@pytest.mark.parametrize("dtype", SUPPORTED_DTYPE_CASES)
+def test_linalg_matrix_rank_legacy_float_tolerance_out(dtype):
+    matrix = torch.diag(
+        torch.tensor([1.5, 1.25, 0.8, 0.1], dtype=dtype, device=flag_gems.device)
+    )
+    expected = torch.tensor(3, dtype=torch.int64, device=matrix.device)
+    out = torch.empty((), dtype=torch.int64, device=matrix.device)
+
+    result = flag_gems.linalg_matrix_rank_tol_out(matrix, 0.75, out=out)
+
+    assert result.data_ptr() == out.data_ptr()
+    _assert_output_metadata(result, matrix)
+    _assert_equal(result, expected)
+
+
+@pytest.mark.linalg_matrix_rank
+@pytest.mark.linalg_matrix_rank_out_tol_tensor
+@pytest.mark.parametrize("dtype", SUPPORTED_DTYPE_CASES)
+def test_linalg_matrix_rank_legacy_tensor_tolerance_out(dtype):
+    matrix = torch.diag(
+        torch.tensor([1.5, 1.25, 0.8, 0.1], dtype=dtype, device=flag_gems.device)
+    )
+    tolerance = torch.tensor(0.75, dtype=dtype, device=matrix.device)
+    expected = torch.tensor(3, dtype=torch.int64, device=matrix.device)
+    out = torch.empty((), dtype=torch.int64, device=matrix.device)
+
+    result = flag_gems.linalg_matrix_rank_tol_out(matrix, tolerance, out=out)
+
     assert result.data_ptr() == out.data_ptr()
     _assert_output_metadata(result, matrix)
     _assert_equal(result, expected)
