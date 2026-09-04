@@ -1970,9 +1970,7 @@ def test_linalg_matrix_rank_empty_validates_tolerances():
 @pytest.mark.parametrize(
     "tol_kind", ["scalar", "broadcast"], ids=["scalar-tol", "broadcast-tol"]
 )
-def test_linalg_matrix_rank_multidim_batch_large_path(
-    hermitian, tol_kind, monkeypatch
-):
+def test_linalg_matrix_rank_multidim_batch_large_path(hermitian, tol_kind, monkeypatch):
     # A (2, 3, 65, 65) input flattens to batch_count 6 on the large
     # decomposition paths; the staged atol/rtol metadata must be flattened
     # to (6,) as well, or the copy into the (6,) workspace buffer fails
@@ -1992,9 +1990,9 @@ def test_linalg_matrix_rank_multidim_batch_large_path(
     dense = torch.randn(5, k, k, dtype=torch.float64, generator=generator)
     if hermitian:
         dense = dense + dense.mT
-        shift = 6.0 * k ** 0.5
+        shift = 6.0 * k**0.5
     else:
-        shift = 3.0 * k ** 0.5
+        shift = 3.0 * k**0.5
     dense += torch.eye(k, dtype=torch.float64) * shift
     base[1:] = dense
     matrix = base.float().reshape(2, 3, k, k).to(flag_gems.device)
