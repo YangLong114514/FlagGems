@@ -2025,19 +2025,21 @@ def test_linalg_matrix_rank_hip_graph_gate(monkeypatch):
 def test_linalg_matrix_rank_empty_validates_tolerances():
     # Native torch runs its same-device / non-complex tolerance checks
     # BEFORE its empty-input return; FlagGems must match, so an empty
-    # matrix still rejects invalid tensor tolerances.
+    # matrix still rejects invalid tensor tolerances.  Direct module API:
+    # vendor plugins may override the public flag_gems entry.
+    module = importlib.import_module("flag_gems.ops.linalg_matrix_rank")
     matrix = torch.empty(2, 0, 5, device=flag_gems.device)
-    result = flag_gems.linalg_matrix_rank(matrix)
+    result = module.linalg_matrix_rank(matrix)
     reference = torch.linalg.matrix_rank(matrix.cpu())
     _assert_equal(result, reference.to(flag_gems.device))
 
     complex_tol = torch.ones(2, dtype=torch.complex64, device=matrix.device)
     with pytest.raises(RuntimeError, match="complex"):
-        flag_gems.linalg_matrix_rank(matrix, atol=complex_tol)
+        module.linalg_matrix_rank(matrix, atol=complex_tol)
     if matrix.device.type != "cpu":
         cpu_tol = torch.ones(2)
         with pytest.raises(RuntimeError, match="same device"):
-            flag_gems.linalg_matrix_rank(matrix, rtol=cpu_tol)
+            module.linalg_matrix_rank(matrix, rtol=cpu_tol)
 
 
 @pytest.mark.linalg_matrix_rank
@@ -2084,11 +2086,13 @@ def test_linalg_matrix_rank_multidim_batch_large_path(hermitian, tol_kind, monke
 
     expected_shape = (2, 3)
 
-    # Direct launches (kill switch on): nothing captured.
+    # Direct launches (kill switch on): nothing captured.  Direct module
+    # API: vendor plugins may override the public flag_gems entry, and the
+    # graph-cache assertions below are about THIS module.
     module._MR_GRAPHS.clear()
     module._MR_GRAPH_BYTES = 0
     monkeypatch.setenv("FLAGGEMS_MR_NO_GRAPH", "1")
-    result = flag_gems.linalg_matrix_rank(matrix, **kwargs)
+    result = module.linalg_matrix_rank(matrix, **kwargs)
     assert result.shape == expected_shape
     _assert_equal(result, reference)
 
@@ -2096,8 +2100,8 @@ def test_linalg_matrix_rank_multidim_batch_large_path(hermitian, tol_kind, monke
     monkeypatch.delenv("FLAGGEMS_MR_NO_GRAPH", raising=False)
     module._MR_GRAPHS.clear()
     module._MR_GRAPH_BYTES = 0
-    first = flag_gems.linalg_matrix_rank(matrix, **kwargs)
-    replay = flag_gems.linalg_matrix_rank(matrix, **kwargs)
+    first = module.linalg_matrix_rank(matrix, **kwargs)
+    replay = module.linalg_matrix_rank(matrix, **kwargs)
     assert first.shape == expected_shape
     _assert_equal(first, reference)
     _assert_equal(replay, reference)
@@ -2136,9 +2140,9 @@ def test_linalg_matrix_rank_blocked_probe_runs_once(monkeypatch):
     )
     assert reference.item() == 100  # construction sanity
 
-    first = flag_gems.linalg_matrix_rank(matrix, hermitian=True)
+    first = module.linalg_matrix_rank(matrix, hermitian=True)
     _assert_equal(first, reference.to(flag_gems.device))
     assert len(calls) == 1  # cold call probed exactly once
-    second = flag_gems.linalg_matrix_rank(matrix, hermitian=True)
+    second = module.linalg_matrix_rank(matrix, hermitian=True)
     _assert_equal(second, reference.to(flag_gems.device))
     assert len(calls) == 1  # verdict cached, no repeat
