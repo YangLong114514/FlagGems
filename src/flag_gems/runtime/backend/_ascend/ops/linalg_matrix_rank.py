@@ -2480,6 +2480,11 @@ def _launch_longdim_rank(
                 NB=min(4, triton.next_power_of_2(max(1, rs // 64))),
                 num_warps=4,
                 num_stages=1,
+                # CANN 9 may auto-multibuffer the four live 64x64 tiles in
+                # the NB=4 specialization, which pushes UB usage past the
+                # 192 KiB limit. The panel is already register-resident, so
+                # multibuffering only duplicates storage here.
+                multibuffer=False,
             )
         else:
             _fast_launch(
@@ -2656,6 +2661,10 @@ def _launch_rrqr_rank(
                     NB=nb,
                     num_warps=4,
                     num_stages=1,
+                    # Keep the NB=4 specialization within the 192 KiB UB
+                    # budget on CANN 9; this panel already keeps its tiles
+                    # resident and does not benefit from extra buffering.
+                    multibuffer=False,
                 )
             else:
                 _fast_launch(
