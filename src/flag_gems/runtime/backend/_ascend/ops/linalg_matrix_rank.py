@@ -62,8 +62,7 @@ rank semantics are invariant under the scaling (rtol is relative).
 
 Implementation note: the RRQR kernels below are extremely sensitive to this
 toolchain's codegen instabilities; the inline comments document every
-workaround (they are load-bearing -- do not "clean them up"). See the report
-matrix_rank_昇腾算子实现报告.md for the full defect list and methodology.
+workaround (they are load-bearing -- do not "clean them up").
 """
 
 import logging
@@ -193,9 +192,7 @@ def _expand_tolerance(value, batch_count, batch_shape, input, name):
         raise TypeError(
             f"torch.linalg.matrix_rank: {name} must be a float or Tensor"
         ) from error
-    return torch.full(
-        (batch_count,), scalar, dtype=input.dtype, device=input.device
-    )
+    return torch.full((batch_count,), scalar, dtype=input.dtype, device=input.device)
 
 
 def _prepare_tolerances(input, atol, rtol):
@@ -208,9 +205,7 @@ def _prepare_tolerances(input, atol, rtol):
     )
 
     if rtol is not None:
-        rtol_tensor = _expand_tolerance(
-            rtol, batch_count, batch_shape, input, "rtol"
-        )
+        rtol_tensor = _expand_tolerance(rtol, batch_count, batch_shape, input, "rtol")
     else:
         default_rtol = max(m, n) * torch.finfo(input.dtype).eps
         if atol_is_set:
@@ -588,13 +583,9 @@ def _matrix_rank_fused_jacobi_kernel(
                     other=0.0,
                 )
             elif TALL:
-                values = tl.load(
-                    a_base + rows * N + column, mask=row_mask, other=0.0
-                )
+                values = tl.load(a_base + rows * N + column, mask=row_mask, other=0.0)
             else:
-                values = tl.load(
-                    a_base + column * N + rows, mask=row_mask, other=0.0
-                )
+                values = tl.load(a_base + column * N + rows, mask=row_mask, other=0.0)
             tl.store(work_base + column * ROWS + rows, values, mask=row_mask)
             column += 1
 
@@ -1127,7 +1118,9 @@ def _matrix_rank_tridiag_kernel(
         dmask = ((rows > j - 1) & (rows < j + 1)).to(tl.float32)
         d_vec = d_vec + v_vec * dmask
         e_vec = e_vec + alpha * dmask
-    vlast = tl.sum(tl.where((cols[None, :] > K - 2) & (cols[None, :] < K), g, 0.0), axis=1)
+    vlast = tl.sum(
+        tl.where((cols[None, :] > K - 2) & (cols[None, :] < K), g, 0.0), axis=1
+    )
     d_vec = d_vec + vlast * ((rows > K - 2) & (rows < K)).to(tl.float32)
     # NOTE: the store carries the batch offset (the pre-fusion version wrote
     # every program's d/e to batch 0's slot, corrupting batched inputs).
@@ -1226,7 +1219,9 @@ def _matrix_rank_small_fused_kernel(
             dmask = ((rows > j - 1) & (rows < j + 1)).to(tl.float32)
             d_vec = d_vec + v_vec * dmask
             e_vec = e_vec + alpha * dmask
-        vlast = tl.sum(tl.where((cols[None, :] > K - 2) & (cols[None, :] < K), g, 0.0), axis=1)
+        vlast = tl.sum(
+            tl.where((cols[None, :] > K - 2) & (cols[None, :] < K), g, 0.0), axis=1
+        )
         d_vec = d_vec + vlast * ((rows > K - 2) & (rows < K)).to(tl.float32)
         # eigenvalue-domain tridiagonal: feed the Sturm count directly.
         dd = d_vec
@@ -1270,7 +1265,9 @@ def _matrix_rank_small_fused_kernel(
                 gT = tl.trans(g)
             if j + 1 < K:
                 # E[j] = alpha2: the right reflection maps g[j, j+1] to +/-sigma
-                e_vec = e_vec + alpha2 * ((rows > j - 1) & (rows < j + 1)).to(tl.float32)
+                e_vec = e_vec + alpha2 * ((rows > j - 1) & (rows < j + 1)).to(
+                    tl.float32
+                )
         # B^T B tridiagonal entries, exact from the bidiagonal d/e:
         # dd_i = d_i^2 + e_{i-1}^2, ee_i = d_i * e_i.
         shift2d = (cols[None, :] > rows[:, None] - 2) & (cols[None, :] < rows[:, None])
@@ -1290,7 +1287,9 @@ def _matrix_rank_small_fused_kernel(
 
 
 @triton.jit
-def _matrix_rank_bidiag64_kernel(A, D, E, M, N, K, BLOCK: tl.constexpr):    # One program per matrix: Golub-Kahan bidiagonalization for the
+def _matrix_rank_bidiag64_kernel(
+    A, D, E, M, N, K, BLOCK: tl.constexpr
+):  # One program per matrix: Golub-Kahan bidiagonalization for the
     # non-hermitian 32 < k <= 64 band (m, n <= 64), writing the RAW
     # bidiagonal d/e to global memory (the Sturm tail -- to_tridiag /
     # sturm_big / sturm_final -- is shared with the large-matrix path).
@@ -1386,7 +1385,9 @@ def _mr_extract_upper_kernel(W, PIV, RB, K, RS, WPITCH, BLOCK: tl.constexpr):
         other=0.0,
     )
     piv = tl.load(PIV + pid * K + lc, mask=lc < K, other=0.0)
-    tile = tile + piv[:, None] * ((lr[None, :] > lc[:, None] - 1) & (lr[None, :] < lc[:, None] + 1)).to(tl.float32)
+    tile = tile + piv[:, None] * (
+        (lr[None, :] > lc[:, None] - 1) & (lr[None, :] < lc[:, None] + 1)
+    ).to(tl.float32)
     # tile[c, r] = R[r, c]; scatter to row-major RB[r*K + c]
     tl.store(
         RB + pid * K * K + lr[None, :] * K + lc[:, None],
@@ -1431,9 +1432,7 @@ def _matrix_rank_sturm_kernel(
     base = batch * BLOCK
     d = tl.load(D + base + kidx, mask=kidx < K, other=0.0)
     e_cur = tl.load(E + base + kidx, mask=kidx < K - 1, other=0.0)
-    e_prev = tl.load(
-        E + base + kidx - 1, mask=(kidx >= 1) & (kidx < K), other=0.0
-    )
+    e_prev = tl.load(E + base + kidx - 1, mask=(kidx >= 1) & (kidx < K), other=0.0)
     if BIDIAG:
         dd = d * d + e_prev * e_prev
         ee = d * e_cur
@@ -1463,12 +1462,8 @@ def _matrix_rank_sturm_kernel(
             sigma_lo = tl.maximum(tl.abs(dmax), tl.abs(tl.min(d, axis=0)))
             tol_lo = tl.maximum(atol, rtol * sigma_lo)
             tol_hi = tl.maximum(atol, rtol * hi)
-            cnt_lo_p, cnt_lo_n = _sturm_count_posneg2(
-                D, E, base, K, tol_lo, -tol_lo
-            )
-            cnt_hi_p, cnt_hi_n = _sturm_count_posneg2(
-                D, E, base, K, tol_hi, -tol_hi
-            )
+            cnt_lo_p, cnt_lo_n = _sturm_count_posneg2(D, E, base, K, tol_lo, -tol_lo)
+            cnt_hi_p, cnt_hi_n = _sturm_count_posneg2(D, E, base, K, tol_hi, -tol_hi)
             rank_lo = (K - cnt_lo_p) + cnt_lo_n
             rank_hi = (K - cnt_hi_p) + cnt_hi_n
         else:
@@ -1702,32 +1697,71 @@ def _launch_tridiag_rank(
                 if not tol_tensor:
                     # the Sturm tail kernels take tolerance tensors
                     at_arg = torch.full(
-                        (batch_count,), atol_val, dtype=torch.float32,
+                        (batch_count,),
+                        atol_val,
+                        dtype=torch.float32,
                         device=input.device,
                     )
                     rt_arg = torch.full(
-                        (batch_count,), rtol_val, dtype=torch.float32,
+                        (batch_count,),
+                        rtol_val,
+                        dtype=torch.float32,
                         device=input.device,
                     )
                 _fast_launch(
-                    _matrix_rank_bidiag64_kernel, (batch_count,),
-                    matrix, d, e, m, n, k, BLOCK=64,
-                    num_warps=4, num_stages=1, enable_fp_fusion=True,
+                    _matrix_rank_bidiag64_kernel,
+                    (batch_count,),
+                    matrix,
+                    d,
+                    e,
+                    m,
+                    n,
+                    k,
+                    BLOCK=64,
+                    num_warps=4,
+                    num_stages=1,
+                    enable_fp_fusion=True,
                 )
                 _fast_launch(
-                    _mr_bidiag_to_tridiag_kernel, (batch_count,),
-                    d, e, ddbuf, eebuf, k, BLOCK=64, num_warps=1, num_stages=1,
+                    _mr_bidiag_to_tridiag_kernel,
+                    (batch_count,),
+                    d,
+                    e,
+                    ddbuf,
+                    eebuf,
+                    k,
+                    BLOCK=64,
+                    num_warps=1,
+                    num_stages=1,
                 )
                 _fast_launch(
-                    _mr_sturm_big_kernel, (batch_count,),
-                    ddbuf, eebuf, at_arg, rt_arg, out.reshape(batch_count),
-                    tol2_buf, flag_buf, k, BLOCK=64, BISECT_ITERS=32,
-                    num_warps=1, num_stages=1,
+                    _mr_sturm_big_kernel,
+                    (batch_count,),
+                    ddbuf,
+                    eebuf,
+                    at_arg,
+                    rt_arg,
+                    out.reshape(batch_count),
+                    tol2_buf,
+                    flag_buf,
+                    k,
+                    BLOCK=64,
+                    BISECT_ITERS=32,
+                    num_warps=1,
+                    num_stages=1,
                 )
                 _fast_launch(
-                    _mr_sturm_final_kernel, (batch_count,),
-                    d, e, tol2_buf, flag_buf, out.reshape(batch_count), k,
-                    num_warps=1, num_stages=1, enable_fp_fusion=False,
+                    _mr_sturm_final_kernel,
+                    (batch_count,),
+                    d,
+                    e,
+                    tol2_buf,
+                    flag_buf,
+                    out.reshape(batch_count),
+                    k,
+                    num_warps=1,
+                    num_stages=1,
+                    enable_fp_fusion=False,
                 )
                 return out
             if os.environ.get("FLAGGEMS_MR_FAST_PATH") != "1":
@@ -1834,7 +1868,6 @@ def _launch_tridiag_rank(
     return out
 
 
-
 # ---------------------------------------------------------------------------
 # Large matrices (fp32, 64 < k <= 255): blocked Householder QR, unpivoted.
 # The rank is #{ |R_ii| > max(atol, rtol * sigma_max) } with sigma_max
@@ -1872,9 +1905,18 @@ def _launch_tridiag_rank(
 
 @triton.jit
 def _mr_rrqr_init_kernel(
-    A, W, NRM2, FROB,
-    M, N, K, ROWS, RS, WPITCH,
-    TALL: tl.constexpr, HERMITIAN: tl.constexpr,
+    A,
+    W,
+    NRM2,
+    FROB,
+    M,
+    N,
+    K,
+    ROWS,
+    RS,
+    WPITCH,
+    TALL: tl.constexpr,
+    HERMITIAN: tl.constexpr,
 ):
     b = tl.program_id(0)
     c0 = tl.program_id(1) * 64
@@ -1916,8 +1958,16 @@ def _mr_rrqr_init_kernel(
 
 @triton.jit
 def _mr_rrqr_panel_kernel(
-    W, V, NRM2, PIV, TAU,
-    J0, B, K, RS, WPITCH,
+    W,
+    V,
+    NRM2,
+    PIV,
+    TAU,
+    J0,
+    B,
+    K,
+    RS,
+    WPITCH,
 ):
     # GM-tile panel factorization for ROWS > 256 (the panel does not fit in
     # register tiles there). No pivoting -- selection/per-step pivoting cost
@@ -1968,21 +2018,15 @@ def _mr_rrqr_panel_kernel(
         colmask = ((lc > jj) & (J0 + lc < K)).to(tl.float32)
         wacc = tl.zeros((64,), dtype=tl.float32)
         for rb in tl.range(j // 64, RB):
-            tile = tl.load(
-                wbase + (J0 + lc)[:, None] * RS + (rb * 64 + lr)[None, :]
-            )
+            tile = tl.load(wbase + (J0 + lc)[:, None] * RS + (rb * 64 + lr)[None, :])
             v2p = tl.load(vbase + j * RS + rb * 64 + lr)
             wacc += tl.sum(tile * v2p[None, :], axis=1)
         w = tau * wacc * colmask
         for rb in tl.range(j // 64, RB):
-            tile = tl.load(
-                wbase + (J0 + lc)[:, None] * RS + (rb * 64 + lr)[None, :]
-            )
+            tile = tl.load(wbase + (J0 + lc)[:, None] * RS + (rb * 64 + lr)[None, :])
             v2p = tl.load(vbase + j * RS + rb * 64 + lr)
             tile = tile - tl.reshape(w, (64, 1)) * tl.reshape(v2p, (1, 64))
-            tl.store(
-                wbase + (J0 + lc)[:, None] * RS + (rb * 64 + lr)[None, :], tile
-            )
+            tl.store(wbase + (J0 + lc)[:, None] * RS + (rb * 64 + lr)[None, :], tile)
         tl.debug_barrier()
     # this panel's R rows (i in [J0, J0+B), i <= col) back to W: the panel
     # columns above the diagonal were left in place by the row-masked apply
@@ -1994,8 +2038,15 @@ def _mr_rrqr_panel_kernel(
 
 @triton.jit
 def _mr_rrqr_panel_reg_kernel(
-    W, V, PIV, TAU,
-    J0, B, K, RS, WPITCH,
+    W,
+    V,
+    PIV,
+    TAU,
+    J0,
+    B,
+    K,
+    RS,
+    WPITCH,
     NB: tl.constexpr,  # number of 64-row register tiles (1, 2 or 4)
 ):
     # Register-resident panel factorization for RS <= 256 (NB <= 4): the
@@ -2017,16 +2068,28 @@ def _mr_rrqr_panel_reg_kernel(
     # runtime-K term in the load mask trips the backend's buffer analysis
     # (ub overflow), so it must not appear in any mask
 
-    g0 = tl.load(wbase + (J0 + lc)[None, :] * RS + rr[:, None],
-                 mask=pm[None, :] & (rr < RS)[:, None], other=0.0)
+    g0 = tl.load(
+        wbase + (J0 + lc)[None, :] * RS + rr[:, None],
+        mask=pm[None, :] & (rr < RS)[:, None],
+        other=0.0,
+    )
     if NB > 1:
-        g1 = tl.load(wbase + (J0 + lc)[None, :] * RS + (64 + rr)[:, None],
-                     mask=pm[None, :] & ((64 + rr) < RS)[:, None], other=0.0)
+        g1 = tl.load(
+            wbase + (J0 + lc)[None, :] * RS + (64 + rr)[:, None],
+            mask=pm[None, :] & ((64 + rr) < RS)[:, None],
+            other=0.0,
+        )
     if NB > 2:
-        g2 = tl.load(wbase + (J0 + lc)[None, :] * RS + (128 + rr)[:, None],
-                     mask=pm[None, :] & ((128 + rr) < RS)[:, None], other=0.0)
-        g3 = tl.load(wbase + (J0 + lc)[None, :] * RS + (192 + rr)[:, None],
-                     mask=pm[None, :] & ((192 + rr) < RS)[:, None], other=0.0)
+        g2 = tl.load(
+            wbase + (J0 + lc)[None, :] * RS + (128 + rr)[:, None],
+            mask=pm[None, :] & ((128 + rr) < RS)[:, None],
+            other=0.0,
+        )
+        g3 = tl.load(
+            wbase + (J0 + lc)[None, :] * RS + (192 + rr)[:, None],
+            mask=pm[None, :] & ((192 + rr) < RS)[:, None],
+            other=0.0,
+        )
 
     piv_acc = tl.zeros((64,), dtype=tl.float32)
     tau_acc = tl.zeros((64,), dtype=tl.float32)
@@ -2079,22 +2142,34 @@ def _mr_rrqr_panel_reg_kernel(
         piv_acc = piv_acc + alpha * cj
         tau_acc = tau_acc + tau * cj
     # R rows of this panel (i in [J0, J0+B), i <= col) back to W, per tile
-    m0 = (((rr >= J0) & (rr < J0 + B))[:, None]
-          & (rr[:, None] <= (J0 + lc)[None, :]) & pm[None, :])
+    m0 = (
+        ((rr >= J0) & (rr < J0 + B))[:, None]
+        & (rr[:, None] <= (J0 + lc)[None, :])
+        & pm[None, :]
+    )
     tl.store(wbase + (J0 + lc)[None, :] * RS + rr[:, None], g0, mask=m0)
     if NB > 1:
         r1 = 64 + rr
-        m1 = (((r1 >= J0) & (r1 < J0 + B))[:, None]
-              & (r1[:, None] <= (J0 + lc)[None, :]) & pm[None, :])
+        m1 = (
+            ((r1 >= J0) & (r1 < J0 + B))[:, None]
+            & (r1[:, None] <= (J0 + lc)[None, :])
+            & pm[None, :]
+        )
         tl.store(wbase + (J0 + lc)[None, :] * RS + r1[:, None], g1, mask=m1)
     if NB > 2:
         r2 = 128 + rr
-        m2 = (((r2 >= J0) & (r2 < J0 + B))[:, None]
-              & (r2[:, None] <= (J0 + lc)[None, :]) & pm[None, :])
+        m2 = (
+            ((r2 >= J0) & (r2 < J0 + B))[:, None]
+            & (r2[:, None] <= (J0 + lc)[None, :])
+            & pm[None, :]
+        )
         tl.store(wbase + (J0 + lc)[None, :] * RS + r2[:, None], g2, mask=m2)
         r3 = 192 + rr
-        m3 = (((r3 >= J0) & (r3 < J0 + B))[:, None]
-              & (r3[:, None] <= (J0 + lc)[None, :]) & pm[None, :])
+        m3 = (
+            ((r3 >= J0) & (r3 < J0 + B))[:, None]
+            & (r3[:, None] <= (J0 + lc)[None, :])
+            & pm[None, :]
+        )
         tl.store(wbase + (J0 + lc)[None, :] * RS + r3[:, None], g3, mask=m3)
     tl.store(PIV + pid * K + J0 + lc, piv_acc, mask=lc < B)
     tl.store(TAU + pid * K + J0 + lc, tau_acc, mask=lc < B)
@@ -2102,8 +2177,14 @@ def _mr_rrqr_panel_reg_kernel(
 
 @triton.jit
 def _mr_rrqr_vtv_kernel(
-    V, TAU, T,
-    J0, B, K, RS, WPITCH,
+    V,
+    TAU,
+    T,
+    J0,
+    B,
+    K,
+    RS,
+    WPITCH,
 ):
     pid = tl.program_id(0)
     vbase = V + pid * WPITCH
@@ -2135,8 +2216,17 @@ def _mr_rrqr_vtv_kernel(
 
 @triton.jit
 def _mr_rrqr_update_kernel(
-    W, V, T, SCR, NRM2,
-    J0, B, K, RS, WPITCH, SCPITCH,
+    W,
+    V,
+    T,
+    SCR,
+    NRM2,
+    J0,
+    B,
+    K,
+    RS,
+    WPITCH,
+    SCPITCH,
 ):
     pid = tl.program_id(0)
     tile_id = tl.program_id(1)
@@ -2182,9 +2272,19 @@ def _mr_rrqr_update_kernel(
 
 @triton.jit
 def _mr_rrqr_count_kernel(
-    W, PIV, ATOL, RTOL, FROB, OUT, X, Y,
-    K, RS, WPITCH,
-    BLOCK_K: tl.constexpr, ITER: tl.constexpr,
+    W,
+    PIV,
+    ATOL,
+    RTOL,
+    FROB,
+    OUT,
+    X,
+    Y,
+    K,
+    RS,
+    WPITCH,
+    BLOCK_K: tl.constexpr,
+    ITER: tl.constexpr,
 ):
     pid = tl.program_id(0)
     kk = tl.arange(0, BLOCK_K)
@@ -2217,8 +2317,7 @@ def _mr_rrqr_count_kernel(
                 acc = tl.zeros((64,), dtype=tl.float32)
                 for jb in tl.range(ib, KB):
                     tile = tl.load(
-                        wbase + (jb * 64 + lc)[:, None] * RS
-                        + (ib * 64 + lr)[None, :]
+                        wbase + (jb * 64 + lc)[:, None] * RS + (ib * 64 + lr)[None, :]
                     )
                     xj = tl.load(xb + jb * 64 + lc)
                     acc += tl.sum(tl.trans(tile) * xj[None, :], axis=1)
@@ -2228,8 +2327,7 @@ def _mr_rrqr_count_kernel(
                 acc = tl.zeros((64,), dtype=tl.float32)
                 for ib in tl.range(0, jb + 1):
                     tile = tl.load(
-                        wbase + (jb * 64 + lc)[:, None] * RS
-                        + (ib * 64 + lr)[None, :]
+                        wbase + (jb * 64 + lc)[:, None] * RS + (ib * 64 + lr)[None, :]
                     )
                     yi = tl.load(yb + ib * 64 + lc)
                     acc += tl.sum(tile * yi[None, :], axis=1)
@@ -2262,15 +2360,13 @@ def _fast_launch(kernel, grid, *args, **kwargs):
         tuple(grid),
         tuple(sorted(kwargs.items())),
         tuple(a if isinstance(a, int) else None for a in args),
-        tuple(a.data_ptr() % 16 == 0 if torch.is_tensor(a) else None
-              for a in args),
+        tuple(a.data_ptr() % 16 == 0 if torch.is_tensor(a) else None for a in args),
     )
     entry = _FAST_LAUNCH_CACHE.get(key)
     if entry is None:
         compiled = kernel.warmup(*args, grid=grid, **kwargs)
         compiled._init_handles()
-        entry = (compiled.run, compiled.function, compiled.packed_metadata,
-                 compiled)
+        entry = (compiled.run, compiled.function, compiled.packed_metadata, compiled)
         _FAST_LAUNCH_CACHE[key] = entry
     run, function, md, compiled = entry
     from triton.runtime import driver
@@ -2285,8 +2381,18 @@ def _fast_launch(kernel, grid, *args, **kwargs):
 
 
 def _launch_longdim_rank(
-    matrix, atol_tensor, rtol_tensor, atol_val, rtol_val,
-    out, m, n, k, rows, batch_count, input,
+    matrix,
+    atol_tensor,
+    rtol_tensor,
+    atol_val,
+    rtol_val,
+    out,
+    m,
+    n,
+    k,
+    rows,
+    batch_count,
+    input,
 ):
     """Long-dimension non-hermitian k <= 64 (one of m, n > 64): QR-reduce to
     the k x k R factor, then the exact bidiag64 + df64 Sturm tail.
@@ -2319,63 +2425,148 @@ def _launch_longdim_rank(
     at_arg, rt_arg = atol_tensor, rtol_tensor
     if not tol_tensor:
         # the Sturm tail kernels take tolerance tensors
-        at_arg = torch.full(
-            (batch_count,), atol_val, dtype=torch.float32, device=dev
-        )
-        rt_arg = torch.full(
-            (batch_count,), rtol_val, dtype=torch.float32, device=dev
-        )
+        at_arg = torch.full((batch_count,), atol_val, dtype=torch.float32, device=dev)
+        rt_arg = torch.full((batch_count,), rtol_val, dtype=torch.float32, device=dev)
     with torch_device_fn.device(input.device):
         _fast_launch(
-            _mr_rrqr_init_kernel, (batch_count, 1),
-            matrix, W, nrm2, frob, m, n, k, rows, rs, wpitch,
-            TALL=m >= n, HERMITIAN=False, num_warps=4, num_stages=1,
+            _mr_rrqr_init_kernel,
+            (batch_count, 1),
+            matrix,
+            W,
+            nrm2,
+            frob,
+            m,
+            n,
+            k,
+            rows,
+            rs,
+            wpitch,
+            TALL=m >= n,
+            HERMITIAN=False,
+            num_warps=4,
+            num_stages=1,
         )
         if rows <= 256:
             _fast_launch(
-                _mr_rrqr_panel_reg_kernel, (batch_count,),
-                W, V, piv, tau, 0, k, k, rs, wpitch,
+                _mr_rrqr_panel_reg_kernel,
+                (batch_count,),
+                W,
+                V,
+                piv,
+                tau,
+                0,
+                k,
+                k,
+                rs,
+                wpitch,
                 # NB must stay in {1, 2, 4}, same as _launch_rrqr_rank: the
                 # NB=3 specialization (rs = 192) is a marginal UB allocation
                 # that flip-flops between fitting and "ub overflow" across
                 # compiles.
                 NB=min(4, triton.next_power_of_2(max(1, rs // 64))),
-                num_warps=4, num_stages=1,
+                num_warps=4,
+                num_stages=1,
             )
         else:
             _fast_launch(
-                _mr_rrqr_panel_kernel, (batch_count,),
-                W, V, nrm2, piv, tau, 0, k, k, rs, wpitch,
-                num_warps=8, num_stages=1, multibuffer=False,
+                _mr_rrqr_panel_kernel,
+                (batch_count,),
+                W,
+                V,
+                nrm2,
+                piv,
+                tau,
+                0,
+                k,
+                k,
+                rs,
+                wpitch,
+                num_warps=8,
+                num_stages=1,
+                multibuffer=False,
             )
         _fast_launch(
-            _mr_extract_upper_kernel, (batch_count,),
-            W, piv, RB, k, rs, wpitch, BLOCK=64, num_warps=4, num_stages=1,
+            _mr_extract_upper_kernel,
+            (batch_count,),
+            W,
+            piv,
+            RB,
+            k,
+            rs,
+            wpitch,
+            BLOCK=64,
+            num_warps=4,
+            num_stages=1,
         )
         _fast_launch(
-            _matrix_rank_bidiag64_kernel, (batch_count,),
-            RB, d, e, k, k, k, BLOCK=64,
-            num_warps=4, num_stages=1, enable_fp_fusion=True,
+            _matrix_rank_bidiag64_kernel,
+            (batch_count,),
+            RB,
+            d,
+            e,
+            k,
+            k,
+            k,
+            BLOCK=64,
+            num_warps=4,
+            num_stages=1,
+            enable_fp_fusion=True,
         )
         _fast_launch(
-            _mr_bidiag_to_tridiag_kernel, (batch_count,),
-            d, e, ddbuf, eebuf, k, BLOCK=64, num_warps=1, num_stages=1,
+            _mr_bidiag_to_tridiag_kernel,
+            (batch_count,),
+            d,
+            e,
+            ddbuf,
+            eebuf,
+            k,
+            BLOCK=64,
+            num_warps=1,
+            num_stages=1,
         )
         _fast_launch(
-            _mr_sturm_big_kernel, (batch_count,),
-            ddbuf, eebuf, at_arg, rt_arg, out.reshape(batch_count),
-            tol2_buf, flag_buf, k, BLOCK=64, BISECT_ITERS=32,
-            num_warps=1, num_stages=1,
+            _mr_sturm_big_kernel,
+            (batch_count,),
+            ddbuf,
+            eebuf,
+            at_arg,
+            rt_arg,
+            out.reshape(batch_count),
+            tol2_buf,
+            flag_buf,
+            k,
+            BLOCK=64,
+            BISECT_ITERS=32,
+            num_warps=1,
+            num_stages=1,
         )
         _fast_launch(
-            _mr_sturm_final_kernel, (batch_count,),
-            d, e, tol2_buf, flag_buf, out.reshape(batch_count), k,
-            num_warps=1, num_stages=1, enable_fp_fusion=False,
+            _mr_sturm_final_kernel,
+            (batch_count,),
+            d,
+            e,
+            tol2_buf,
+            flag_buf,
+            out.reshape(batch_count),
+            k,
+            num_warps=1,
+            num_stages=1,
+            enable_fp_fusion=False,
         )
     return out
 
 
-def _launch_rrqr_rank(    matrix, atol_tensor, rtol_tensor, out, m, n, k, rows, batch_count, input,
+def _launch_rrqr_rank(
+    matrix,
+    atol_tensor,
+    rtol_tensor,
+    out,
+    m,
+    n,
+    k,
+    rows,
+    batch_count,
+    input,
     hermitian,
 ):
     """Blocked Householder QR, unpivoted (fp32, 64 < k <= 255).
@@ -2410,9 +2601,22 @@ def _launch_rrqr_rank(    matrix, atol_tensor, rtol_tensor, out, m, n, k, rows, 
     ys = torch.empty((batch_count, block_k), dtype=torch.float32, device=dev)
     with torch_device_fn.device(input.device):
         _fast_launch(
-            _mr_rrqr_init_kernel, (batch_count, kp // 64),
-            matrix, W, nrm2, frob, m, n, k, rows, rs, wpitch,
-            TALL=m >= n, HERMITIAN=hermitian, num_warps=4, num_stages=1,
+            _mr_rrqr_init_kernel,
+            (batch_count, kp // 64),
+            matrix,
+            W,
+            nrm2,
+            frob,
+            m,
+            n,
+            k,
+            rows,
+            rs,
+            wpitch,
+            TALL=m >= n,
+            HERMITIAN=hermitian,
+            num_warps=4,
+            num_stages=1,
         )
         j0 = 0
         while j0 < k:
@@ -2424,33 +2628,90 @@ def _launch_rrqr_rank(    matrix, atol_tensor, rtol_tensor, out, m, n, k, rows, 
             # k=131 compiles, same NB).  Use the GM-tile panel for those.
             if reg_panel and b != 1:
                 _fast_launch(
-                    _mr_rrqr_panel_reg_kernel, (batch_count,),
-                    W, V, piv, tau, j0, b, k, rs, wpitch,
-                    NB=nb, num_warps=4, num_stages=1,
+                    _mr_rrqr_panel_reg_kernel,
+                    (batch_count,),
+                    W,
+                    V,
+                    piv,
+                    tau,
+                    j0,
+                    b,
+                    k,
+                    rs,
+                    wpitch,
+                    NB=nb,
+                    num_warps=4,
+                    num_stages=1,
                 )
             else:
                 _fast_launch(
-                    _mr_rrqr_panel_kernel, (batch_count,),
-                    W, V, nrm2, piv, tau, j0, b, k, rs, wpitch,
-                    num_warps=8, num_stages=1, multibuffer=False,
+                    _mr_rrqr_panel_kernel,
+                    (batch_count,),
+                    W,
+                    V,
+                    nrm2,
+                    piv,
+                    tau,
+                    j0,
+                    b,
+                    k,
+                    rs,
+                    wpitch,
+                    num_warps=8,
+                    num_stages=1,
+                    multibuffer=False,
                 )
             if nt > 0:
                 _fast_launch(
-                    _mr_rrqr_vtv_kernel, (batch_count,),
-                    V, tau, T, j0, b, k, rs, wpitch,
-                    num_warps=4, num_stages=1,
+                    _mr_rrqr_vtv_kernel,
+                    (batch_count,),
+                    V,
+                    tau,
+                    T,
+                    j0,
+                    b,
+                    k,
+                    rs,
+                    wpitch,
+                    num_warps=4,
+                    num_stages=1,
                 )
                 _fast_launch(
-                    _mr_rrqr_update_kernel, (batch_count, nt),
-                    W, V, T, scr, nrm2, j0, b, k, rs, wpitch, ntmax * 4096,
-                    num_warps=4, num_stages=1,
+                    _mr_rrqr_update_kernel,
+                    (batch_count, nt),
+                    W,
+                    V,
+                    T,
+                    scr,
+                    nrm2,
+                    j0,
+                    b,
+                    k,
+                    rs,
+                    wpitch,
+                    ntmax * 4096,
+                    num_warps=4,
+                    num_stages=1,
                 )
             j0 += b
         _fast_launch(
-            _mr_rrqr_count_kernel, (batch_count,),
-            W, piv, atol_tensor, rtol_tensor, frob, out.reshape(batch_count),
-            xs, ys, k, rs, wpitch,
-            BLOCK_K=block_k, ITER=30, num_warps=4, num_stages=1,
+            _mr_rrqr_count_kernel,
+            (batch_count,),
+            W,
+            piv,
+            atol_tensor,
+            rtol_tensor,
+            frob,
+            out.reshape(batch_count),
+            xs,
+            ys,
+            k,
+            rs,
+            wpitch,
+            BLOCK_K=block_k,
+            ITER=30,
+            num_warps=4,
+            num_stages=1,
         )
     return out
 
@@ -2478,7 +2739,9 @@ def _mr_bidiag_lstep_kernel(W, V, D, TAU, ACC, J, K, RS, WPITCH, APITCH, RBV):
         ch = ch * ((r0 + lr) >= J).to(tl.float32)
         tl.store(V + pid * WPITCH + J * RS + r0 + lr, ch)
         ssq += tl.sum(ch * ch, axis=0)
-        x0 += tl.sum(ch * ((r0 + lr > J - 1) & (r0 + lr < J + 1)).to(tl.float32), axis=0)
+        x0 += tl.sum(
+            ch * ((r0 + lr > J - 1) & (r0 + lr < J + 1)).to(tl.float32), axis=0
+        )
     sigma = tl.sqrt(ssq)
     alpha = tl.where(x0 >= 0.0, -sigma, sigma)
     vnorm2 = 2.0 * sigma * (sigma + tl.abs(x0))
@@ -2576,15 +2839,20 @@ def _mr_bidiag_rmat_kernel(W, U, ACC, J, K, RS, WPITCH, UPITCH, APITCH, NCC, CC0
     # the RS row pitch; mask it (the wrapped-around address is the NEXT
     # column's row 0 -- an out-of-bounds read/write otherwise)
     rmask = (r0 + lr) < RS
-    tile = tl.load(wbase + (c0 + lc)[:, None] * RS + (r0 + lr)[None, :],
-                   mask=rmask[None, :], other=0.0)
+    tile = tl.load(
+        wbase + (c0 + lc)[:, None] * RS + (r0 + lr)[None, :],
+        mask=rmask[None, :],
+        other=0.0,
+    )
     up = tl.load(U + pid * UPITCH + J * K + c0 + lc, mask=(c0 + lc) < K, other=0.0)
     part = tl.sum(tl.trans(tile) * up[None, :], axis=1)
     tl.atomic_add(ACC + pid * APITCH + r0 + lr, part)
 
 
 @triton.jit
-def _mr_bidiag_rapply_kernel(W, U, TAU, ACC, J, K, RS, WPITCH, UPITCH, APITCH, NRC, NTR):
+def _mr_bidiag_rapply_kernel(
+    W, U, TAU, ACC, J, K, RS, WPITCH, UPITCH, APITCH, NRC, NTR
+):
     pid = tl.program_id(0)
     flat = tl.program_id(1)
     ct = flat // NTR
@@ -2598,11 +2866,15 @@ def _mr_bidiag_rapply_kernel(W, U, TAU, ACC, J, K, RS, WPITCH, UPITCH, APITCH, N
     rmask = (r0 + lr) < RS
     wu = tl.load(ACC + pid * APITCH + r0 + lr, mask=rmask, other=0.0) * tau
     up = tl.load(U + pid * UPITCH + J * K + c0 + lc, mask=(c0 + lc) < K, other=0.0)
-    tile = tl.load(wbase + (c0 + lc)[:, None] * RS + (r0 + lr)[None, :],
-                   mask=rmask[None, :], other=0.0)
+    tile = tl.load(
+        wbase + (c0 + lc)[:, None] * RS + (r0 + lr)[None, :],
+        mask=rmask[None, :],
+        other=0.0,
+    )
     tile = tile - tl.reshape(up, (64, 1)) * tl.reshape(wu, (1, 64))
-    tl.store(wbase + (c0 + lc)[:, None] * RS + (r0 + lr)[None, :], tile,
-             mask=rmask[None, :])
+    tl.store(
+        wbase + (c0 + lc)[:, None] * RS + (r0 + lr)[None, :], tile, mask=rmask[None, :]
+    )
 
 
 @triton.jit
@@ -2622,7 +2894,9 @@ def _mr_tridiag_step_kernel(W, V, D, E, TAU, ACC, CSCA, J, K, RS, WPITCH, APITCH
     for rb in tl.range(J // 64, (K + 63) // 64):
         r0 = rb * 64
         chf = tl.load(wbase + J * RS + r0 + lr)
-        dj += tl.sum(chf * ((r0 + lr > J - 1) & (r0 + lr < J + 1)).to(tl.float32), axis=0)
+        dj += tl.sum(
+            chf * ((r0 + lr > J - 1) & (r0 + lr < J + 1)).to(tl.float32), axis=0
+        )
         ch = chf * ((r0 + lr) > J).to(tl.float32)
         tl.store(V + pid * WPITCH + J * RS + r0 + lr, ch)
         ssq += tl.sum(ch * ch, axis=0)
@@ -2823,8 +3097,8 @@ def _df64_mul_ds(a_h, a_l, b_h, b_l):
     p = a_h * b_h
     e = tl.fma(a_h, b_h, -p) + a_h * b_l + a_l * b_h
     h = p + e
-    l = e - (h - p)
-    return h, l
+    low = e - (h - p)
+    return h, low
 
 
 @triton.jit
@@ -2836,8 +3110,8 @@ def _df64_div_ds(a_h, a_l, b_h, b_l):
     r_h, r_l = _df64_add(a_h, a_l, -p, -(pe + q1 * b_l))
     q2 = r_h / b_h
     h = q1 + q2
-    l = q2 - (h - q1)
-    return h, l
+    low = q2 - (h - q1)
+    return h, low
 
 
 @triton.jit
@@ -2854,8 +3128,6 @@ def _mr_sturm_final_kernel(D, E, TOL2, FLAG, OUT, K):
     # TwoSum/TwoProd error-free transforms).
     batch = tl.program_id(0)
     tol2 = tl.load(TOL2 + batch)
-    refine = tl.load(FLAG + batch)
-    rank_a = tl.load(OUT + batch)
     base = batch * K
     d0 = tl.load(D + base)
     d0h, d0l = _df64_mul_ds(d0, 0.0, d0, 0.0)
@@ -3024,9 +3296,7 @@ def _bidiag_workspace(dev, batch_count, k, rows):
         "block_k": block_k,
         "W": torch.zeros((batch_count, kp, rs), dtype=torch.float32, device=dev),
         "V": torch.zeros((batch_count, kp, rs), dtype=torch.float32, device=dev),
-        "U": torch.zeros(
-            (batch_count, kp * (k + 64)), dtype=torch.float32, device=dev
-        ),
+        "U": torch.zeros((batch_count, kp * (k + 64)), dtype=torch.float32, device=dev),
         "dbuf": torch.zeros((batch_count, k), dtype=torch.float32, device=dev),
         "ebuf": torch.zeros((batch_count, k), dtype=torch.float32, device=dev),
         # fp32 B^T B tridiagonal for the bracket counts only; the decisive
@@ -3039,12 +3309,8 @@ def _bidiag_workspace(dev, batch_count, k, rows):
         "frob": torch.zeros((batch_count,), dtype=torch.float32, device=dev),
         # One extra tile of slack: the right matvec's atomic accumulation
         # index r0 + 63 can reach rs (pad-row tiles are updated, never read).
-        "acc": torch.zeros(
-            (batch_count, kp + 64), dtype=torch.float32, device=dev
-        ),
-        "uacc": torch.zeros(
-            (batch_count, rs + 64), dtype=torch.float32, device=dev
-        ),
+        "acc": torch.zeros((batch_count, kp + 64), dtype=torch.float32, device=dev),
+        "uacc": torch.zeros((batch_count, rs + 64), dtype=torch.float32, device=dev),
         "tol2": torch.empty((batch_count,), dtype=torch.float32, device=dev),
         "flag": torch.empty((batch_count,), dtype=torch.int64, device=dev),
         "atol": torch.empty((batch_count,), dtype=torch.float32, device=dev),
@@ -3053,8 +3319,9 @@ def _bidiag_workspace(dev, batch_count, k, rows):
     }
 
 
-def _bidiag_run(ws, matrix, atol_tensor, rtol_tensor, m, n, k, rows,
-                batch_count, hermitian):
+def _bidiag_run(
+    ws, matrix, atol_tensor, rtol_tensor, m, n, k, rows, batch_count, hermitian
+):
     """The launch sequence of the unblocked Golub-Kahan bidiagonalization.
 
     Written as a pure function of the workspace so it can run either
@@ -3067,9 +3334,22 @@ def _bidiag_run(ws, matrix, atol_tensor, rtol_tensor, m, n, k, rows,
     taul, taur = ws["taul"], ws["taur"]
     nrm2, frob, acc, uacc = ws["nrm2"], ws["frob"], ws["acc"], ws["uacc"]
     _fast_launch(
-        _mr_rrqr_init_kernel, (batch_count, (kp - 64) // 64),
-        matrix, W, nrm2, frob, m, n, k, rows, rs, wpitch,
-        TALL=m >= n, HERMITIAN=hermitian, num_warps=4, num_stages=1,
+        _mr_rrqr_init_kernel,
+        (batch_count, (kp - 64) // 64),
+        matrix,
+        W,
+        nrm2,
+        frob,
+        m,
+        n,
+        k,
+        rows,
+        rs,
+        wpitch,
+        TALL=m >= n,
+        HERMITIAN=hermitian,
+        num_warps=4,
+        num_stages=1,
     )
     nrc_full = (rs - 64) // 64
     ncc_full = (kp - 64) // 64
@@ -3086,20 +3366,55 @@ def _bidiag_run(ws, matrix, atol_tensor, rtol_tensor, m, n, k, rows,
         rb0 = j // 64
         nrct = nrc_full - rb0
         _fast_launch(
-            _mr_bidiag_lstep_kernel, (batch_count,),
-            W, V, dbuf, taul, acc, j, k, rs, wpitch, kp, rbv,
-            num_warps=4, num_stages=1,
+            _mr_bidiag_lstep_kernel,
+            (batch_count,),
+            W,
+            V,
+            dbuf,
+            taul,
+            acc,
+            j,
+            k,
+            rs,
+            wpitch,
+            kp,
+            rbv,
+            num_warps=4,
+            num_stages=1,
         )
         if ntl > 0:
             _fast_launch(
-                _mr_bidiag_lmat_kernel, (batch_count, ntl * nrct),
-                W, V, acc, j, k, rs, wpitch, kp, nrct, rb0,
-                num_warps=4, num_stages=1,
+                _mr_bidiag_lmat_kernel,
+                (batch_count, ntl * nrct),
+                W,
+                V,
+                acc,
+                j,
+                k,
+                rs,
+                wpitch,
+                kp,
+                nrct,
+                rb0,
+                num_warps=4,
+                num_stages=1,
             )
             _fast_launch(
-                _mr_bidiag_lapply_kernel, (batch_count, ntl * nrct),
-                W, V, taul, acc, j, k, rs, wpitch, kp, nrct, rb0,
-                num_warps=4, num_stages=1,
+                _mr_bidiag_lapply_kernel,
+                (batch_count, ntl * nrct),
+                W,
+                V,
+                taul,
+                acc,
+                j,
+                k,
+                rs,
+                wpitch,
+                kp,
+                nrct,
+                rb0,
+                num_warps=4,
+                num_stages=1,
             )
         if j + 1 < k:
             # valid row tiles only (see rbv above): rows j+1 .. rows-1
@@ -3107,36 +3422,97 @@ def _bidiag_run(ws, matrix, atol_tensor, rtol_tensor, m, n, k, rows,
             cc0 = (j + 1) // 64
             ncct = ncc_full - cc0
             _fast_launch(
-                _mr_bidiag_rstep_kernel, (batch_count,),
-                W, U, ebuf, taur, uacc, j, k, rs, wpitch, upitch, rs,
-                num_warps=4, num_stages=1,
+                _mr_bidiag_rstep_kernel,
+                (batch_count,),
+                W,
+                U,
+                ebuf,
+                taur,
+                uacc,
+                j,
+                k,
+                rs,
+                wpitch,
+                upitch,
+                rs,
+                num_warps=4,
+                num_stages=1,
             )
             _fast_launch(
-                _mr_bidiag_rmat_kernel, (batch_count, ntr * ncct),
-                W, U, uacc, j, k, rs, wpitch, upitch, rs, ncct, cc0,
-                num_warps=4, num_stages=1,
+                _mr_bidiag_rmat_kernel,
+                (batch_count, ntr * ncct),
+                W,
+                U,
+                uacc,
+                j,
+                k,
+                rs,
+                wpitch,
+                upitch,
+                rs,
+                ncct,
+                cc0,
+                num_warps=4,
+                num_stages=1,
             )
             _fast_launch(
-                _mr_bidiag_rapply_kernel, (batch_count, ntl * ntr),
-                W, U, taur, uacc, j, k, rs, wpitch, upitch, rs,
-                (rs - 64) // 64, ntr,
-                num_warps=4, num_stages=1,
+                _mr_bidiag_rapply_kernel,
+                (batch_count, ntl * ntr),
+                W,
+                U,
+                taur,
+                uacc,
+                j,
+                k,
+                rs,
+                wpitch,
+                upitch,
+                rs,
+                (rs - 64) // 64,
+                ntr,
+                num_warps=4,
+                num_stages=1,
             )
     _fast_launch(
-        _mr_bidiag_to_tridiag_kernel, (batch_count,),
-        dbuf, ebuf, ddbuf, eebuf, k, BLOCK=block_k,
-        num_warps=1, num_stages=1,
+        _mr_bidiag_to_tridiag_kernel,
+        (batch_count,),
+        dbuf,
+        ebuf,
+        ddbuf,
+        eebuf,
+        k,
+        BLOCK=block_k,
+        num_warps=1,
+        num_stages=1,
     )
     _fast_launch(
-        _mr_sturm_big_kernel, (batch_count,),
-        ddbuf, eebuf, atol_tensor, rtol_tensor, ws["out"],
-        ws["tol2"], ws["flag"],
-        k, BLOCK=block_k, BISECT_ITERS=32, num_warps=1, num_stages=1,
+        _mr_sturm_big_kernel,
+        (batch_count,),
+        ddbuf,
+        eebuf,
+        atol_tensor,
+        rtol_tensor,
+        ws["out"],
+        ws["tol2"],
+        ws["flag"],
+        k,
+        BLOCK=block_k,
+        BISECT_ITERS=32,
+        num_warps=1,
+        num_stages=1,
     )
     _fast_launch(
-        _mr_sturm_final_kernel, (batch_count,),
-        dbuf, ebuf, ws["tol2"], ws["flag"], ws["out"], k,
-        num_warps=1, num_stages=1, enable_fp_fusion=False,
+        _mr_sturm_final_kernel,
+        (batch_count,),
+        dbuf,
+        ebuf,
+        ws["tol2"],
+        ws["flag"],
+        ws["out"],
+        k,
+        num_warps=1,
+        num_stages=1,
+        enable_fp_fusion=False,
     )
 
 
@@ -3176,7 +3552,16 @@ _BIDIAG_GRAPH_MAX_ENTRIES = 16
 
 
 def _launch_bidiag_rank(
-    matrix, atol_tensor, rtol_tensor, out, m, n, k, rows, batch_count, input,
+    matrix,
+    atol_tensor,
+    rtol_tensor,
+    out,
+    m,
+    n,
+    k,
+    rows,
+    batch_count,
+    input,
     hermitian,
 ):
     """Unblocked Golub-Kahan bidiagonalization + Sturm count (fp32; the
@@ -3212,13 +3597,25 @@ def _launch_bidiag_rank(
                 if os.environ.get("FLAGGEMS_MR_NO_GRAPH") == "1":
                     ws = _bidiag_workspace(dev, batch_count, k, rows)
                     _bidiag_run(
-                        ws, matrix, atol_tensor, rtol_tensor, m, n, k, rows,
-                        batch_count, hermitian,
+                        ws,
+                        matrix,
+                        atol_tensor,
+                        rtol_tensor,
+                        m,
+                        n,
+                        k,
+                        rows,
+                        batch_count,
+                        hermitian,
                     )
                     out.copy_(ws["out"].reshape(out.shape))
                     return out
                 key = (
-                    m, n, batch_count, hermitian, input.device.index,
+                    m,
+                    n,
+                    batch_count,
+                    hermitian,
+                    input.device.index,
                     _current_stream_key(input.device),
                 )
                 ent = _BIDIAG_GRAPHS.get(key)
@@ -3234,26 +3631,51 @@ def _launch_bidiag_rank(
                     # (compile is illegal during capture) and fills
                     # _FAST_LAUNCH_CACHE
                     _bidiag_run(
-                        ws, staging, ws["atol"], ws["rtol"], m, n, k, rows,
-                        batch_count, hermitian,
+                        ws,
+                        staging,
+                        ws["atol"],
+                        ws["rtol"],
+                        m,
+                        n,
+                        k,
+                        rows,
+                        batch_count,
+                        hermitian,
                     )
                     torch.npu.synchronize()
                     graph = torch.npu.NPUGraph()
                     try:
                         with torch.npu.graph(graph):
                             _bidiag_run(
-                                ws, staging, ws["atol"], ws["rtol"], m, n, k,
-                                rows, batch_count, hermitian,
+                                ws,
+                                staging,
+                                ws["atol"],
+                                ws["rtol"],
+                                m,
+                                n,
+                                k,
+                                rows,
+                                batch_count,
+                                hermitian,
                             )
                     except Exception:
                         logger.warning(
                             "NPUGraph capture failed for matrix_rank bidiag "
                             "shape (%d, %d); falling back to direct launches",
-                            m, n,
+                            m,
+                            n,
                         )
                         _bidiag_run(
-                            ws, staging, ws["atol"], ws["rtol"], m, n, k, rows,
-                            batch_count, hermitian,
+                            ws,
+                            staging,
+                            ws["atol"],
+                            ws["rtol"],
+                            m,
+                            n,
+                            k,
+                            rows,
+                            batch_count,
+                            hermitian,
                         )
                         out.copy_(ws["out"].reshape(out.shape))
                         return out
@@ -3304,9 +3726,7 @@ def _tridiag_workspace(dev, batch_count, k, rows):
         "taul": torch.zeros((batch_count, k), dtype=torch.float32, device=dev),
         "nrm2": torch.empty((batch_count, k), dtype=torch.float32, device=dev),
         "frob": torch.zeros((batch_count,), dtype=torch.float32, device=dev),
-        "acc": torch.zeros(
-            (batch_count, kp + 64), dtype=torch.float32, device=dev
-        ),
+        "acc": torch.zeros((batch_count, kp + 64), dtype=torch.float32, device=dev),
         "tol2": torch.empty((batch_count,), dtype=torch.float32, device=dev),
         "flag": torch.empty((batch_count,), dtype=torch.int64, device=dev),
         "atol": torch.empty((batch_count,), dtype=torch.float32, device=dev),
@@ -3315,8 +3735,7 @@ def _tridiag_workspace(dev, batch_count, k, rows):
     }
 
 
-def _tridiag_run(ws, matrix, atol_tensor, rtol_tensor, m, n, k, rows,
-                 batch_count):
+def _tridiag_run(ws, matrix, atol_tensor, rtol_tensor, m, n, k, rows, batch_count):
     """The launch sequence of the unblocked one-sided Householder
     tridiagonalization (hermitian k > 64): three kernels per step
     (reflector step / symmetric matvec / rank-2 apply) plus the
@@ -3331,43 +3750,119 @@ def _tridiag_run(ws, matrix, atol_tensor, rtol_tensor, m, n, k, rows,
     nrm2, frob, acc = ws["nrm2"], ws["frob"], ws["acc"]
     apitch = kp + 64
     _fast_launch(
-        _mr_rrqr_init_kernel, (batch_count, (kp - 64) // 64),
-        matrix, W, nrm2, frob, m, n, k, rows, rs, wpitch,
-        TALL=True, HERMITIAN=True, num_warps=4, num_stages=1,
+        _mr_rrqr_init_kernel,
+        (batch_count, (kp - 64) // 64),
+        matrix,
+        W,
+        nrm2,
+        frob,
+        m,
+        n,
+        k,
+        rows,
+        rs,
+        wpitch,
+        TALL=True,
+        HERMITIAN=True,
+        num_warps=4,
+        num_stages=1,
     )
     for j in range(k):
         _fast_launch(
-            _mr_tridiag_step_kernel, (batch_count,),
-            W, V, dbuf, ebuf, taul, acc, frob, j, k, rs, wpitch, apitch,
-            num_warps=4, num_stages=1,
+            _mr_tridiag_step_kernel,
+            (batch_count,),
+            W,
+            V,
+            dbuf,
+            ebuf,
+            taul,
+            acc,
+            frob,
+            j,
+            k,
+            rs,
+            wpitch,
+            apitch,
+            num_warps=4,
+            num_stages=1,
         )
         if j + 1 < k:
             nrt = triton.cdiv(k - 1 - j, 64)
             _fast_launch(
-                _mr_tridiag_mat_kernel, (batch_count, nrt * nrt),
-                W, V, acc, frob, j, k, rs, wpitch, apitch, nrt,
-                num_warps=4, num_stages=1,
+                _mr_tridiag_mat_kernel,
+                (batch_count, nrt * nrt),
+                W,
+                V,
+                acc,
+                frob,
+                j,
+                k,
+                rs,
+                wpitch,
+                apitch,
+                nrt,
+                num_warps=4,
+                num_stages=1,
             )
             _fast_launch(
-                _mr_tridiag_apply_kernel, (batch_count, nrt * nrt),
-                W, V, taul, acc, frob, j, k, rs, wpitch, apitch, nrt,
-                num_warps=4, num_stages=1,
+                _mr_tridiag_apply_kernel,
+                (batch_count, nrt * nrt),
+                W,
+                V,
+                taul,
+                acc,
+                frob,
+                j,
+                k,
+                rs,
+                wpitch,
+                apitch,
+                nrt,
+                num_warps=4,
+                num_stages=1,
             )
     _fast_launch(
-        _mr_sturm_big_tridiag_kernel, (batch_count,),
-        dbuf, ebuf, atol_tensor, rtol_tensor, ws["out"],
-        ws["tol2"], ws["flag"],
-        k, BLOCK=block_k, BISECT_ITERS=32, num_warps=1, num_stages=1,
+        _mr_sturm_big_tridiag_kernel,
+        (batch_count,),
+        dbuf,
+        ebuf,
+        atol_tensor,
+        rtol_tensor,
+        ws["out"],
+        ws["tol2"],
+        ws["flag"],
+        k,
+        BLOCK=block_k,
+        BISECT_ITERS=32,
+        num_warps=1,
+        num_stages=1,
     )
     _fast_launch(
-        _mr_sturm_final_tridiag_kernel, (batch_count,),
-        dbuf, ebuf, ws["tol2"], ws["flag"], ws["out"], k,
-        num_warps=1, num_stages=1, enable_fp_fusion=False,
+        _mr_sturm_final_tridiag_kernel,
+        (batch_count,),
+        dbuf,
+        ebuf,
+        ws["tol2"],
+        ws["flag"],
+        ws["out"],
+        k,
+        num_warps=1,
+        num_stages=1,
+        enable_fp_fusion=False,
     )
 
 
 def _launch_tridiag_big_rank(
-    matrix, atol_tensor, rtol_tensor, out, m, n, k, rows, batch_count, input,
+    matrix,
+    atol_tensor,
+    rtol_tensor,
+    out,
+    m,
+    n,
+    k,
+    rows,
+    batch_count,
+    input,
 ):
     """Hermitian k > 64: unblocked one-sided Householder tridiagonalization
     + eigenvalue-domain Sturm count (|lambda| > tol via +/-tol qd chains,
@@ -3385,13 +3880,23 @@ def _launch_tridiag_big_rank(
                 if os.environ.get("FLAGGEMS_MR_NO_GRAPH") == "1":
                     ws = _tridiag_workspace(dev, batch_count, k, rows)
                     _tridiag_run(
-                        ws, matrix, atol_tensor, rtol_tensor, m, n, k, rows,
+                        ws,
+                        matrix,
+                        atol_tensor,
+                        rtol_tensor,
+                        m,
+                        n,
+                        k,
+                        rows,
                         batch_count,
                     )
                     out.copy_(ws["out"].reshape(out.shape))
                     return out
                 key = (
-                    m, n, batch_count, input.device.index,
+                    m,
+                    n,
+                    batch_count,
+                    input.device.index,
                     _current_stream_key(input.device),
                 )
                 ent = _TRIDIAG_GRAPHS.get(key)
@@ -3404,7 +3909,14 @@ def _launch_tridiag_big_rank(
                     ws["atol"].copy_(atol_tensor)
                     ws["rtol"].copy_(rtol_tensor)
                     _tridiag_run(
-                        ws, staging, ws["atol"], ws["rtol"], m, n, k, rows,
+                        ws,
+                        staging,
+                        ws["atol"],
+                        ws["rtol"],
+                        m,
+                        n,
+                        k,
+                        rows,
                         batch_count,
                     )
                     torch.npu.synchronize()
@@ -3412,18 +3924,33 @@ def _launch_tridiag_big_rank(
                     try:
                         with torch.npu.graph(graph):
                             _tridiag_run(
-                                ws, staging, ws["atol"], ws["rtol"], m, n, k,
-                                rows, batch_count,
+                                ws,
+                                staging,
+                                ws["atol"],
+                                ws["rtol"],
+                                m,
+                                n,
+                                k,
+                                rows,
+                                batch_count,
                             )
                     except Exception:
                         logger.warning(
                             "NPUGraph capture failed for matrix_rank tridiag "
                             "shape (%d, %d); falling back to direct launches",
-                            m, n,
+                            m,
+                            n,
                         )
                         _tridiag_run(
-                            ws, staging, ws["atol"], ws["rtol"], m, n, k,
-                            rows, batch_count,
+                            ws,
+                            staging,
+                            ws["atol"],
+                            ws["rtol"],
+                            m,
+                            n,
+                            k,
+                            rows,
+                            batch_count,
                         )
                         out.copy_(ws["out"].reshape(out.shape))
                         return out
@@ -3516,9 +4043,7 @@ def _launch_matrix_rank(input, atol, rtol, hermitian):
     nonzero_flag = None
     if rows <= 64:
         normed = torch.empty_like(matrix)
-        scale = torch.empty(
-            (batch_count,), dtype=torch.float32, device=matrix.device
-        )
+        scale = torch.empty((batch_count,), dtype=torch.float32, device=matrix.device)
         if need_flag:
             nonzero_flag = torch.empty(
                 (batch_count,), dtype=torch.int8, device=matrix.device
@@ -3734,7 +4259,7 @@ def _launch_matrix_rank(input, atol, rtol, hermitian):
 # ---------------------------------------------------------------------------
 def linalg_matrix_rank(input, *, atol=None, rtol=None, hermitian=False):
     """Computes numerical matrix rank (Ascend backend)."""
-    logger.debug("GEMS LINALG_MATRIX_RANK (Ascend)")
+    logger.debug("GEMS LINALG_MATRIX_RANK")
     _check_input(input, hermitian)
 
     output_shape = input.shape[:-2]
@@ -3753,9 +4278,7 @@ def linalg_matrix_rank_tol(input, tol, hermitian=False):
     return linalg_matrix_rank(input, atol=tol, rtol=0.0, hermitian=hermitian)
 
 
-def linalg_matrix_rank_out(
-    input, *, atol=None, rtol=None, hermitian=False, out=None
-):
+def linalg_matrix_rank_out(input, *, atol=None, rtol=None, hermitian=False, out=None):
     result = linalg_matrix_rank(input, atol=atol, rtol=rtol, hermitian=hermitian)
     return _copy_rank_to_out(input, result, out)
 
