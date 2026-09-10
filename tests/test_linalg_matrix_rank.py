@@ -838,12 +838,17 @@ def test_linalg_matrix_rank_rejects_complex_tolerance():
 @pytest.mark.parametrize(
     "shape,rank,hermitian",
     [
-        # Gram band: non-hermitian 33..64 and long-dimension k <= 64
+        # Exact-default small/long-dimension paths: local bidiag/tridiag for
+        # compact k <= 64 inputs, and QR compression followed by bidiag64 for
+        # long-dimension non-hermitian inputs.  The former Gram alternatives
+        # are available only with FLAGGEMS_MR_FAST_PATH=1.
         pytest.param((33, 33), 16, False, id="gram-band-k33"),
         pytest.param((256, 64), 32, False, id="gram-band-tall"),
         pytest.param((64, 512), 32, False, id="gram-band-wide"),
         pytest.param((1024, 8), 4, False, id="gram-band-long-dim-k8"),
-        # QR band: 64 < k <= 512
+        # Exact-default large paths: Golub-Kahan bidiagonalization for general
+        # inputs and one-sided tridiagonalization for Hermitian inputs.  In the
+        # 65..255 band, unpivoted QR is an opt-in fast path only.
         pytest.param((128, 128), 60, False, id="qr-band-k128"),
         pytest.param((256, 512), 100, False, id="qr-band-wide"),
         pytest.param((2, 100, 100), 40, False, id="qr-band-batched"),
@@ -1314,29 +1319,30 @@ def test_linalg_matrix_rank_hermitian_deflated_spectrum(k, expect_rank, monkeypa
 @pytest.mark.parametrize(
     "shape,rank,hermitian,kind",
     [
-        # general: RRQR (65..128) vs default bidiag (>128) boundary.
-        # The RRQR case uses an exactly-gapped spectrum: unpivoted QR's
-        # |R_ii| undercounts slow-decay spectra even at 6x tolerance margin
-        # (verified: sigma=1e-4 vs tol=1.5e-5 reports 59/60) -- that is the
-        # documented exception-2 limitation, not a dispatch bug.
+        # General exact-default coverage across the optional fast band:
+        # 65..255 uses bidiagonalization by default and may opt into unpivoted
+        # QR with FLAGGEMS_MR_FAST_PATH=1; k >= 256 is always exact.  The
+        # 128/255 inputs retain an exactly-gapped spectrum so they are also
+        # valid when the optional fast mode is exercised separately.
         pytest.param((128, 128), 60, False, "gapped", id="general-k128-rrqr"),
         pytest.param((255, 255), 120, False, "gapped", id="general-k255-rrqr"),
         pytest.param((256, 256), 120, False, "slowdecay", id="general-k256-bidiag"),
         pytest.param((256, 512), 120, False, "slowdecay", id="general-k256-wide"),
         pytest.param((512, 256), 120, False, "slowdecay", id="general-k256-tall"),
         pytest.param((2, 256, 256), 120, False, "slowdecay", id="general-k256-batched"),
-        # hermitian: QR (65..255) vs one-sided big tridiag (>=256)
+        # Hermitian exact-default coverage: one-sided tridiagonalization for
+        # k > 64; the 65..255 unpivoted-QR alternative is opt-in only.
         pytest.param((64, 64), 30, True, "slowdecay", id="herm-k64-padded"),
         pytest.param((65, 65), 30, True, "gapped", id="herm-k65-rrqr"),
         pytest.param((256, 256), 120, True, "slowdecay", id="herm-k256-tridiag"),
     ],
 )
 def test_linalg_matrix_rank_dispatch_boundary(shape, rank, hermitian, kind):
-    # Default-dispatch boundaries.  slowdecay = singular values 1 .. 1e-4
-    # (exposes the Gram sigma^2 floor and QR near-tolerance miscount where
-    # those paths are NOT expected); gapped = sigma in {1, 0} with an exact
-    # gap (valid on every dispatch).  Reference: fp64 with fp32-semantics
-    # tolerance.
+    # Exact-default path coverage around the opt-in fast-band boundary.
+    # slowdecay = singular values 1 .. 1e-4, which exposes the approximation
+    # error if a Gram/QR path is selected unexpectedly; gapped = sigma in
+    # {1, 0}, valid on either exact or fast dispatch.  Reference: fp64 with
+    # fp32-semantics tolerance.
     generator = torch.Generator().manual_seed(2026 + rank)
     *batch, m, n = shape
     if hermitian:
