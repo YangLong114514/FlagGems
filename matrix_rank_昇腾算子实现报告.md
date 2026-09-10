@@ -1361,3 +1361,27 @@ Householder 代数会把矩阵尺度平方(w = A·v 是 O(σ²)),fp32 平方和�
 (算术 / 几何平均)归一化的代价集中在小 herm 方阵:1²~33² 从 0.85~1.49 回落到 ~0.6(亚毫秒算子上 +2 launch + 2 次分配约 40~60µs);长维 k≤64、65~160 方阵、129 长维等原有结构缺口基本不变。进一步恢复小 herm 需要把归一化做进 fused kernel 寄存器内(in-kernel max-abs),但该 kernel 是全套实现里误编译彩票最敏感的一个,且 in-kernel 无法用向量位掩码做精确 2 的幂缩放(标量 bitcast 误编译,见缺陷清单)——留作后续方向,当前以语义正确性优先。
 
 合入版 benchmark 另有 70 个新增变体(tensor atol/rtol、out=、positional tol):tensor 容差变体在小 shape 上 0.16~0.75,主因是 `_prepare_tolerances` 的多次物化与修正路径——本轮已用 nonzero_flag 复用消掉其中的全矩阵 tril+amax+amin 扫描,剩余为容差物化本身的 launch 开销,属预存项,与归一化无关。
+
+## 6. 后续优化项:单矩阵内部的极端动态范围
+
+当前通用实现与昇腾实现都采用逐 batch 的单一 max-abs 尺度。该策略已经解决
+“整张矩阵统一处于 1e20 或 1e-30 量级”时 Householder 平方溢出/下溢的问题,但在
+FP32 有限精度下并非对所有输入都严格保持信息。例如:
+
+```python
+A = torch.diag(torch.tensor([1e20, 1e-30], dtype=torch.float32))
+rank = torch.linalg.matrix_rank(A, atol=0.0, rtol=0.0)
+```
+
+以约 1e20 的共享尺度归一化后,第二个元素约为 1e-50,会在 FP32 中下溢为 0;后续
+即使走双对角化/三对角化 + df64 Sturm 精确路径,也无法恢复入口缩放时已经丢失的
+非零信息。这是通用与昇腾实现共享的全局缩放边界,不是 Ascend 分解 kernel 单独
+引入的问题。
+
+该边界不阻塞本次 PR:默认容差约为 `k*eps*sigma_max`,上述小奇异值本来就远低于
+默认秩阈值;现有极端尺度测试覆盖的是整矩阵统一缩放和不同 batch 各自缩放,这些
+验收场景均已通过。它主要影响显式 `atol=rtol=0`（或极小容差）且单矩阵内部跨度
+几十个数量级的病态输入。
+
+后续应在通用测试中增加同矩阵 mixed-dynamic-range 用例,先核对各后端原生
+`torch.linalg.matrix_rank` 对 FP32 次正规数/FTZ 的实际行为;若要求完整对齐,需要
