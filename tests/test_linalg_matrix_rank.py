@@ -1558,7 +1558,6 @@ def test_linalg_matrix_rank_fp64_input_requires_native_fp64(monkeypatch):
 
 
 @pytest.mark.linalg_matrix_rank
-@pytest.mark.skipif(IS_ASCEND, reason="Ascend backend has its own implementation")
 @pytest.mark.parametrize("log10_scale", [20, -30], ids=lambda s: f"1e{s}")
 @pytest.mark.parametrize(
     "shape,hermitian",
@@ -1596,7 +1595,6 @@ def test_linalg_matrix_rank_extreme_scales(shape, hermitian, log10_scale):
 
 
 @pytest.mark.linalg_matrix_rank
-@pytest.mark.skipif(IS_ASCEND, reason="Ascend backend has its own implementation")
 def test_linalg_matrix_rank_mixed_magnitude_batch():
     # One batch mixing 1e20, 1e-30 and exactly-zero matrices: per-batch
     # scaling must keep each matrix independent of the others' magnitude.
@@ -2021,7 +2019,6 @@ def test_linalg_matrix_rank_hip_graph_gate(monkeypatch):
 
 
 @pytest.mark.linalg_matrix_rank
-@pytest.mark.skipif(IS_ASCEND, reason="Ascend backend has its own implementation")
 def test_linalg_matrix_rank_empty_validates_tolerances():
     # Native torch runs its same-device / non-complex tolerance checks
     # BEFORE its empty-input return; FlagGems must match, so an empty
@@ -2031,7 +2028,11 @@ def test_linalg_matrix_rank_empty_validates_tolerances():
     reference = torch.linalg.matrix_rank(matrix.cpu())
     _assert_equal(result, reference.to(flag_gems.device))
 
-    complex_tol = torch.ones(2, dtype=torch.complex64, device=matrix.device)
+    # Complex tensors are not constructible on Ascend (torch_npu rejects
+    # them); building the tolerance on CPU still exercises the complex
+    # rejection because the dtype check precedes the device check.
+    complex_device = torch.device("cpu") if IS_ASCEND else matrix.device
+    complex_tol = torch.ones(2, dtype=torch.complex64, device=complex_device)
     with pytest.raises(RuntimeError, match="complex"):
         flag_gems.linalg_matrix_rank(matrix, atol=complex_tol)
     if matrix.device.type != "cpu":

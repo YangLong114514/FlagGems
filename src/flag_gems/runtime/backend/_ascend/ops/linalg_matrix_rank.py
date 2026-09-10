@@ -52,7 +52,13 @@ fp64 Triton kernels); there is no aclnn/native decomposition fallback
 anywhere -- every rank is computed by the Triton kernels in this file (the
 hermitian 32 < k <= 64 path only uses host-side aten ops -- zeros / where /
 arange -- for padding and lower-triangle symmetrization, never for the
-decomposition itself).
+decomposition itself).  Empty inputs still validate tolerance
+dtype/device/broadcast before returning (native torch validates before
+its empty-input return too).  Every non-empty call is scale-normalized at
+the entry: each batch matrix is divided by its lower-triangle
+(hermitian) / full-matrix max-abs and atol by the same factor, so fp32
+sum-of-squares neither overflow (|x| ~ 1e20) nor underflow (|x| ~ 1e-30);
+rank semantics are invariant under the scaling (rtol is relative).
 
 Implementation note: the RRQR kernels below are extremely sensitive to this
 toolchain's codegen instabilities; the inline comments document every
@@ -257,6 +263,45 @@ def _tolerance_scalars(input, atol, rtol):
     return atol_val, rtol_val
 
 
+def _validate_tolerance_metadata(input, atol, rtol):
+    """Host-side-only tolerance validation for the empty-input early return
+    (which never calls _prepare_tolerances -- that would divide by
+    m*n == 0).  Mirrors _expand_tolerance's checks so empty inputs reject
+    invalid tolerances exactly like non-empty ones (native torch validates
+    tolerances before its empty-input return as well)."""
+    batch_shape = input.shape[:-2]
+    for name, value in (("atol", atol), ("rtol", rtol)):
+        if value is None:
+            continue
+        if not isinstance(value, torch.Tensor):
+            try:
+                float(value)
+            except (TypeError, ValueError) as error:
+                raise TypeError(
+                    f"torch.linalg.matrix_rank: {name} must be a float or Tensor"
+                ) from error
+            continue
+        if value.is_complex():
+            raise RuntimeError(
+                f"torch.linalg.matrix_rank: {name} tensor of complex type is "
+                f"not supported. Got {value.dtype}"
+            )
+        if value.device != input.device:
+            raise RuntimeError(
+                f"torch.linalg.matrix_rank: Expected {name} and input tensors "
+                f"to be on the same device, but got {name} on {value.device} "
+                f"and input on {input.device}"
+            )
+        try:
+            value.expand(batch_shape)
+        except RuntimeError as error:
+            raise RuntimeError(
+                f"torch.linalg.matrix_rank: {name} with shape "
+                f"{tuple(value.shape)} is not broadcastable to batch shape "
+                f"{tuple(batch_shape)}"
+            ) from error
+
+
 def _check_input(input, hermitian):
     if input.ndim < 2:
         raise RuntimeError(
@@ -324,6 +369,55 @@ def _copy_rank_to_out(input, result, out):
 def _matrix_rank_zero_kernel(out, N: tl.constexpr, BLOCK_SIZE: tl.constexpr):
     offsets = tl.program_id(0) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
     tl.store(out + offsets, 0, mask=offsets < N)
+
+
+@triton.jit
+def _mr_normalize_small_kernel(
+    A,
+    OUT,
+    SCALE,
+    FLAG,
+    M: tl.constexpr,
+    N: tl.constexpr,
+    HERMITIAN: tl.constexpr,
+    NEED_FLAG: tl.constexpr,
+    BLOCK_R: tl.constexpr,
+    BLOCK_C: tl.constexpr,
+):
+    # Single-launch scale normalization for small matrices (m, n <= 64):
+    # per-batch power-of-two max-abs scale + in-kernel divide.  The aten
+    # equivalent (abs -> amax -> mantissa mask -> where -> div, plus tril
+    # for hermitian) costs 5-6 launches, which dominates sub-millisecond
+    # ops.  HERMITIAN takes the scale from the LOWER triangle only (torch
+    # reads just the lower triangle; garbage above the diagonal must not
+    # inflate the scale) while still writing out the FULL scaled matrix.
+    # The bit trick zeroes the fp32 mantissa -> the divisor is 2^e and the
+    # division is exact; a masked-to-zero scale (all-zero or subnormal-max
+    # matrix) maps to 1, i.e. "no scaling", matching native torch.  FLAG
+    # (written only under NEED_FLAG, for the tensor-tolerance negative-tol
+    # fixup) records "the (lower-triangle) max-abs is nonzero", sparing the
+    # fixup its own full-matrix amax/amin/tril scan.
+    batch = tl.program_id(0)
+    rr = tl.arange(0, BLOCK_R)[:, None]
+    cc = tl.arange(0, BLOCK_C)[None, :]
+    lmask = (rr < M) & (cc < N)
+    a = tl.load(A + batch * M * N + rr * N + cc, mask=lmask, other=0.0)
+    aa = tl.abs(a)
+    if HERMITIAN:
+        aa = tl.where(rr >= cc, aa, 0.0)
+    row_max = tl.max(aa, axis=1)  # (BLOCK_R,), >= 0
+    if NEED_FLAG:
+        nz = tl.max(row_max, axis=0) > 0.0
+        tl.store(FLAG + batch, nz.to(tl.int8))
+    # pow2-floor per row, then the batch max: pow2_floor is monotonic on
+    # nonneg floats, so pow2_floor(max) == max(pow2_floor(row_maxes)) --
+    # this keeps the bitcast on a VECTOR (a scalar bitcast miscompiles on
+    # this backend).
+    pw = (row_max.to(tl.int32, bitcast=True) & -8388608).to(tl.float32, bitcast=True)
+    scale = tl.max(pw, axis=0)
+    scale = tl.where(scale > 0, scale, 1.0)
+    tl.store(SCALE + batch, scale)
+    tl.store(OUT + batch * M * N + rr * N + cc, a / scale, mask=lmask)
 
 
 # ---------------------------------------------------------------------------
@@ -3367,6 +3461,20 @@ def _launch_matrix_rank(input, atol, rtol, hermitian):
     matrix = input.contiguous().reshape(batch_count, m, n)
     out = torch.empty(output_shape, dtype=torch.int64, device=input.device)
 
+    if is_fp64:
+        # fp64 is unsupported on this backend end to end: aclnn svd_npu
+        # is fp32-only, and triton-ascend cannot compile fp64 kernels
+        # (verified: the rank1/rank2 closed forms and the fused-Jacobi
+        # reference path all die with MLIRCompilationError at kernel
+        # compile time).  Reject BEFORE any shape dispatch -- and before
+        # the scale normalization below, whose pow2 mantissa mask is an
+        # fp32-only bit trick -- so every shape fails fast with a clear
+        # error instead of a compiler crash.
+        raise NotImplementedError(
+            "FlagGems Ascend linalg_matrix_rank does not support "
+            "float64 inputs (triton-ascend cannot compile fp64 kernels)"
+        )
+
     # Scalar tolerances (the common case) are passed to the small-path
     # kernels as scalar arguments, skipping the two fill-kernel launches that
     # materializing (batch,) tolerance tensors would cost.  Tensor
@@ -3380,6 +3488,86 @@ def _launch_matrix_rank(input, atol, rtol, hermitian):
     else:
         atol_val, rtol_val = _tolerance_scalars(input, atol, rtol)
 
+    # Input scale normalization (mirrors the shared implementation): the
+    # Householder algebra squares the matrix scale (w = A.v is
+    # O(sigma^2)), so fp32 sum-of-squares overflow for |x| ~ 1e20 and
+    # underflow for |x| ~ 1e-30.  Normalize each batch matrix by its
+    # max-abs and shrink atol by the same factor -- rank = #{sigma >
+    # max(atol, rtol*sigma_max)} is invariant under this (rtol is
+    # relative).  Hermitian reads ONLY the lower triangle, so the scale
+    # comes from the lower triangle: garbage in the strict upper triangle
+    # is invisible to the computation and must not inflate the scale.
+    # The divisor is rounded DOWN to a power of two (fp32 mantissa bits
+    # masked off): division by 2^e is exact (pure exponent shift), so the
+    # normalization adds no rounding step to ordinary inputs (a plain
+    # max-abs division flipped a noise-floor lowrank case: (24,24) rank 12
+    # read as 13; exp2(floor(log2(x))) is NOT exact on this backend --
+    # measured 0.5 -> 0.49999997).  A masked-to-zero scale (all-zero or
+    # subnormal-max matrix) maps to 1, i.e. "no scaling", matching native
+    # torch.  Small matrices (m, n <= 64) use a single-launch kernel --
+    # the aten chain below costs 5-6 launches, which halves the speedup of
+    # sub-millisecond ops (measured: herm 17^2 0.85 -> 0.46).
+    # nonzero_flag (batch,) int8 records "the (lower-triangle) max-abs is
+    # nonzero" for the negative-tolerance fixup at the end, sparing it a
+    # full-matrix tril+amax+amin scan per tensor-tolerance call.  Also
+    # needed when a nonzero scalar atol gets materialized into tensors by
+    # the scaling below.
+    need_flag = tol_tensor or atol_val != 0.0
+    nonzero_flag = None
+    if rows <= 64:
+        normed = torch.empty_like(matrix)
+        scale = torch.empty(
+            (batch_count,), dtype=torch.float32, device=matrix.device
+        )
+        if need_flag:
+            nonzero_flag = torch.empty(
+                (batch_count,), dtype=torch.int8, device=matrix.device
+            )
+        with torch_device_fn.device(matrix.device):
+            _fast_launch(
+                _mr_normalize_small_kernel,
+                (batch_count,),
+                matrix,
+                normed,
+                scale,
+                nonzero_flag if need_flag else scale,  # dummy: not stored
+                M=m,
+                N=n,
+                HERMITIAN=hermitian,
+                NEED_FLAG=need_flag,
+                BLOCK_R=triton.next_power_of_2(m),
+                BLOCK_C=triton.next_power_of_2(n),
+                num_warps=1,
+            )
+        matrix = normed
+    else:
+        scale_src = matrix.tril() if hermitian else matrix
+        scale = scale_src.abs().amax(dim=(1, 2))
+        if need_flag:
+            nonzero_flag = (scale > 0).to(torch.int8)
+        scale = (scale.view(torch.int32) & -0x800000).view(torch.float32)
+        scale = torch.where(scale > 0, scale, torch.ones_like(scale))
+        matrix = matrix / scale[:, None, None]
+    if tol_tensor:
+        atol_tensor = atol_tensor / scale
+    elif atol_val != 0.0:
+        # A nonzero scalar atol becomes per-batch under scaling.  The
+        # kernels take tolerances either both as tensors or both as
+        # scalars, so rtol is materialized alongside (it is relative and
+        # needs no division).  The common atol == 0 case keeps the scalar
+        # fast path: 0 / scale == 0.
+        atol_tensor = (
+            torch.full(
+                (batch_count,), atol_val, dtype=matrix.dtype, device=matrix.device
+            )
+            / scale
+        )
+        rtol_tensor = torch.full(
+            (batch_count,), rtol_val, dtype=matrix.dtype, device=matrix.device
+        )
+        atol_val = rtol_val = 0.0
+        tol_tensor = True
+
     block_r = triton.next_power_of_2(rows)
     relative_epsilon = 1.0e-15 if is_fp64 else 1.0e-7
     absolute_epsilon = 1.0e-300 if is_fp64 else 1.0e-30
@@ -3390,18 +3578,6 @@ def _launch_matrix_rank(input, atol, rtol, hermitian):
     rt_arg = rtol_tensor if tol_tensor else matrix
 
     with torch_device_fn.device(input.device):
-        if is_fp64:
-            # fp64 is unsupported on this backend end to end: aclnn svd_npu
-            # is fp32-only, and triton-ascend cannot compile fp64 kernels
-            # (verified: the rank1/rank2 closed forms and the fused-Jacobi
-            # reference path all die with MLIRCompilationError at kernel
-            # compile time).  Reject BEFORE any shape dispatch so every
-            # shape fails fast with a clear error instead of a compiler
-            # crash.
-            raise NotImplementedError(
-                "FlagGems Ascend linalg_matrix_rank does not support "
-                "float64 inputs (triton-ascend cannot compile fp64 kernels)"
-            )
         if k == 1:
             _matrix_rank_rank1_kernel[(batch_count,)](
                 matrix,
@@ -3532,18 +3708,17 @@ def _launch_matrix_rank(input, atol, rtol, hermitian):
     # not trigger the fix; (b) no Python branch on device data -- a
     # bool(...any()) here would sync the host on EVERY tensor-tolerance
     # call, so the tensor branch applies the (usually no-op) where
-    # unconditionally and asynchronously.  A Triton early-exit kernel was
+    # unconditionally and asynchronously.  (A Triton early-exit kernel was
     # tried and abandoned: this backend fails to legalize a masked load
-    # combined with any runtime scalar in a vector expression (unresolved
-    # () -> tensor materialization, five variants), so the tensor branch
-    # pays tril (herm only) + amax + amin + where even when no tolerance
-    # is negative -- a documented follow-up.
+    # combined with any runtime scalar in a vector expression -- unresolved
+    # () -> tensor materialization, five variants.)  The matrix scan itself
+    # is free: the tensor branch reuses the entry normalization's
+    # nonzero_flag (the scale is already computed from the lower triangle
+    # for hermitian inputs, satisfying (a)), leaving only the tiny
+    # (batch,)-sized where.
     if tol_tensor:
         neg_pair = ((atol_tensor < 0) & (rtol_tensor < 0)).reshape(output_shape)
-        src = matrix.tril() if hermitian else matrix
-        nonzero = ((src.amax(dim=(1, 2)) > 0) | (src.amin(dim=(1, 2)) < 0)).reshape(
-            output_shape
-        )
+        nonzero = nonzero_flag.reshape(output_shape) != 0
         out = torch.where(neg_pair & nonzero, torch.full_like(out, k), out)
     elif atol_val < 0.0 and rtol_val < 0.0:
         src = matrix.tril() if hermitian else matrix
@@ -3564,6 +3739,10 @@ def linalg_matrix_rank(input, *, atol=None, rtol=None, hermitian=False):
 
     output_shape = input.shape[:-2]
     if input.numel() == 0:
+        # Native torch validates tolerances BEFORE its empty-input return;
+        # match that (complex dtype / wrong device / unbroadcastable tensor
+        # tolerances must still raise).
+        _validate_tolerance_metadata(input, atol, rtol)
         return _empty_matrix_rank(input, output_shape)
 
     return _launch_matrix_rank(input, atol, rtol, hermitian)
