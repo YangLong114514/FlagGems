@@ -133,6 +133,11 @@ _RRQR_MAX_K = 255  # 65..255 uses the exact paths by default; the fast
 # 65^2 0.74 / 129^2 0.72). k >= 256 is always exact (256^2 1.10x
 # general / 2.04x herm, and 2.2x/4.0x at 512^2).
 
+# The register-resident QR panel is reliable for one or two 64-row tiles.
+# Its NB=4 specialization exceeds the 192 KiB UB budget on CANN 9.1.1 even
+# with multibuffering disabled, so larger row counts use the GM-tile panel.
+_RRQR_REG_PANEL_MAX_ROWS = 128
+
 
 def _jacobi_sweeps(k, is_fp64):
     """Worst-case sweep cap; kernels exit early once the Weyl bound holds."""
@@ -2049,10 +2054,12 @@ def _mr_rrqr_panel_reg_kernel(
     WPITCH,
     NB: tl.constexpr,  # number of 64-row register tiles (1, 2 or 4)
 ):
-    # Register-resident panel factorization for RS <= 256 (NB <= 4): the
-    # panel lives in NB static (64, 64) register tiles, so a Householder
+    # Register-resident panel factorization supporting RS <= 256 (NB <= 4).
+    # The panel lives in NB static (64, 64) register tiles, so a Householder
     # step is a handful of fused tile ops (~9-20us/step vs ~50-100us for the
-    # GM-tile panel above, which is kept for rows > 256). No pivoting: the
+    # GM-tile panel above). CANN 9.1.1 cannot allocate the NB=4 specialization,
+    # so current launchers use this kernel only for rows <= 128 and route
+    # larger panels through GM. No pivoting: the
     # k <= 64 bidiagonalization path is likewise unpivoted, and the test
     # spectra have clear gaps.
     #
@@ -2460,7 +2467,7 @@ def _launch_longdim_rank(
             num_warps=4,
             num_stages=1,
         )
-        if rows <= 256:
+        if rows <= _RRQR_REG_PANEL_MAX_ROWS:
             _fast_launch(
                 _mr_rrqr_panel_reg_kernel,
                 (batch_count,),
@@ -2473,18 +2480,9 @@ def _launch_longdim_rank(
                 k,
                 rs,
                 wpitch,
-                # NB must stay in {1, 2, 4}, same as _launch_rrqr_rank: the
-                # NB=3 specialization (rs = 192) is a marginal UB allocation
-                # that flip-flops between fitting and "ub overflow" across
-                # compiles.
-                NB=min(4, triton.next_power_of_2(max(1, rs // 64))),
+                NB=triton.next_power_of_2(max(1, rs // 64)),
                 num_warps=4,
                 num_stages=1,
-                # CANN 9 may auto-multibuffer the four live 64x64 tiles in
-                # the NB=4 specialization, which pushes UB usage past the
-                # 192 KiB limit. The panel is already register-resident, so
-                # multibuffering only duplicates storage here.
-                multibuffer=False,
             )
         else:
             _fast_launch(
@@ -2594,20 +2592,19 @@ def _launch_rrqr_rank(
     the rank is read off the |R_ii| diagonal, which sits in the LINEAR domain
     (no Gram squaring), so the smallest singular value keeps full relative
     precision. Panels are factored by the register-resident kernel when the
-    row count fits (rows <= 256), else by the GM-tile kernel.
+    row count fits (rows <= 128), else by the GM-tile kernel.
     """
     dev = input.device
-    reg_panel = rows <= 256
+    reg_panel = rows <= _RRQR_REG_PANEL_MAX_ROWS
     kp = triton.cdiv(k, 64) * 64
     rs = triton.cdiv(rows, 64) * 64
     wpitch = kp * rs
     ntmax = kp // 64
     block_k = triton.next_power_of_2(k)
-    nb = min(4, triton.next_power_of_2(max(1, rs // 64)))  # 64-row register
-    # tiles in the reg panel kernel.  NB must stay in {1, 2, 4}: the NB=3
-    # specialization (rs = 192) is a marginal UB allocation that flip-flops
-    # between fitting and "ub overflow" across compiles (verified: (129,129)
-    # failed, (192,192) passed, same binary specialization).
+    # 64-row tiles in the register panel kernel. When ``reg_panel`` is true,
+    # the row threshold guarantees NB is 1 or 2; the value is unused for the
+    # GM-panel branch.
+    nb = triton.next_power_of_2(max(1, rs // 64))
     W = torch.empty((batch_count, kp, rs), dtype=torch.float32, device=dev)
     V = torch.zeros((batch_count, kp, rs), dtype=torch.float32, device=dev)
     nrm2 = torch.empty((batch_count, k), dtype=torch.float32, device=dev)
@@ -2661,10 +2658,6 @@ def _launch_rrqr_rank(
                     NB=nb,
                     num_warps=4,
                     num_stages=1,
-                    # Keep the NB=4 specialization within the 192 KiB UB
-                    # budget on CANN 9; this panel already keeps its tiles
-                    # resident and does not benefit from extra buffering.
-                    multibuffer=False,
                 )
             else:
                 _fast_launch(

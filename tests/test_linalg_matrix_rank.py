@@ -1299,13 +1299,10 @@ def test_linalg_matrix_rank_negative_tolerances(k, hermitian):
 @pytest.mark.parametrize("shape", [(129, 64), (64, 129), (192, 64), (64, 192)])
 def test_linalg_matrix_rank_longdim_exact_power2_nb(shape, monkeypatch):
     # Long-dimension k <= 64 QR-compresses to the k x k R factor with the
-    # register panel kernel (default since the exact-path flip; clear any
-    # FAST_PATH leftover so the register panel is really exercised); for
-    # these shapes
-    # rs = round_up(max(m, n), 64) = 192, and a raw NB = rs // 64 = 3
-    # specialization is a marginal UB allocation that flip-flops between
-    # fitting and "ub overflow" across compiles.  The launcher must clamp NB
-    # to {1, 2, 4} (same as the main QR launcher).
+    # exact bidiag64 tail. For these shapes rs = 192, which previously rounded
+    # NB=3 up to the NB=4 register specialization. That specialization exceeds
+    # the 192 KiB UB budget on CANN 9.1.1, so this is also a regression test for
+    # routing the panel through the GM-tile kernel without changing results.
     monkeypatch.delenv("FLAGGEMS_MR_FAST_PATH", raising=False)
     m, n = shape
     rank = 17
