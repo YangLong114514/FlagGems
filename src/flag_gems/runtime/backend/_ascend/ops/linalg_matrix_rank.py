@@ -2355,6 +2355,14 @@ _FAST_LAUNCH_CACHE = {}
 
 
 def _fast_launch(kernel, grid, *args, **kwargs):
+    # Triton <= 3.2 passes only non-constexpr values to CompiledKernel.run,
+    # while Triton 3.5 passes every bound kernel argument (including
+    # tl.constexpr values).  The Ascend C launcher is generated to match the
+    # frontend ABI, so select the argument set expected by that frontend.
+    # Every call below passes the non-constexpr prefix positionally and the
+    # remaining kernel arguments by name; direct tuple assembly preserves the
+    # low-overhead cache-hit path.  Calling run with only ``args`` on 3.5
+    # produces e.g. "function takes exactly 19 arguments (13 given)".
     key = (
         id(kernel),
         tuple(grid),
@@ -2369,15 +2377,21 @@ def _fast_launch(kernel, grid, *args, **kwargs):
         entry = (compiled.run, compiled.function, compiled.packed_metadata, compiled)
         _FAST_LAUNCH_CACHE[key] = entry
     run, function, md, compiled = entry
+    if hasattr(kernel, "non_constexpr_indices"):
+        launch_args = args
+    else:
+        launch_args = args + tuple(
+            kwargs[name] for name in kernel.arg_names[len(args) :]
+        )
     from triton.runtime import driver
 
     device = driver.active.get_current_device()
     stream = driver.active.get_current_stream(device)
-    lm = compiled.launch_metadata(grid, stream, *args)
+    lm = compiled.launch_metadata(grid, stream, *launch_args)
     g0 = grid[0] if len(grid) > 0 else 1
     g1 = grid[1] if len(grid) > 1 else 1
     g2 = grid[2] if len(grid) > 2 else 1
-    run(g0, g1, g2, stream, function, md, lm, None, None, *args)
+    run(g0, g1, g2, stream, function, md, lm, None, None, *launch_args)
 
 
 def _launch_longdim_rank(

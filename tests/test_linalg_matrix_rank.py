@@ -981,6 +981,51 @@ def test_linalg_matrix_rank_fast_path_dispatch(monkeypatch):
 
 
 @pytest.mark.linalg_matrix_rank
+@pytest.mark.skipif(not IS_ASCEND, reason="Ascend-specific launcher compatibility")
+@pytest.mark.parametrize("legacy_abi", [False, True], ids=["triton35", "triton32"])
+def test_linalg_matrix_rank_fast_launch_abi(legacy_abi):
+    # Triton 3.5 passes all bound kernel arguments to CompiledKernel.run;
+    # Triton <= 3.2 passes only non-constexpr arguments.  Exercise both host
+    # ABIs with a fake compiled kernel so this test never launches device code.
+    module = importlib.import_module(flag_gems.linalg_matrix_rank.__module__)
+    events = {}
+
+    class FakeCompiled:
+        function = object()
+        packed_metadata = {}
+
+        def _init_handles(self):
+            pass
+
+        def launch_metadata(self, grid, stream, *launch_args):
+            events["metadata_args"] = launch_args
+            return None
+
+        def run(self, *launch_args):
+            events["run_args"] = launch_args[9:]
+
+    class FakeKernel:
+        arg_names = ["A", "M", "N"]
+
+        def warmup(self, *args, **kwargs):
+            return FakeCompiled()
+
+    kernel = FakeKernel()
+    if legacy_abi:
+        kernel.non_constexpr_indices = [0]
+    pointer = object()
+    module._FAST_LAUNCH_CACHE.clear()
+    try:
+        module._fast_launch(kernel, (1,), pointer, M=8, N=16, num_warps=1)
+    finally:
+        module._FAST_LAUNCH_CACHE.clear()
+
+    expected = (pointer,) if legacy_abi else (pointer, 8, 16)
+    assert events["metadata_args"] == expected
+    assert events["run_args"] == expected
+
+
+@pytest.mark.linalg_matrix_rank
 @pytest.mark.parametrize("dtype", SUPPORTED_DTYPE_CASES)
 @pytest.mark.parametrize(
     "shape,fill_row,fill_col",
