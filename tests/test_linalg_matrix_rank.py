@@ -2132,3 +2132,76 @@ def test_linalg_matrix_rank_blocked_probe_runs_once(monkeypatch):
     assert module._blocked_tridiag_ok(device)
     assert module._blocked_tridiag_ok(device)
     assert len(calls) == 1
+
+
+@pytest.mark.linalg_matrix_rank
+@pytest.mark.skipif(IS_ASCEND, reason="Ascend backend has its own implementation")
+@pytest.mark.parametrize(
+    "hermitian", [False, True], ids=["nonherm-bidiag", "herm-tridiag"]
+)
+def test_linalg_matrix_rank_no_fp64_k32_dispatch(hermitian, monkeypatch):
+    # k=32 fp32 on a device WITHOUT native FP64 must not take the fused
+    # Jacobi tile: at least one such backend's compiler (Iluvatar CoreX)
+    # miscompiles exactly that configuration, returning near-zero ranks.
+    # Hermitian must route to tridiagonalization, non-hermitian to
+    # bidiagonalization; full-capability devices keep the fused path.
+    # Spy on the decomposition launchers to prove the routing and check
+    # the rank against a CPU fp64 oracle.  Direct module API (vendor
+    # plugins may override the public entry).
+    module = importlib.import_module("flag_gems.ops.linalg_matrix_rank")
+    monkeypatch.setattr(module.runtime_device, "support_fp64", False)
+    calls = {"tridiag": [], "bidiag": []}
+    orig_tridiag = module._launch_herm_tridiag_rank
+    orig_bidiag = module._launch_bidiag_rank
+
+    def spy_tridiag(*args, **kwargs):
+        calls["tridiag"].append(1)
+        return orig_tridiag(*args, **kwargs)
+
+    def spy_bidiag(*args, **kwargs):
+        calls["bidiag"].append(1)
+        return orig_bidiag(*args, **kwargs)
+
+    monkeypatch.setattr(module, "_launch_herm_tridiag_rank", spy_tridiag)
+    monkeypatch.setattr(module, "_launch_bidiag_rank", spy_bidiag)
+
+    # Rank-30 k=32 with singular/eigenvalues exactly 1..30 (far above
+    # atol=5e-2; fp32 rounding noise ~1e-5 far below), built on CPU fp64
+    # with a single final rounding.
+    k, rank = 32, 30
+    generator = torch.Generator().manual_seed(29)
+    spectrum = torch.arange(1, rank + 1, dtype=torch.float64)
+    basis = torch.linalg.qr(
+        torch.randn(k, k, generator=generator, dtype=torch.float64)
+    )[0]
+    if hermitian:
+        base = (basis[:, :rank] * spectrum) @ basis[:, :rank].mT
+    else:
+        right = torch.linalg.qr(
+            torch.randn(k, k, generator=generator, dtype=torch.float64)
+        )[0]
+        base = (basis[:, :rank] * spectrum) @ right[:, :rank].mT
+    matrix = base.float().to(flag_gems.device)
+    reference = torch.linalg.matrix_rank(base, hermitian=hermitian, atol=5e-2)
+    assert reference.item() == rank  # construction sanity
+
+    result = module.linalg_matrix_rank(matrix, hermitian=hermitian, atol=5e-2)
+    _assert_equal(result, reference.to(flag_gems.device))
+    call_counts = {name: len(hits) for name, hits in calls.items()}
+    expected_calls = {
+        "tridiag": 1 if hermitian else 0,
+        "bidiag": 0 if hermitian else 1,
+    }
+    assert call_counts == expected_calls
+
+    # Smaller fused sizes are unaffected: k=16 still takes the fused
+    # single-kernel path (no decomposition launcher involved).
+    calls["tridiag"].clear()
+    calls["bidiag"].clear()
+    small = torch.randn(16, 16, generator=generator, dtype=torch.float64)
+    small = ((small + small.mT) / 4).float().to(flag_gems.device)
+    module.linalg_matrix_rank(small, hermitian=True)
+    assert {name: len(hits) for name, hits in calls.items()} == {
+        "tridiag": 0,
+        "bidiag": 0,
+    }
