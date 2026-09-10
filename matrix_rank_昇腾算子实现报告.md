@@ -1,12 +1,12 @@
 # `linalg_matrix_rank` 昇腾 910B 后端实现与优化报告(详细版)
 
 > 分支:`ascend-matrix-rank-triton`(已推送 `github.com:YangLong114514/FlagGems`)
-> 提交:`fdbe04cb`(第十二阶段:默认分发反转为精确路径 + 评审测试闭环)
+> 提交:`ac842302`(ascend-matrix-rank-new 分支,第十三阶段:PR 评审语义修复——空矩阵容差校验 + 输入尺度归一化)
 > 硬件:昇腾 910B4(20 AI Core × 2 Vector = 40 Vector 核,UB 192KB)
 > 软件:CANN 8.5.0、triton-ascend 3.2.0(BiShengIR)、torch 2.6.0+cpu / torch_npu 2.6.0rc1
 > 目标:`torch.linalg.matrix_rank` 在 NPU 上的 speedup ≥ 0.8
 >
-> **阅读指引**:第一至三章是设计/优化的主体内容,其中 §1.4 已更新为**当前最终 dispatch**;第一阶段的原始结构保留在附录 C。第二至第十二阶段是按时间顺序的演进记录(RRQR → 精确大矩阵路径 → hermitian 基线修正与小矩阵优化 → 评审修复与工具链退化处置 → 精确路径推广 → 默认分发切换 → 三轮评审修复 → 精确路径优化评估 → 五方向优化意见闭环与 slack 裁剪落地 → 默认分发反转为精确路径),各阶段内的"当前状态"描述以写作时为准,最终以 §0 总结 + §1.4 + 第十至十二阶段为准。
+> **阅读指引**:第一至三章是设计/优化的主体内容,其中 §1.4 已更新为**当前最终 dispatch**;第一阶段的原始结构保留在附录 C。第二至第十二阶段是按时间顺序的演进记录(RRQR → 精确大矩阵路径 → hermitian 基线修正与小矩阵优化 → 评审修复与工具链退化处置 → 精确路径推广 → 默认分发切换 → 三轮评审修复 → 精确路径优化评估 → 五方向优化意见闭环与 slack 裁剪落地 → 默认分发反转为精确路径 → PR 评审语义修复),各阶段内的"当前状态"描述以写作时为准,最终以 §0 总结 + §1.4 + 第十至十三阶段为准。
 
 ---
 
@@ -1310,3 +1310,54 @@ QR+GK(R) 比 default 和 exact **都慢**。原因:46% 的 FLOP 论证在本硬�
 4. **两处源码注释与实测矛盾**:模块 docstring 原写"fp32 matrices with 64 < k <= 255 use a pure-Triton blocked Householder QR"(易误读为 QR 是默认),改为明确"exact paths BY DEFAULT,FAST_PATH=1 opts into the QR";精确分发处"Both SVD-accurate and >= 0.8x torch at every measured size"改为如实记录:k ≥ 256 ≥ 0.8×,65~255 默认在 tile 边界低谷 < 0.8×(129² 0.58、129×2048 0.53、herm 65² 0.71),这正是快速 QR 保留为 opt-in 的原因。
 
 **验证**:目标子集(exact_path 8 + strict_threshold 5 + power2_nb 4 + deflated 4 + fast_path_dispatch 1)真机通过;tensor atol 用例首跑暴露一个测试自身的构造错误(非 batch 输入的 atol 必须是 0-D 张量,torch 语义),已修正。全量回归:官方套件 **131 passed / 44 skipped**(+1 = fast_path_dispatch),sweeps **4/4**(+1 = 366 拆分出的 fast_mode;exact_default 模式下长维 lowrank 0 失配被断言锁死)。
+
+---
+
+# 第十三阶段:合入 master 后的 PR 评审语义修复(空矩阵容差校验 + 输入尺度归一化)
+
+通用实现与两个测试文件经 `#5942` 合入 master 后,昇腾后端在 `ascend-matrix-rank-new` 分支(基于最新 master)单独提交。PR 评审提出两个语义缺口,本阶段修复并验证。
+
+## 1. 空矩阵绕过 tolerance 校验
+
+入口在 `numel()==0` 时直接返回全零,跳过了 tolerance 的 complex dtype / device 一致性 / 广播校验(原生 torch 在空矩阵返回**之前**完成校验)。且 `_prepare_tolerances` 会算 `numel() // (m*n)`,对 (0,n) 除零,不能直接复用。修复:新增 `_validate_tolerance_metadata`(纯 host 元数据校验,错误消息与 `_expand_tolerance` 逐字一致),空矩阵返回前调用。
+
+测试联动:`test_linalg_matrix_rank_empty_validates_tolerances` 取消 Ascend skip;其中 complex 容差用例在 NPU 上无法构造(torch_npu `aclnnInplaceOne` 不支持 complex64,测试文件既有惯例 "complex tensors not constructible on Ascend"),按语义改为在 CPU 上构造 complex 容差——complex 检查先于 device 检查,语义不变。
+
+## 2. 极端数值尺度的输入归一化
+
+Householder 代数会把矩阵尺度平方(w = A·v 是 O(σ²)),fp32 平方和在 |x|~1e20 溢出、|x|~1e-30 下溢。通用实现(in-kernel `1/scale` + `_matrix_rank_scale_tol_kernel`)已有归一化;昇腾端此前没有,属于预存缺口而非 master 回归。
+
+修复(入口统一归一化,不触碰任何分解 kernel——避免重摇误编译彩票):
+
+- 每个 batch 矩阵除以各自的 max-abs 尺度,atol 同步除以同一因子;rtol 是相对量不变。rank 语义不变式:rank = #{σ > max(atol, rtol·σmax)}。
+- **hermitian 的尺度只从下三角取**(torch 只读下三角,垃圾上三角不可见,不能抬高 scale)——否则 atol 被过度缩小会改变秩判定。
+- **除数向下取 2 的幂**(fp32 尾数位掩码清零):除以 2^e 是纯指数移位、完全精确,对普通输入零舍入代价。教训:最初用普通 max-abs 做除数,~1ulp 的舍入把 366 扫描中 (24,24) lowrank 的噪声地板奇异值推过默认容差(秩 12 误报 13);`exp2(floor(log2(x)))` transcendental 路线在该后端实测不精确(0.5→0.49999997),只有位掩码可靠。位掩码在 kernel 内必须作用于**向量**(标量 bitcast 在该后端误编译,见缺陷清单),利用 pow2_floor 在非负浮点上的单调性:先对行最大值向量掩码再取 batch 最大。
+- 全零矩阵与次正规尺度掩码后为 0 → 映射为 1(即不缩放,与 torch 不缩放的行为一致)。
+- atol=0 的常见情形(含全部默认容差调用)保持标量快路径(0/scale=0);仅显式非零 atol 才物化张量容差。
+
+**性能驱动的双实现**:aten 归一化链(abs→amax→掩码→where→div,herm 再加 tril)共 5~6 个 launch,实测把亚毫秒小 shape 的加速比腰斩(herm 17² 0.85→0.46,(8,8) 2.44→0.94)。因此 m,n ≤ 64 的小矩阵改用**单 launch** 归一化 kernel `_mr_normalize_small_kernel`(一次 launch 完成下三角掩码 max-abs + 2 的幂掩码 + 写出缩放矩阵与 scale);rows > 64 的路径(长维/大矩阵,op 本身 ≥1ms)保留 aten 链,开销可忽略。
+
+## 3. 实现细节与本轮踩坑
+
+- **kernel 版归一化不能带 `@libentry`**:`_fast_launch` 直接调 `kernel.warmup`,LibEntry 包装对象没有该方法——该文件里所有走 `_fast_launch` 的内部 kernel 都是裸 `@triton.jit`。
+- **BLOCK_C 必须取 n 而非 k**:首版传 `next_power_of_2(k=min(m,n))`,宽矩阵(如 (5,16))右半部分根本没被拷贝,输出是 empty_like 的脏数据(秩 4 报 8)。套件里 `nonsquare_lowrank[wide-fused-band]` 当场抓住——已有覆盖的回归价值再次验证。
+- **fp64 fail-fast 必须前移到归一化之前**:归一化的尾数掩码是 fp32-only 位操作,fp64 输入会在 kernel 编译期报 "Cannot bitcast data-type of size 64" 而不是干净的 NotImplementedError。
+- **负容差修正的 nonzero 复用归一化的 max-abs**:tensor 容差路径此前每次调用无条件 tril+amax+amin+where 扫全矩阵(修正 tol<0 的边角),归一化 kernel 顺手多写一个 int8 flag(NEED_FLAG 常量门控,不需要时不写)即可替代,aten 大路径则用 `scale > 0` 的一个 (batch,) 比较替代三次全矩阵归约。注意 flag 需求要在"标量 atol≠0 被物化成张量"的翻转情形下也计算(`need_flag = tol_tensor or atol_val != 0`),否则负容差修正拿到 None。
+
+## 4. 验证(最终态)
+
+- 三个评审测试取消 Ascend skip 并全过:`test_linalg_matrix_rank_extreme_scales`(1e20/1e-30 × (16,16)/(65,65)herm/(513,513))、`test_linalg_matrix_rank_mixed_magnitude_batch`、`test_linalg_matrix_rank_empty_validates_tolerances`。
+- 官方套件 **143 passed / 42 skipped**;sweeps **4/4**(366 双模式 + herm 34 + QR 22);benchmark 137 项全部正常执行。
+
+## 5. 性能(`--mode operator`,合入版 benchmark,共享机器小 shape 有 ±20% 抖动)
+
+原 67 个验收 shape(标量默认容差)口径:
+
+| 口径 | general | herm | 总体 |
+|---|---|---|---|
+| 归一化前 | 1.82 / 1.28 | 2.15 / 1.74 | 1.92 / 1.40 |
+| 归一化后(单 kernel 版) | 1.43 / 1.07 | 1.79 / 1.37 | **1.53 / 1.15** |
+
+(算术 / 几何平均)归一化的代价集中在小 herm 方阵:1²~33² 从 0.85~1.49 回落到 ~0.6(亚毫秒算子上 +2 launch + 2 次分配约 40~60µs);长维 k≤64、65~160 方阵、129 长维等原有结构缺口基本不变。进一步恢复小 herm 需要把归一化做进 fused kernel 寄存器内(in-kernel max-abs),但该 kernel 是全套实现里误编译彩票最敏感的一个,且 in-kernel 无法用向量位掩码做精确 2 的幂缩放(标量 bitcast 误编译,见缺陷清单)——留作后续方向,当前以语义正确性优先。
+
+合入版 benchmark 另有 70 个新增变体(tensor atol/rtol、out=、positional tol):tensor 容差变体在小 shape 上 0.16~0.75,主因是 `_prepare_tolerances` 的多次物化与修正路径——本轮已用 nonzero_flag 复用消掉其中的全矩阵 tril+amax+amin 扫描,剩余为容差物化本身的 launch 开销,属预存项,与归一化无关。
