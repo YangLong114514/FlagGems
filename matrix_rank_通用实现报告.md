@@ -402,6 +402,46 @@ blocked WY 上线后天数回归出现 12 例失败，分三类：
 - **无 FP64 设备上，一切 fp64 中间形态都要出设备前完成**：reference、构造、
   sanity 检查都不例外。
 
+### 3.5 PR 评审修复（合入 master / PR #5942 之后）
+
+算子经 `general-matrix-rank-merge` 分支合入 master(#5942）后收到三条评审意见，
+核实与处理如下（提交在 merge 分支）：
+
+1. **空输入容差校验顺序（属实，已修）**：空矩阵在 `_prepare_tolerances` 之前返回，
+   complex / 跨设备 tensor 容差会被静默放过，而原生 torch 在空输入返回**之前**就
+   做这两项检查。修复：校验前移到空输入返回之前；新增空输入 + 非法容差用例。
+2. **blocked 自测的冷启动开销与并发（部分采纳）**：verdict 缓存无锁、并发首调会
+   重复执行——属实，已加双检锁（`_BLOCKED_TRIDIAG_LOCK`)；探针构造从 CPU fp64
+   QR（O(k³)）换成 F·Fᵀ/k（rank 100 数学上精确，最小非零特征值 ~0.4 ≫ 阈值
+   5e-2，零空间噪声 ~1e-5，两侧裕量充足），冷启动净成本 **~1.3s → ~59ms**(H20
+   实测；剩余主要是 768 列分解的 launch,JIT 反正首次真实调用也要付）。评审建议
+   的"移到 CI + 静态能力位/denylist"**未采纳**：与本实现 vendor 中立约束冲突
+   （通用文件不做 vendor 判断、不动后端 runtime 文件），且天数 rank2k 误编译
+   （3.3 节）是 CI 拦不住的生产环境静默错误，运行时已知答案自测是目前唯一
+   vendor 中立的拦截手段。探针拆分出 `_blocked_tridiag_probe` 便于测试 spy。
+3. **多维 batch 展平（属实，比评审说的更广）**:`(2,3,65,65)` 这类输入在大路径上
+   矩阵被 reshape 成 `(6,65,65)`，但物化的 atol/rtol 仍带 `output_shape` (2,3)，往
+   `(6,)` 的 workspace buffer `copy_` 直接报错——标量容差同样挂
+   （`torch.full((2,3))`)；评审提到的 `scale` 其实无恙（从已 reshape 的矩阵计算，
+   本来就是 `(6,)`)。修复：物化后 `.reshape(batch_count)`，与矩阵展平顺序一致。
+   此前多维 batch 只在小路径测过——小路径用裸指针 flat 索引，形状错误不暴露；
+   大路径的 staging `copy_` 是形状严格路径。新增 herm/bidiag × 标量/广播 tensor
+   容差 × 有图/无图共 4 例，CPU fp64 oracle 仲裁。
+4. **CI 教训：白盒测试必须模块直调**。`SpecOpRegistrar` 在 import 时把 vendor 实现
+   写进 `flag_gems` 的 globals、**替换**通用入口（`runtime/backend/__init__.py`),
+   所以带 vendor 后端的 CI 上 `flag_gems.linalg_matrix_rank` 可能是另一个模块的函
+   数。只断言结果的测试不受影响（谁的实现对结果都一样），但断言"内部探针恰好执
+   行一次"的白盒测试必须 `importlib.import_module("flag_gems.ops.linalg_matrix_rank")`
+   直调本模块——CI 上的 `calls == 0` 失败正是公共入口被覆盖所致（结果全对、
+   spy 零命中）。本分支图相关测试此前已整体直调化（merge 分支 `734f97ec`)。另注
+   意：同场 CI 还有 `test_has_compatible_shallow_copy_type.py` 在 import 期无条件
+   `to_mkldnn()` 导致 collection 崩死（MKL-DNN disabled 的 torch 构建）——与本算
+   子无关，属该测试自身可移植性缺陷。
+5. **测试粒度的取舍**:probe 缓存测试初版构造 768×768 矩阵并完整跑两次算子，过
+   重且与既有 blocked 用例重复。收敛为 fake-probe 轻量单测——它只负责"verdict
+   缓存恰好算一次"（这关系到性能：缓存失效意味着每次调用多跑一次 768² 自检）;
+   分派边界、失败回退、计算正确性由既有 blocked 测试组覆盖。
+
 ## 4. 当前性能（H20，分支 HEAD）
 
 `CUDA_VISIBLE_DEVICES=3 python -m pytest -s benchmark/test_linalg_matrix_rank.py`
@@ -445,6 +485,8 @@ graph 捕获把 barrier-free 重构初期的 herm fp32 回归（0.17~0.45x）全
 | `aa0a2413` | HIP 构建图捕获 opt-in（`FLAGGEMS_MR_HIP_GRAPH=1`，2.4/3.1 节） |
 | `38322f2b` | 修复 opt-in 门控被 `cuda is None` 条件遮蔽（2.4 节） |
 | `dcb7971c` | HIP 构建改为默认开图，`FLAGGEMS_MR_NO_GRAPH=1` 兜底（2.4/3.1 节） |
+| `2f3cb8fd`（merge 分支） | PR 评审修复：空输入容差校验前置、自测加锁+去 QR、多维 batch 展平（3.5 节） |
+| `ff07da3c` / `c3137c56`（merge 分支） | 新测试改模块直调 + probe 缓存测试轻量化（3.5 节） |
 
 ---
 
