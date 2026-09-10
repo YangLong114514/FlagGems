@@ -441,6 +441,15 @@ blocked WY 上线后天数回归出现 12 例失败，分三类：
    重且与既有 blocked 用例重复。收敛为 fake-probe 轻量单测——它只负责"verdict
    缓存恰好算一次"（这关系到性能：缓存失效意味着每次调用多跑一次 768² 自检）;
    分派边界、失败回退、计算正确性由既有 blocked 测试组覆盖。
+6. **天数新编译器：fused Jacobi k=32 误编译（merge 分支 `3ddd3193`)**。天数新编
+   译器（CoreX）下 fp32 k=32 的 fused Jacobi 单 tile kernel 整体不可靠：rank-30
+   的 k=32 输入 herm 返回 1、非 herm 返回 0，而强制走三对角化则正确；更小的
+   fused 尺寸与所有分解路径无恙。分流按能力位而非 vendor:
+   `avoid_fused_k32 = not support_fp64 and fp32 and k == 32`——herm 把三对角化门
+   槛降到 32，非 herm 落入 bidiag;NV 等有 FP64 的平台保持更快的 fused 不变。
+   教训：CI 只通过 herm 用例暴露了它，非 herm k=32 没有回归用例；已补
+   `no_fp64_k32_dispatch`(monkeypatch 关 `support_fp64` + spy 分解 launcher 双向
+   pin 路由 + CPU fp64 oracle)，并附带断言 k=16 在无 FP64 下仍走 fused 不误伤。
 
 ## 4. 当前性能（H20，分支 HEAD）
 
