@@ -1540,7 +1540,7 @@ def test_linalg_matrix_rank_ds32_fallback(shape, hermitian, monkeypatch):
     # fp64, and check every rank-relevant case against torch.  The fallback
     # only changes the Sturm count, so diagonal spectra stay exact and the
     # dense cases are built with margins far above the fp32 noise floor.
-    module = importlib.import_module("flag_gems.ops.linalg_matrix_rank")
+    module = importlib.import_module(flag_gems.linalg_matrix_rank.__module__)
     monkeypatch.setattr(module.runtime_device, "support_fp64", False)
 
     device = flag_gems.device
@@ -1570,7 +1570,7 @@ def test_linalg_matrix_rank_ds32_fallback(shape, hermitian, monkeypatch):
     def check(matrix, **kwargs):
         matrix = matrix.float().to(device)
         reference = torch.linalg.matrix_rank(matrix.cpu(), **kwargs)
-        result = module.linalg_matrix_rank(matrix, **kwargs)
+        result = flag_gems.linalg_matrix_rank(matrix, **kwargs)
         _assert_equal(result, reference.to(device))
 
     # full-rank dense
@@ -1593,14 +1593,14 @@ def test_linalg_matrix_rank_fp64_input_requires_native_fp64(monkeypatch):
     # On a device without native FP64 the entry point must reject float64
     # input with NotImplementedError before any shape dispatch, instead of
     # silently computing in demoted precision.
-    module = importlib.import_module("flag_gems.ops.linalg_matrix_rank")
+    module = importlib.import_module(flag_gems.linalg_matrix_rank.__module__)
     monkeypatch.setattr(module.runtime_device, "support_fp64", False)
 
     matrix = torch.randn(8, 8, dtype=torch.float64, device=flag_gems.device)
     with pytest.raises(NotImplementedError, match="native FP64"):
-        module.linalg_matrix_rank(matrix)
+        flag_gems.linalg_matrix_rank(matrix)
     with pytest.raises(NotImplementedError, match="native FP64"):
-        module.linalg_matrix_rank(matrix, hermitian=True)
+        flag_gems.linalg_matrix_rank(matrix, hermitian=True)
 
 
 @pytest.mark.linalg_matrix_rank
@@ -1731,7 +1731,7 @@ def test_linalg_matrix_rank_graph_key_includes_ds32(monkeypatch):
         or torch.version.hip is not None
     ):
         pytest.skip("graph capture only on genuine CUDA builds")
-    module = importlib.import_module("flag_gems.ops.linalg_matrix_rank")
+    module = importlib.import_module(flag_gems.linalg_matrix_rank.__module__)
     module._MR_GRAPHS.clear()
     module._MR_GRAPH_BYTES = 0
 
@@ -1739,12 +1739,12 @@ def test_linalg_matrix_rank_graph_key_includes_ds32(monkeypatch):
     matrix = (matrix + matrix.mT).to(flag_gems.device)
     reference = torch.linalg.matrix_rank(matrix.cpu(), hermitian=True)
 
-    module.linalg_matrix_rank(matrix, hermitian=True)  # native-fp64 capture
+    flag_gems.linalg_matrix_rank(matrix, hermitian=True)  # native-fp64 capture
     assert len(module._MR_GRAPHS) == 1
     assert list(module._MR_GRAPHS)[0][0][4] is False
 
     monkeypatch.setattr(module.runtime_device, "support_fp64", False)
-    result = module.linalg_matrix_rank(matrix, hermitian=True)  # ds32 capture
+    result = flag_gems.linalg_matrix_rank(matrix, hermitian=True)  # ds32 capture
     _assert_equal(result, reference.to(flag_gems.device))
     assert len(module._MR_GRAPHS) == 2
     assert list(module._MR_GRAPHS)[1][0][4] is True
@@ -1784,7 +1784,7 @@ def test_linalg_matrix_rank_hermitian_blocked_dispatch(k, path, monkeypatch):
     # fallback).  The graph cache is cleared so every case really runs its
     # launch sequence instead of replaying a graph captured by an earlier
     # test with the same cache key.
-    module = importlib.import_module("flag_gems.ops.linalg_matrix_rank")
+    module = importlib.import_module(flag_gems.linalg_matrix_rank.__module__)
     module._MR_GRAPHS.clear()
     module._MR_GRAPH_BYTES = 0
     device = torch.empty((), device=flag_gems.device).device
@@ -1815,7 +1815,7 @@ def test_linalg_matrix_rank_hermitian_blocked_dispatch(k, path, monkeypatch):
     reference = torch.linalg.matrix_rank(
         matrix.cpu().double(), hermitian=True, rtol=rtol
     )
-    result = module.linalg_matrix_rank(matrix, hermitian=True)
+    result = flag_gems.linalg_matrix_rank(matrix, hermitian=True)
     _assert_equal(result, reference.to(flag_gems.device))
     assert result.item() == 100
     # Backends whose blocked pipeline fails the known-answer self-test
@@ -1832,7 +1832,7 @@ def test_linalg_matrix_rank_hermitian_blocked_self_test_fallback(monkeypatch):
     # When the blocked-path self-test fails (backend miscompile), k >= 768
     # fp32 hermitian inputs must fall back to the unblocked run and stay
     # correct -- blocked results would be silently wrong there.
-    module = importlib.import_module("flag_gems.ops.linalg_matrix_rank")
+    module = importlib.import_module(flag_gems.linalg_matrix_rank.__module__)
     module._MR_GRAPHS.clear()
     module._MR_GRAPH_BYTES = 0
     calls = {"blocked": [], "unblocked": []}
@@ -1859,7 +1859,7 @@ def test_linalg_matrix_rank_hermitian_blocked_self_test_fallback(monkeypatch):
     reference = torch.linalg.matrix_rank(
         matrix.cpu().double(), hermitian=True, rtol=rtol
     )
-    result = module.linalg_matrix_rank(matrix, hermitian=True)
+    result = flag_gems.linalg_matrix_rank(matrix, hermitian=True)
     _assert_equal(result, reference.to(flag_gems.device))
     assert result.item() == 100
     assert not calls["blocked"]
@@ -1960,7 +1960,7 @@ def test_linalg_matrix_rank_hermitian_blocked_ds32(monkeypatch):
     # Force the pure-FP32 double-single Sturm tail on the BLOCKED path: the
     # panel factorization and the DS32 count must compose (the graph cache
     # key includes ds32, so this cannot replay a native-FP64 graph).
-    module = importlib.import_module("flag_gems.ops.linalg_matrix_rank")
+    module = importlib.import_module(flag_gems.linalg_matrix_rank.__module__)
     monkeypatch.setattr(module.runtime_device, "support_fp64", False)
 
     k = 768
@@ -1973,7 +1973,7 @@ def test_linalg_matrix_rank_hermitian_blocked_ds32(monkeypatch):
         matrix.cpu().double(), hermitian=True, rtol=rtol
     )
     assert reference.item() == 100  # construction sanity
-    result = module.linalg_matrix_rank(matrix, hermitian=True)
+    result = flag_gems.linalg_matrix_rank(matrix, hermitian=True)
     _assert_equal(result, reference.to(flag_gems.device))
 
 
@@ -2034,7 +2034,7 @@ def test_linalg_matrix_rank_hip_graph_gate(monkeypatch):
         or torch.version.hip is not None
     ):
         pytest.skip("genuine CUDA build required to simulate the HIP gate")
-    module = importlib.import_module("flag_gems.ops.linalg_matrix_rank")
+    module = importlib.import_module(flag_gems.linalg_matrix_rank.__module__)
 
     matrix = torch.randn(65, 65).float()
     matrix = (matrix + matrix.mT).to(flag_gems.device)
@@ -2048,10 +2048,10 @@ def test_linalg_matrix_rank_hip_graph_gate(monkeypatch):
     # Default on HIP builds: capture happens, replay stays correct.
     module._MR_GRAPHS.clear()
     module._MR_GRAPH_BYTES = 0
-    result = module.linalg_matrix_rank(matrix, hermitian=True)
+    result = flag_gems.linalg_matrix_rank(matrix, hermitian=True)
     _assert_equal(result, reference.to(flag_gems.device))
     assert len(module._MR_GRAPHS) == 1
-    result = module.linalg_matrix_rank(matrix, hermitian=True)  # replay
+    result = flag_gems.linalg_matrix_rank(matrix, hermitian=True)  # replay
     _assert_equal(result, reference.to(flag_gems.device))
     assert len(module._MR_GRAPHS) == 1
 
@@ -2059,7 +2059,7 @@ def test_linalg_matrix_rank_hip_graph_gate(monkeypatch):
     module._MR_GRAPHS.clear()
     module._MR_GRAPH_BYTES = 0
     monkeypatch.setenv("FLAGGEMS_MR_NO_GRAPH", "1")
-    result = module.linalg_matrix_rank(matrix, hermitian=True)
+    result = flag_gems.linalg_matrix_rank(matrix, hermitian=True)
     _assert_equal(result, reference.to(flag_gems.device))
     assert len(module._MR_GRAPHS) == 0
 
@@ -2100,7 +2100,7 @@ def test_linalg_matrix_rank_multidim_batch_large_path(hermitian, tol_kind, monke
     # (Tensor.copy_ does not reshape equal-numel tensors).  The small
     # single-kernel paths never hit this -- they index raw pointers.  Both
     # direct (no-graph) and graph capture+replay executions are checked.
-    module = importlib.import_module("flag_gems.ops.linalg_matrix_rank")
+    module = importlib.import_module(flag_gems.linalg_matrix_rank.__module__)
     k = 65
     generator = torch.Generator().manual_seed(13)
     # Batch member 0 is rank 10 by construction (FF.mT/k: smallest nonzero
@@ -2159,7 +2159,7 @@ def test_linalg_matrix_rank_blocked_probe_runs_once(monkeypatch):
     # probe -- whether k=768 dispatches to blocked, whether a failed probe
     # falls back, and whether the results are correct are all covered by
     # the existing blocked-path tests above.
-    module = importlib.import_module("flag_gems.ops.linalg_matrix_rank")
+    module = importlib.import_module(flag_gems.linalg_matrix_rank.__module__)
     module._BLOCKED_TRIDIAG_OK.clear()
 
     calls = []
@@ -2188,10 +2188,9 @@ def test_linalg_matrix_rank_no_fp64_k32_dispatch(hermitian, monkeypatch):
     # miscompiles exactly that configuration, returning near-zero ranks.
     # Hermitian must route to tridiagonalization, non-hermitian to
     # bidiagonalization; full-capability devices keep the fused path.
-    # Spy on the decomposition launchers to prove the routing and check
-    # the rank against a CPU fp64 oracle.  Direct module API (vendor
-    # plugins may override the public entry).
-    module = importlib.import_module("flag_gems.ops.linalg_matrix_rank")
+    # Spy on the decomposition launchers selected by the public API to prove
+    # the routing, while keeping the actual operator calls backend-dispatched.
+    module = importlib.import_module(flag_gems.linalg_matrix_rank.__module__)
     monkeypatch.setattr(module.runtime_device, "support_fp64", False)
     calls = {"tridiag": [], "bidiag": []}
     orig_tridiag = module._launch_herm_tridiag_rank
@@ -2228,7 +2227,7 @@ def test_linalg_matrix_rank_no_fp64_k32_dispatch(hermitian, monkeypatch):
     reference = torch.linalg.matrix_rank(base, hermitian=hermitian, atol=5e-2)
     assert reference.item() == rank  # construction sanity
 
-    result = module.linalg_matrix_rank(matrix, hermitian=hermitian, atol=5e-2)
+    result = flag_gems.linalg_matrix_rank(matrix, hermitian=hermitian, atol=5e-2)
     _assert_equal(result, reference.to(flag_gems.device))
     call_counts = {name: len(hits) for name, hits in calls.items()}
     expected_calls = {
@@ -2243,7 +2242,7 @@ def test_linalg_matrix_rank_no_fp64_k32_dispatch(hermitian, monkeypatch):
     calls["bidiag"].clear()
     small = torch.randn(16, 16, generator=generator, dtype=torch.float64)
     small = ((small + small.mT) / 4).float().to(flag_gems.device)
-    module.linalg_matrix_rank(small, hermitian=True)
+    flag_gems.linalg_matrix_rank(small, hermitian=True)
     assert {name: len(hits) for name, hits in calls.items()} == {
         "tridiag": 0,
         "bidiag": 0,
