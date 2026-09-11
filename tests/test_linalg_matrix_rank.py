@@ -848,7 +848,7 @@ def test_linalg_matrix_rank_rejects_complex_tolerance():
         pytest.param((1024, 8), 4, False, id="gram-band-long-dim-k8"),
         # Exact-default large paths: Golub-Kahan bidiagonalization for general
         # inputs and one-sided tridiagonalization for Hermitian inputs.  In the
-        # 65..255 band, unpivoted QR is an opt-in fast path only.
+        # 65..255 band, only non-hermitian rows > 256 may opt into QR.
         pytest.param((128, 128), 60, False, id="qr-band-k128"),
         pytest.param((256, 512), 100, False, id="qr-band-wide"),
         pytest.param((2, 100, 100), 40, False, id="qr-band-batched"),
@@ -857,7 +857,7 @@ def test_linalg_matrix_rank_rejects_complex_tolerance():
 )
 def test_linalg_matrix_rank_exact_path(shape, rank, hermitian, monkeypatch):
     # Exact reference path coverage: the exact path is the DEFAULT dispatch
-    # (the Gram/unpivoted-QR fast bands are opt-in via
+    # (the Gram/long-row unpivoted-QR fast bands are opt-in via
     # FLAGGEMS_MR_FAST_PATH=1), so this test runs the SVD-accurate
     # Golub-Kahan bidiagonalization + df64 Sturm count on every band.
     # Slowly-decaying low-rank spectra (singular values from 1
@@ -924,7 +924,7 @@ def test_linalg_matrix_rank_fast_path_dispatch(monkeypatch):
 
     for name in (
         "_launch_longdim_rank",  # exact long-dimension k <= 64 (QR compress)
-        "_launch_rrqr_rank",  # fast 65..255 unpivoted QR
+        "_launch_rrqr_rank",  # fast long-row 65..255 unpivoted QR
         "_launch_bidiag_rank",  # exact general k > 64
         "_launch_tridiag_big_rank",  # exact hermitian k > 64
     ):
@@ -965,19 +965,22 @@ def test_linalg_matrix_rank_fast_path_dispatch(monkeypatch):
     monkeypatch.setenv("FLAGGEMS_MR_FAST_PATH", "1")
     assert run((256, 64)) == []  # long-dim k <= 64: Gram inline
     assert run((64, 64)) == []  # square k <= 64: still unaffected
-    assert run((65, 65)) == ["_launch_rrqr_rank"]
-    assert run((255, 255)) == ["_launch_rrqr_rank"]
+    # Compact QR needs the register panel that CANN 9.1.1 cannot compile;
+    # using its GM fallback would be slower than the exact paths.
+    assert run((65, 65)) == ["_launch_bidiag_rank"]
+    assert run((255, 255)) == ["_launch_bidiag_rank"]
     assert run((256, 256)) == ["_launch_bidiag_rank"]  # k >= 256 stays exact
-    assert run((65, 65), hermitian=True) == ["_launch_rrqr_rank"]
-    assert run((65, 65), tensor_tol=True) == ["_launch_rrqr_rank"]
+    assert run((65, 65), hermitian=True) == ["_launch_tridiag_big_rank"]
+    assert run((65, 65), tensor_tol=True) == ["_launch_bidiag_rank"]
+    assert run((257, 65)) == ["_launch_rrqr_rank"]
 
     # --- runtime switching in one process (the env is read per call) ---
     monkeypatch.delenv("FLAGGEMS_MR_FAST_PATH", raising=False)
-    assert run((65, 65)) == ["_launch_bidiag_rank"]
+    assert run((257, 65)) == ["_launch_bidiag_rank"]
     monkeypatch.setenv("FLAGGEMS_MR_FAST_PATH", "1")
-    assert run((65, 65)) == ["_launch_rrqr_rank"]
+    assert run((257, 65)) == ["_launch_rrqr_rank"]
     monkeypatch.delenv("FLAGGEMS_MR_FAST_PATH", raising=False)
-    assert run((65, 65)) == ["_launch_bidiag_rank"]
+    assert run((257, 65)) == ["_launch_bidiag_rank"]
 
 
 @pytest.mark.linalg_matrix_rank
@@ -1104,10 +1107,8 @@ def test_linalg_matrix_rank_nonsquare_lowrank(dtype, shape, rank):
     "k", [3, 33, 65, 128, 257] if IS_ASCEND else [33, 65, 128, 257]
 )
 def test_linalg_matrix_rank_hermitian_strict_threshold(k, monkeypatch):
-    # The exact herm paths are the default dispatch (the 65..255 fast
-    # unpivoted-QR band is opt-in via FLAGGEMS_MR_FAST_PATH=1); clear any
-    # FAST_PATH leftover so the strict-threshold cases really run the
-    # fused/padded/tridiag Sturm counters exercised here.
+    # Hermitian paths remain exact regardless of FAST_PATH; clear the variable
+    # so the strict-threshold cases explicitly exercise the default mode.
     monkeypatch.delenv("FLAGGEMS_MR_FAST_PATH", raising=False)
     # torch's hermitian semantics are STRICT: rank = #{|lambda| > tol}
     # = #{lambda > tol} + #{lambda < -tol}.  The Sturm qd zero-pivot guard
@@ -1300,9 +1301,9 @@ def test_linalg_matrix_rank_negative_tolerances(k, hermitian):
 def test_linalg_matrix_rank_longdim_exact_power2_nb(shape, monkeypatch):
     # Long-dimension k <= 64 QR-compresses to the k x k R factor with the
     # exact bidiag64 tail. For these shapes rs = 192, which previously rounded
-    # NB=3 up to the NB=4 register specialization. That specialization exceeds
-    # the 192 KiB UB budget on CANN 9.1.1, so this is also a regression test for
-    # routing the panel through the GM-tile kernel without changing results.
+    # NB=3 up to the NB=4 register specialization. Both NB=2 and NB=4 exceed
+    # the 192 KiB UB budget on CANN 9.1.1, so all active long-dimension panels
+    # route through the GM-tile kernel without changing results.
     monkeypatch.delenv("FLAGGEMS_MR_FAST_PATH", raising=False)
     m, n = shape
     rank = 17
@@ -1361,21 +1362,18 @@ def test_linalg_matrix_rank_hermitian_deflated_spectrum(k, expect_rank, monkeypa
 @pytest.mark.parametrize(
     "shape,rank,hermitian,kind",
     [
-        # General exact-default coverage across the optional fast band:
-        # 65..255 uses bidiagonalization by default and may opt into unpivoted
-        # QR with FLAGGEMS_MR_FAST_PATH=1; k >= 256 is always exact.  The
-        # 128/255 inputs retain an exactly-gapped spectrum so they are also
-        # valid when the optional fast mode is exercised separately.
-        pytest.param((128, 128), 60, False, "gapped", id="general-k128-rrqr"),
-        pytest.param((255, 255), 120, False, "gapped", id="general-k255-rrqr"),
+        # General exact-default coverage around the optional long-row QR band:
+        # compact 65..255 remains exact even with FAST_PATH=1 because the
+        # register panel is unavailable; k >= 256 is always exact.
+        pytest.param((128, 128), 60, False, "gapped", id="general-k128-bidiag"),
+        pytest.param((255, 255), 120, False, "gapped", id="general-k255-bidiag"),
         pytest.param((256, 256), 120, False, "slowdecay", id="general-k256-bidiag"),
         pytest.param((256, 512), 120, False, "slowdecay", id="general-k256-wide"),
         pytest.param((512, 256), 120, False, "slowdecay", id="general-k256-tall"),
         pytest.param((2, 256, 256), 120, False, "slowdecay", id="general-k256-batched"),
-        # Hermitian exact-default coverage: one-sided tridiagonalization for
-        # k > 64; the 65..255 unpivoted-QR alternative is opt-in only.
+        # Hermitian k > 64 always uses one-sided tridiagonalization.
         pytest.param((64, 64), 30, True, "slowdecay", id="herm-k64-padded"),
-        pytest.param((65, 65), 30, True, "gapped", id="herm-k65-rrqr"),
+        pytest.param((65, 65), 30, True, "gapped", id="herm-k65-tridiag"),
         pytest.param((256, 256), 120, True, "slowdecay", id="herm-k256-tridiag"),
     ],
 )

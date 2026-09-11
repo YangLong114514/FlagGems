@@ -32,9 +32,10 @@ stable in the linear sigma domain) followed by the same bidiagonalization
 -- both ending in the shared Sturm tail whose decisive count runs in
 double-single (df64) arithmetic from the raw bidiagonal d/e; fp32 matrices
 with 64 < k <= 255 use the same exact paths BY DEFAULT (the
-tridiagonalization / bidiagonalization below), with
-FLAGGEMS_MR_FAST_PATH=1 opting into a pure-Triton blocked Householder QR
-(unpivoted) whose |R_ii| diagonal is counted against the tolerance:
+tridiagonalization / bidiagonalization below). For non-hermitian inputs whose
+long dimension exceeds 256, FLAGGEMS_MR_FAST_PATH=1 opts into a pure-Triton
+blocked Householder QR (unpivoted) whose |R_ii| diagonal is counted against
+the tolerance:
 rank = #{ |R_ii| > max(atol, rtol * sigma_max) }, with sigma_max
 bracketed by |R_00| and ||A||_F and refined by power iteration only when
 the two bounds disagree; and fp32 matrices with k > 255 ALWAYS use an
@@ -45,8 +46,8 @@ double-single (df64) arithmetic (SVD-accurate); hermitian ranks are
 counted in the eigenvalue domain by a +/-tol double-chain Sturm bracket.
 The exact paths are the DEFAULT; FLAGGEMS_MR_FAST_PATH=1 opts back into
 the fast approximations (Gram sigma^2-domain count for long-dimension
-k <= 64, unpivoted-QR |R_ii| count for 64 < k <= 255), which are faster
-but less accurate on adversarial spectra.
+k <= 64, unpivoted-QR |R_ii| count for non-hermitian 64 < k <= 255 with
+rows > 256), which are faster but less accurate on adversarial spectra.
 fp64 is rejected with NotImplementedError (this toolchain cannot compile
 fp64 Triton kernels); there is no aclnn/native decomposition fallback
 anywhere -- every rank is computed by the Triton kernels in this file (the
@@ -124,19 +125,18 @@ _FUSED_JACOBI_WIDE_MAX_ROWS = 128
 # tridiagonalization for hermitian 33..64, QR-compression to the k x k R
 # factor + bidiag64 for long dimensions.
 _TRIDIAG_MAX_K = 64
-_RRQR_MAX_K = 255  # 65..255 uses the exact paths by default; the fast
-# unpivoted-QR band (both hermitian and general) is opt-in via
-# FLAGGEMS_MR_FAST_PATH=1 because the exact paths dip below the 0.8x bar
-# there -- per-step GM tile-op floor, with an extra step-cost jump at
-# every 64-wide tile boundary (measured on the extended benchmark:
-# general 129^2 0.50 / 160^2 0.69 / 192^2 0.90 / 129x2048 0.52, herm
-# 65^2 0.74 / 129^2 0.72). k >= 256 is always exact (256^2 1.10x
-# general / 2.04x herm, and 2.2x/4.0x at 512^2).
+_RRQR_MAX_K = 255
+# CANN 9.1.1 cannot compile the register-panel specializations needed by
+# compact 65..255 QR. The GM-panel QR remains useful only for non-hermitian
+# long-row inputs; compact inputs and every hermitian input stay on the exact
+# bidiagonalization/tridiagonalization paths even when FAST_PATH=1.
+_RRQR_FAST_MIN_ROWS = 257
 
-# The register-resident QR panel is reliable for one or two 64-row tiles.
-# Its NB=4 specialization exceeds the 192 KiB UB budget on CANN 9.1.1 even
-# with multibuffering disabled, so larger row counts use the GM-tile panel.
-_RRQR_REG_PANEL_MAX_ROWS = 128
+# CANN 9.1.1/BiShengIR UB-overflows both the NB=2 and NB=4 specializations of
+# the register-resident QR panel. The active QR launch domains all have more
+# than 64 rows, so they use the GM-tile panel; keep NB=1 available for future
+# callers/toolchains without exposing a known-uncompilable path.
+_RRQR_REG_PANEL_MAX_ROWS = 64
 
 
 def _jacobi_sweeps(k, is_fp64):
@@ -2057,9 +2057,9 @@ def _mr_rrqr_panel_reg_kernel(
     # Register-resident panel factorization supporting RS <= 256 (NB <= 4).
     # The panel lives in NB static (64, 64) register tiles, so a Householder
     # step is a handful of fused tile ops (~9-20us/step vs ~50-100us for the
-    # GM-tile panel above). CANN 9.1.1 cannot allocate the NB=4 specialization,
-    # so current launchers use this kernel only for rows <= 128 and route
-    # larger panels through GM. No pivoting: the
+    # GM-tile panel above). CANN 9.1.1 cannot allocate the NB=2/NB=4
+    # specializations, so current launchers use this kernel only for rows <= 64
+    # and route larger panels through GM. No pivoting: the
     # k <= 64 bidiagonalization path is likewise unpivoted, and the test
     # spectra have clear gaps.
     #
@@ -2586,13 +2586,14 @@ def _launch_rrqr_rank(
     input,
     hermitian,
 ):
-    """Blocked Householder QR, unpivoted (fp32, 64 < k <= 255).
+    """Blocked Householder QR, unpivoted (fp32, 64 < k <= 255, rows > 256).
 
     Pure Triton: no aclnn decomposition. Singular values never materialize;
     the rank is read off the |R_ii| diagonal, which sits in the LINEAR domain
     (no Gram squaring), so the smallest singular value keeps full relative
     precision. Panels are factored by the register-resident kernel when the
-    row count fits (rows <= 128), else by the GM-tile kernel.
+    row count fits (rows <= 64), else by the GM-tile kernel. Current dispatch
+    enters this function only for non-hermitian rows > 256, hence always GM.
     """
     dev = input.device
     reg_panel = rows <= _RRQR_REG_PANEL_MAX_ROWS
@@ -2602,8 +2603,8 @@ def _launch_rrqr_rank(
     ntmax = kp // 64
     block_k = triton.next_power_of_2(k)
     # 64-row tiles in the register panel kernel. When ``reg_panel`` is true,
-    # the row threshold guarantees NB is 1 or 2; the value is unused for the
-    # GM-panel branch.
+    # the row threshold guarantees NB is 1; the value is unused for the
+    # current GM-panel branch.
     nb = triton.next_power_of_2(max(1, rs // 64))
     W = torch.empty((batch_count, kp, rs), dtype=torch.float32, device=dev)
     V = torch.zeros((batch_count, kp, rs), dtype=torch.float32, device=dev)
@@ -3581,8 +3582,9 @@ def _launch_bidiag_rank(
     hermitian,
 ):
     """Unblocked Golub-Kahan bidiagonalization + Sturm count (fp32; the
-    default for every k > 64 -- k > 255 always, 64 < k <= 255 unless
-    FLAGGEMS_MR_FAST_PATH=1 opts into the fast unpivoted QR).
+    default for every non-hermitian k > 64 -- k > 255 always, and compact
+    64 < k <= 255 even when FLAGGEMS_MR_FAST_PATH=1; only long-row inputs in
+    that band may opt into the unpivoted QR).
 
     SVD-accurate rank: unlike the RRQR path (|R_ii| only approximate sigma_i),
     the bidiagonal d/e keep every singular value at linear precision and the
@@ -4172,18 +4174,23 @@ def _launch_matrix_rank(input, atol, rtol, hermitian):
                 input,
                 hermitian,
             )
-        elif k > _RRQR_MAX_K or os.environ.get("FLAGGEMS_MR_FAST_PATH") != "1":
-            # k >= 256 always; 65..255 by default (the fast QR band is
-            # opt-in via FLAGGEMS_MR_FAST_PATH=1): the exact paths.
+        elif (
+            k > _RRQR_MAX_K
+            or hermitian
+            or rows < _RRQR_FAST_MIN_ROWS
+            or os.environ.get("FLAGGEMS_MR_FAST_PATH") != "1"
+        ):
+            # k >= 256, every hermitian input, compact rows <= 256, and the
+            # default mode: use the exact paths. FAST_PATH=1 selects QR only
+            # for non-hermitian 65..255 inputs whose long dimension is > 256.
             # hermitian: one-sided Householder tridiagonalization +
             # eigenvalue-domain Sturm count (|lambda| > tol via +/-tol qd
             # chains, decisive pass in df64).  general: unblocked Golub-Kahan
             # bidiagonalization + df64 Sturm.  Both SVD-accurate.  Performance:
             # >= 0.8x torch for k >= 256 (general 1.1x/1.8x at 256^2/512^2,
-            # 2.8x at 1024^2; herm 2.0x/3.8x, 7.0x at 1024^2), but the 65..255
-            # default dips below 0.8x at the 64-wide tile boundaries (general
-            # 129^2 0.58, 129x2048 0.53; herm 65^2 0.71 -- report stages
-            # 8/11/12), which is why the fast QR band remains as an opt-in.
+            # 2.8x at 1024^2; herm 2.0x/3.8x, 7.0x at 1024^2). Some compact
+            # 65..255 exact shapes dip below 0.8x, but GM QR is slower there
+            # after the register-panel path became uncompilable on CANN 9.1.1.
             if atol_tensor is None:
                 atol_tensor, rtol_tensor = _prepare_tolerances(input, atol, rtol)
             if hermitian:
@@ -4214,10 +4221,9 @@ def _launch_matrix_rank(input, atol, rtol, hermitian):
                     hermitian,
                 )
         else:
-            # 65..255 fast opt-in (FLAGGEMS_MR_FAST_PATH=1, hermitian and
-            # general): pure-Triton blocked Householder QR (unpivoted);
-            # the rank is read off the |R_ii| diagonal.  There is no
-            # aclnn/native decomposition fallback anywhere.
+            # Non-hermitian 65..255 with rows > 256 and FAST_PATH=1:
+            # pure-Triton blocked Householder QR (unpivoted); rank is read off
+            # the |R_ii| diagonal. There is no native decomposition fallback.
             if atol_tensor is None:
                 atol_tensor, rtol_tensor = _prepare_tolerances(input, atol, rtol)
             _launch_rrqr_rank(

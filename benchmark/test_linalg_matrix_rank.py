@@ -46,9 +46,9 @@ MATRIX_RANK_COMPREHENSIVE_SHAPES = [
     (64, 512),
     (512, 64),
     # Exact-default dispatch band: 65+ uses bidiagonalization/tridiagonalization.
-    # For 65..255, FLAGGEMS_MR_FAST_PATH=1 opts into unpivoted QR. 65..192 are
-    # sampled densely because the default exact paths have tile-edge performance
-    # dips there.
+    # Compact 65..255 stays exact even with FAST_PATH=1 because CANN 9.1.1
+    # cannot compile the register QR panel. The dense sampling captures the
+    # exact paths' tile-edge performance dips.
     (65, 65),
     (80, 80),
     (96, 96),
@@ -97,9 +97,8 @@ MATRIX_RANK_HERMITIAN_CORE_SHAPES = [
 ]
 
 MATRIX_RANK_HERMITIAN_COMPREHENSIVE_SHAPES = [
-    # Hermitian 65+ uses one-sided tridiagonalization by default; for 65..255,
-    # FLAGGEMS_MR_FAST_PATH=1 opts into unpivoted QR. 65/129/257 sample the
-    # fast-path boundary and the always-exact k >= 256 region.
+    # Hermitian 65+ always uses one-sided tridiagonalization. 65/129/257 sample
+    # the small/medium tile boundaries and the k >= 256 region.
     (65, 65),
     (128, 128),
     (129, 129),
