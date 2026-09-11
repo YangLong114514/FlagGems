@@ -1,12 +1,13 @@
 # `linalg_matrix_rank` 昇腾 910B 后端实现与优化报告(详细版)
 
-> 分支:`ascend-matrix-rank-triton`(已推送 `github.com:YangLong114514/FlagGems`)
-> 提交:`ac842302`(ascend-matrix-rank-new 分支,第十三阶段:PR 评审语义修复——空矩阵容差校验 + 输入尺度归一化)
+> 文档分支:`ascend-matrix-rank-triton`(`github.com:YangLong114514/FlagGems`)
+> 代码分支:`ascend-matrix-rank-new`,PR #6161;当前提交:`77cffb23d`(其中最终 CANN 9.1.1 分发修复为 `86a323ec0`)
 > 硬件:昇腾 910B4(20 AI Core × 2 Vector = 40 Vector 核,UB 192KB)
-> 软件:CANN 8.5.0、triton-ascend 3.2.0(BiShengIR)、torch 2.6.0+cpu / torch_npu 2.6.0rc1
+> 原始开发/性能环境:CANN 8.5.0、triton-ascend 3.2.0(BiShengIR)、torch 2.6.0+cpu / torch_npu 2.6.0rc1
+> PR CI 兼容环境:CANN 9.1.1、Triton 3.5 frontend + triton-ascend 3.2.1 backend(见第十四阶段)
 > 目标:`torch.linalg.matrix_rank` 在 NPU 上的 speedup ≥ 0.8
 >
-> **阅读指引**:第一至三章是设计/优化的主体内容,其中 §1.4 已更新为**当前最终 dispatch**;第一阶段的原始结构保留在附录 C。第二至第十二阶段是按时间顺序的演进记录(RRQR → 精确大矩阵路径 → hermitian 基线修正与小矩阵优化 → 评审修复与工具链退化处置 → 精确路径推广 → 默认分发切换 → 三轮评审修复 → 精确路径优化评估 → 五方向优化意见闭环与 slack 裁剪落地 → 默认分发反转为精确路径 → PR 评审语义修复),各阶段内的"当前状态"描述以写作时为准,最终以 §0 总结 + §1.4 + 第十至十三阶段为准。
+> **阅读指引**:第一至三章是设计/优化的主体内容,其中 §1.4 已更新为**当前最终 dispatch**;第一阶段的原始结构保留在附录 C。第二至第十四阶段按时间顺序记录算法演进、默认精确分发、PR 评审修复及 CANN 9.1.1 集成兼容处理。各历史阶段内的"当前状态"描述以写作时为准,最终以 §0 总结 + §1.4 + 第十二至十四阶段为准。
 
 ---
 
@@ -19,23 +20,22 @@
 | 频段 | 默认路径 | 说明 |
 |---|---|---|
 | k = 1/2 | 闭式 kernel | — |
-| k ≤ 32(任意长宽) | 寄存器融合 GK + Sturm | herm 走单边三对角分支 |
-| 33~64 方阵 | bidiag64(GK 线性域)| 第六阶段替代 Gram |
-| 33~64 herm | padded 单边三对角化 | — |
+| k ≤ 32 且 m,n≤32 | 寄存器融合 GK + Sturm | herm 走单边三对角分支 |
+| 33~64 非 herm 且 m,n≤64 | bidiag64(GK 线性域)| 第六阶段替代 Gram |
+| 33~64 herm | padded 单边三对角化 | hermitian 输入必须是方阵 |
 | 长维 k≤64(如 64×512) | **QR 压缩 + bidiag64 + df64 Sturm**(精确)| 快速 Gram(σ² 域地板 √eps·σmax,缓衰减谱高估 rank)经 `FLAGGEMS_MR_FAST_PATH=1` 选择加入(0.9~3.6× vs 精确 0.26~0.6×)|
-| 65~255(herm 与非 herm)| **精确路径**(herm 单边三对角化 / 非 herm GK 双对角化)| 存在 tile 边界性能低谷(见第十二阶段实测);快速无主元 Householder QR(历史章节称 RRQR,|R_ii|≈σ_i 有语义缺口:缓衰减谱低估,256² randn+中谱 atol 实测报 94/真值 129)经 `FLAGGEMS_MR_FAST_PATH=1` 选择加入 |
+| 65~255(herm 与非 herm)| **精确路径**(herm 单边三对角化 / 非 herm GK 双对角化)| CANN 9.1.1 下 herm 与 rows≤256 的紧凑非 herm 即使设置 `FLAGGEMS_MR_FAST_PATH=1` 也保持精确;仅非 herm 且 rows>256 时可选择 GM-panel 无主元 QR(|R_ii|≈σ_i 有语义缺口) |
 | herm k ≥ 256 | **单边三对角化 + ±tol df64 Sturm**(精确)| 2.0~7.1× |
 | 非 herm k ≥ 256 | **非分块 GK 双对角化 + df64 Sturm**(精确)| 1.1~2.7× |
 
-`FLAGGEMS_MR_EXACT_PATH` 不再被代码读取(精确已是默认,设置它无害);`FLAGGEMS_MR_FAST_PATH` 在 dispatch 时逐次读取,运行中可切换。
+`FLAGGEMS_MR_EXACT_PATH` 不再被代码读取(精确已是默认,设置它无害);`FLAGGEMS_MR_FAST_PATH` 在 dispatch 时逐次读取,运行中可切换。它当前选择两段快速近似:长维 k≤64 的 Gram,以及非 herm、65≤k≤255、rows>256 的 GM-panel QR;不会再把紧凑 65~255 或任何 herm 输入切到 QR。
 
-**性能(验收口径 `benchmark --mode operator`,扩展 benchmark 67 项全部正常执行——SUCCESS 仅表示无异常,speedup 逐条见下)**:精确默认分发(第十二阶段实测):general 算术 1.82/几何 1.28,herm 2.15/1.74;<0.8 共 20 项,集中于长维 k≤64(0.30~0.59,放弃 Gram 快路径的代价)、近方阵 65~160(0.45~0.79,tile 边界低谷)与长维 k≥129(0.53~0.76,固有地板,见第八阶段 §5),另有小 herm 边际 shape(33² 0.74/65² 0.71)。快速路径(`FLAGGEMS_MR_FAST_PATH=1`,即第十二阶段前的旧默认):general 算术 2.40/几何 1.98,herm 2.12/1.71,<0.8 仅 (129,2048)/(2048,129) 0.38/0.41 与小 herm 边际 shape。大矩阵(精确):general 1024² 2.80×、512² 1.78×;herm 1024² 6.95×、512² 3.80×。
+**性能(验收口径 `benchmark --mode operator`)**:下列数字均来自 CANN 8.5.0 / triton-ascend 3.2.0,是第十二、十三阶段的历史基线:精确默认分发 general 算术 1.82/几何 1.28,herm 2.15/1.74;归一化合入后总体算术 1.53/几何 1.15。历史快速路径的 general 2.40/1.98、herm 2.12/1.71依赖当时可编译的寄存器 QR panel,**不能外推到 CANN 9.1.1**。当前分发避免在紧凑 65~255 上用慢速 GM QR,因此默认紧凑/大矩阵与 herm 路径算法不变;但默认长维 k≤64、rows≤256 的精确 QR 压缩从寄存器 panel 改为 GM panel,该小段 shape 预计会下降,完整平均值必须在 CANN 9.1.1 上重新实测后更新。大矩阵精确路径历史值:general 1024² 2.80×、512² 1.78×;herm 1024² 6.95×、512² 3.80×。
 
-**正确性(最终态)**:
-- 官方套件(精确默认分发,未设任何 env)130 passed / 44 skipped(fp64 与 complex 按环境跳过、sweep 文件 38 例默认 skip),0 失败。
-- 366 例全路径扫描(新默认分发)复跑通过;单独核对 50 个长维 k≤64 与 (3,3)/(7,7) 的 lowrank 用例 **0 失配**——Gram σ² 域地板随快速路径退出默认而消失。历史 2 例 (3,3)/(7,7) fp32 噪声区边界保留在扫描允许清单内(fp32 参考自身即与 fp64 不一致,与分发无关)。快速模式(`FLAGGEMS_MR_FAST_PATH=1`)下仍有 46 例长维 Gram 地板高估(文档化,快速近似的已知代价)。
-- herm 专项压力 34/34(近阈值 ±tol 双符号簇、低秩、缓衰减、零矩阵、垃圾上三角、batch;内部固定的 `FLAGGEMS_MR_EXACT_PATH=1` 在新默认下冗余但无害)。
-- bidiag64 σ 直验 121/121(~6e-8);QR 频段对抗 22/22;非方阵回归 11 例。
+**正确性验证状态**:
+- CANN 8.5.0 历史最终态(第十三阶段):官方套件 143 passed / 42 skipped;sweeps 4/4(366 双模式 + herm 34 + QR 22);bidiag64 σ 直验 121/121(~6e-8);非方阵回归 11 例。
+- CANN 9.1.1 集成过程:ABI 修复后 `(256,64)` 的 NB=4 编译失败;NB=4 fallback 后原用例通过并推进到 144 passed,随后由 FAST_PATH `(65,65)` 暴露 NB=2 编译失败。两处失败均已由第十四阶段最终分发规避。
+- CANN 9.1.1 最终提交已通过 compileall、diff check、pre-commit 与导出检查;完整 NPU 功能套件和性能 benchmark **待 CI 复跑**,因此不能沿用历史数字声称新工具链已全量通过。
 
 **过程中修复的四个真实生产缺陷**:① fp32 dd/ee 把平方域地板带回决定性计数(k≥513,近阈值判错);② fused kernel 非方阵丢尾能量(预存,官方测试从未覆盖);③ 评审指出的零矩阵未初始化读取 / hermitian 未守下三角语义 / Sturm 同 kernel 写后读 / fp64 fail-fast 顺序;④ 大路径 host enqueue 瓶颈(NPUGraph 化,replay ~1μs/launch)。
 
@@ -67,7 +67,9 @@
 15. [第十阶段:精确路径优化评估(两条严格排除+候选方向)](#第十阶段精确路径65255-频段优化评估两条严格排除两条估算不足四个候选方向待真机)
 16. [第十一阶段:五方向优化意见闭环与 slack 裁剪](#第十一阶段五方向优化意见的评估闭环方向-2-落地exact-频段-810方向-135-真机证伪)
 17. [第十二阶段:默认分发反转为精确路径](#第十二阶段默认分发反转为精确路径fast_path-选择加入快速近似)
-18. [附录 A/B/C](#附录-a改动文件清单)
+18. [第十三阶段:PR 评审语义修复](#第十三阶段合入-master-后的-pr-评审语义修复空矩阵容差校验--输入尺度归一化)
+19. [第十四阶段:CANN 9.1.1 集成兼容修复](#第十四阶段cann-911--triton-35-集成兼容修复)
+20. [附录 A/B/C](#附录-a改动文件清单)
 
 ---
 
@@ -183,6 +185,9 @@ for j in 0..K-2:
 linalg_matrix_rank(input, *, atol, rtol, hermitian)
   ├─ _check_input:ndim≥2、hermitian 需方阵
   ├─ fp64 → NotImplementedError(先于一切 shape dispatch,第五阶段前移)
+  ├─ 空矩阵 → 先校验 tolerance dtype/device/broadcast,再返回零 rank
+  ├─ 每 batch 以 max-abs 的 2 次幂尺度归一化;hermitian 只读下三角;
+  │   atol 同尺度缩放、rtol 不变(第十三阶段)
   ├─ 标量 tol 快路径:atol/rtol 非 tensor 时直接作为 kernel 标量参数
   │   (不物化 (batch,) 张量,省 2 次 aten launch);tensor tol 走 _prepare_tolerances
   └─ _launch_matrix_rank: k = min(m,n), rows = max(m,n), batch_count = numel/(m·n)
@@ -199,12 +204,12 @@ linalg_matrix_rank(input, *, atol, rtol, hermitian)
        │    │    (单 program GK 双对角化,原始 d/e)+ 共享 Sturm 尾巴
        │    │    (to_tridiag + sturm_big + df64 sturm_final)——第六阶段新增,
        │    │    取代 Gram(rand/diag/lowrank 全谱精确)
-       │    └─ 长维(有一维 > 64)→ 默认 QR 压缩(Householder QR 得 k×k R,
+       │    └─ 长维(有一维 > 64)→ 默认 QR 压缩(GM panel;Householder QR 得 k×k R,
        │         σ(R)=σ(A) 线性域)+ bidiag64 + df64 尾巴(精确但慢,见
        │         第六阶段 §3 的性能墙分析);FLAGGEMS_MR_FAST_PATH=1 时
        │         切换为 Gram(Cube)+ 三对角化 + Sturm(快速近似,σ² 域
        │         地板见第六阶段)
-       ├─ hermitian 且 k > 64 → _launch_tridiag_big_rank(默认,精确):
+       ├─ hermitian 且 k > 64 → _launch_tridiag_big_rank(始终精确):
        │    单边 Householder 三对角化(3 kernel/步:step/mat/apply,K 裁剪
        │    尾随 grid)+ 特征值域 ±tol Sturm(bracket + df64 决定性双链),
        │    整条 launch 序列按 shape NPUGraph 捕获重放
@@ -213,12 +218,13 @@ linalg_matrix_rank(input, *, atol, rtol, hermitian)
        │    非分块 Golub-Kahan 双对角化(尾随裁剪 grid + 单遍 step)+
        │    独立 BᵀB 构造 kernel + df64 Sturm;NPUGraph 捕获
        │    (256² 1.10 / 512² 1.75 / 1024² 2.6×)
-       │    ※ 65~255 设 FLAGGEMS_MR_FAST_PATH=1 时改走下方的快速 QR
-       └─ 65 ≤ k ≤ 255 且 FLAGGEMS_MR_FAST_PATH=1(herm 与非 herm)→ 分块
+       │    ※ 仅 65~255、rows>256、FAST_PATH=1 时改走下方的快速 QR;
+       │      rows≤256 即使设置 FAST_PATH 也保持精确
+       └─ 非 herm,65 ≤ k ≤ 255,rows>256 且 FAST_PATH=1 → GM-panel 分块
             Householder QR(无主元,历史章节称 RRQR):rank 由 |R_ii| 对角
-            读出。精确路径在 65~160 有 tile 边界性能低谷(general 129²
-            0.58、160² 0.79,见第十二阶段),这是快速 QR 保留为 opt-in 的
-            原因;QR 的缓衰减谱低估(6× 余量内也会发生)维持文档化
+            读出。紧凑 QR 所需的 NB=2/4 寄存器 panel 在 CANN 9.1.1
+            UB 溢出,且改用 GM 比精确路径更慢,因此不再属于快速分发;
+            QR 的近阈值语义缺口维持文档化
 ```
 
 **关键设计点:为什么分解和 Sturm 计数拆成独立 kernel**
@@ -1268,6 +1274,9 @@ QR+GK(R) 比 default 和 exact **都慢**。原因:46% 的 FLOP 论证在本硬�
 
 # 第十二阶段:默认分发反转为精确路径(FAST_PATH 选择加入快速近似)
 
+> 本阶段记录 CANN 8.5.0 下的历史分发。CANN 9.1.1 上寄存器 QR panel
+> 不可编译后,FAST_PATH 的最终定义已由第十四阶段收窄;当前行为以 §0 和第十四阶段为准。
+
 应要求把精确路径设为默认:此前默认分发中仅剩的两段快速近似——长维 k≤64 的 Gram(σ² 域地板)与 65~255 的无主元 QR(|R_ii|≈σ_i 缺口)——改为经 `FLAGGEMS_MR_FAST_PATH=1` 选择加入。动机:默认分发应当语义优先(与 torch 精确语义对齐),性能优先的快速近似由调用方显式开启。
 
 ## 1. 代码改动(仅分发逻辑与注释,无 kernel 改动)
@@ -1314,6 +1323,9 @@ QR+GK(R) 比 default 和 exact **都慢**。原因:46% 的 FLOP 论证在本硬�
 ---
 
 # 第十三阶段:合入 master 后的 PR 评审语义修复(空矩阵容差校验 + 输入尺度归一化)
+
+> 本阶段的语义修复仍是当前实现的一部分;其中测试/性能“最终态”数字来自
+> CANN 8.5.0,新工具链状态以第十四阶段为准。
 
 通用实现与两个测试文件经 `#5942` 合入 master 后,昇腾后端在 `ascend-matrix-rank-new` 分支(基于最新 master)单独提交。PR 评审提出两个语义缺口,本阶段修复并验证。
 
@@ -1385,3 +1397,115 @@ rank = torch.linalg.matrix_rank(A, atol=0.0, rtol=0.0)
 
 后续应在通用测试中增加同矩阵 mixed-dynamic-range 用例,先核对各后端原生
 `torch.linalg.matrix_rank` 对 FP32 次正规数/FTZ 的实际行为;若要求完整对齐,需要
+引入分段/逐列尺度或类似 xLASSQ 的安全范数累计,并重新设计 atol 与各局部尺度之间
+的映射。该方案会侵入所有分解路径,属于后续独立算法改造,不在本次 PR 范围内。
+
+---
+
+# 第十四阶段:CANN 9.1.1 / Triton 3.5 集成兼容修复
+
+PR #6161 在新 master 的 Ascend CI 上使用 CANN 9.1.1、Triton 3.5 frontend 与
+triton-ascend 3.2.1 backend。该组合暴露了原始 CANN 8.5.0 开发环境没有出现的
+launcher ABI 差异和 RRQR 寄存器 panel UB 分配问题。本阶段目标是先保证默认精确
+语义与所有公开模式都可编译运行,再在新工具链上重新建立性能基线。
+
+## 1. Triton 3.5 `_fast_launch` ABI 兼容
+
+首轮 CI 在 `_mr_normalize_small_kernel` 报错:
+
+```text
+TypeError: function takes exactly 19 arguments (13 given)
+```
+
+原因不是 kernel 参数漏传,而是 frontend ABI 改变:Triton ≤3.2 的低层 launcher 只
+接收 non-constexpr 参数,Triton 3.5 则接收全部已绑定 kernel 参数(含 constexpr)。
+`_fast_launch` 原来始终只把位置参数传给 `CompiledKernel.run`,因此在 3.5 下少了
+6 个 constexpr 参数。修复根据 JIT function 是否暴露 `non_constexpr_indices` 选择
+参数集合:旧 frontend 保持位置参数,新 frontend 按 `kernel.arg_names` 把剩余命名
+kernel 参数追加到 launch tuple;`num_warps`、`num_stages`、`multibuffer` 等编译选项
+不属于 `arg_names`,不会误传给 C launcher。新增 fake compiled-kernel 测试同时覆盖
+Triton 3.2/3.5 两种 ABI,无需启动设备 kernel。
+
+对应代码提交:`b77dc499f`。
+
+## 2. RRQR register panel 在 CANN 9.1.1 下不可用
+
+ABI 修复后,默认精确用例 `(256,64)` 进入长维 QR 压缩,编译
+`_mr_rrqr_panel_reg_kernel(NB=4)` 时失败:
+
+```text
+ub overflow, requires 8552448 bits while 1572864 bits available
+```
+
+另一真机环境报告过 11730944 bits,均远超 192KiB UB。显式传
+`multibuffer=False` 后仍失败,证明问题不只是可通过 launch option 关闭的自动双缓冲。
+第一步把 `NB=4`(含 rs=192 向上取整到 4 的 specialization)改走已有 GM-tile panel;
+此后套件越过 `(256,64)` 并运行到 144 passed,说明该 fallback 已解决原失败。
+
+随后 `test_linalg_matrix_rank_fast_path_dispatch` 的 `(65,65)` 在
+`FLAGGEMS_MR_FAST_PATH=1` 下触发 `NB=2`,再次报错:
+
+```text
+ub overflow, requires 8519680 bits while 1572864 bits available
+```
+
+至此可以确定当前 BiShengIR 对该 register-panel 实现的 `NB=2/4` specialization
+都不可依赖,不能继续通过猜阈值逐例修补。两个 QR launcher 的有效输入都满足
+rows>64,因此把 register panel 的可用上限收紧到 64 后,所有当前可达 QR 输入都会
+使用 GM panel;NB=1 实现仅保留给未来调用方/工具链,当前分发不会触达。
+
+对应代码提交:`75e689d66`(尝试关闭 multibuffer)、`e8e230131`(NB=4 fallback)、
+`86a323ec0`(最终分发;替代未推送的中间提交 `7cca1cba1`)。
+
+## 3. 最终分发:资源可编译性与性能共同约束
+
+简单地把紧凑 65~255 的快速 QR 从寄存器 panel 换成 GM panel 虽可编译,但历史
+单步成本约从 9~20µs 增到 50~100µs,整个快速路径可能慢 2~5 倍,失去“快速”意义。
+因此最终不是“所有 RRQR 无条件走 GM”,而是按 shape 重新限定 FAST_PATH:
+
+| 输入区域 | 默认模式 | `FLAGGEMS_MR_FAST_PATH=1` |
+|---|---|---|
+| 长维 k≤64 | QR 压缩(GM panel)+bidiag64+df64 Sturm | Gram 快速近似 |
+| 非 herm,65≤k≤255,rows≤256 | 精确 GK 双对角化 | **仍走精确 GK**(GM QR 更慢) |
+| 非 herm,65≤k≤255,rows>256 | 精确 GK 双对角化 | GM-panel 无主元 QR |
+| herm,k>64 | 单边三对角化精确路径 | **仍走单边三对角化** |
+| k≥256 | 精确路径 | 精确路径 |
+
+也就是说,FAST_PATH 不再表示“整个 65~255 频段强制 QR”,而只选择仍有性能收益且
+从一开始就使用 GM panel 的长行非 herm QR。紧凑输入和 herm 输入不会为了满足
+环境变量而退化到更慢的算法。
+
+## 4. 性能影响与需要重测的区域
+
+- 默认 65~255 紧凑矩阵、全部 herm、k≥256:算法与第十二/十三阶段一致,不受本轮
+  RRQR fallback 影响。
+- 非 herm 65~255、rows>256 的 FAST_PATH:原来就使用 GM panel,不受影响。
+- 默认长维 k≤64、65≤rows≤256:原先可走 NB=2/4 寄存器 panel,现在走 GM panel;
+  panel 本身预计慢 3~7 倍,整算子延迟按 shape 预计增加约 1.5~3 倍。这是当前唯一
+  明确的默认性能退化区域。
+- CANN 8.5.0 上“FAST_PATH=1 等价于旧默认”的 general 2.40/1.98、herm
+  2.12/1.71 已不再代表当前分发,不可继续用作 CANN 9.1.1 验收结论。
+
+当前 benchmark 列表中 `(8,256)/(256,8)` 会落入上述默认退化区;更长的
+`(16,512)/(32,1024)/(64,512)` 原本就用 GM panel,不因本轮变化而进一步下降。
+应在 CANN 9.1.1 上至少单测 `(8,128)/(8,256)/(33,128)/(64,256)` 和转置形状,
+再跑完整 `--mode operator` benchmark 更新算术/几何平均;在实测前不填造新 speedup。
+
+## 5. 测试闭环与 PR 集成状态
+
+`test_linalg_matrix_rank_fast_path_dispatch` 已按最终语义更新:
+
+- `(65,65)/(255,255)` 在 FAST_PATH=1 下仍断言精确 bidiag;
+- `(65,65),hermitian=True` 仍断言精确 tridiag;
+- `(257,65)` 断言默认 bidiag、FAST_PATH=1 时 GM RRQR,并覆盖同进程动态切换;
+- `(256,64)` 默认精确长维用例继续覆盖 GM panel + bidiag64 尾巴。
+
+静态验证:`compileall`、`git diff --check`、pre-commit 全过。CANN 9.1.1 的完整 NPU
+套件与性能 benchmark 需在最终提交后复跑;本文不把中间日志的 144 passed 写成
+最终全量通过。
+
+PR 合并最新 master 时仅 `src/flag_gems/runtime/backend/_ascend/ops/__init__.py`
+冲突:上游 #6157 重排 `__all__`,本分支新增四个 matrix_rank 导出。最终按新规则保留
+`matrix_exp → matrix_power → matrix_rank`,导出检查通过。合并提交:`77cffb23d`;
+GitHub API 在推送后报告 `mergeable=true`,`mergeable_state=unstable`(冲突已消失,
+仍等待/检查 CI 状态)。
