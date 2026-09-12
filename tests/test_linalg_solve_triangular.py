@@ -325,7 +325,7 @@ def test_no_tle_fallback(n, upper, dtype, monkeypatch):
 
 @pytest.mark.linalg_solve_triangular
 @pytest.mark.skipif(
-    flag_gems.vendor_name != "tsingmicro",
+    flag_gems.vendor_name != "ascend",
     reason="Verify the correctness of the PyTorch combination implementation path, "
     "and perform verification only on the Ascend platform.",
 )
