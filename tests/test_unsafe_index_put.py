@@ -134,7 +134,7 @@ def test_unsafe_index_put_acc_false(
 @pytest.mark.parametrize(
     "input_shape, indices_shape, values_shape, is_bool", UNSAFE_INDEX_PUT_SHAPE_ACC_TRUE
 )
-@pytest.mark.parametrize("dtype", [torch.float16, torch.float32])
+@pytest.mark.parametrize("dtype", FLOAT_DTYPES)
 def test_unsafe_index_put_acc_true(
     input_shape, indices_shape, values_shape, is_bool, dtype
 ):

@@ -141,7 +141,7 @@ def test_unsafe_index_put_acc_true():
         op_name="unsafe_index_put",
         torch_op=torch._unsafe_index_put,
         input_fn=unsafe_index_put_input_fn(True),
-        dtypes=[torch.float16, torch.float32],
+        dtypes=consts.FLOAT_DTYPES,
     )
     bench.set_gems(flag_gems.unsafe_index_put)
     bench.run()
