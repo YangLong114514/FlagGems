@@ -118,6 +118,7 @@ from .pow import (
 )
 from .randperm import randperm
 from .repeat_interleave import repeat_interleave_self_int
+from .rrelu_with_noise import rrelu_with_noise, rrelu_with_noise_
 from .replication_pad2d_backward import (
     replication_pad2d_backward,
     replication_pad2d_backward_grad_input,
@@ -296,6 +297,8 @@ __all__ = [
     "pow_tensor_tensor_",
     "randperm",
     "repeat_interleave_self_int",
+    "rrelu_with_noise",
+    "rrelu_with_noise_",
     "replication_pad2d_backward",
     "replication_pad2d_backward_grad_input",
     "resolve_neg",
