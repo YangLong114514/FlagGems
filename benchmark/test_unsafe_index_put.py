@@ -65,7 +65,7 @@ def unsafe_index_put_input_fn(accumulate):
 
 
 class UnsafeIndexPutAccFalseBenchmark(base.GenericBenchmark):
-    def set_more_shapes(self):
+    def set_shapes(self, shape_file_path=None):
         UNSAFE_INDEX_PUT_SHAPE = (
             ((2**28,), ((2**16,),), (2**16,), False),
             ((32, 32), ((8,), (8,)), (8,), False),
@@ -120,7 +120,7 @@ def test_unsafe_index_put_acc_false():
 
 
 class UnsafeIndexPutAccTrueBenchmark(base.GenericBenchmark):
-    def set_more_shapes(self):
+    def set_shapes(self, shape_file_path=None):
         UNSAFE_INDEX_PUT_SHAPE = (
             ((2**28,), ((2**16,),), (2**16,), False),
             ((32, 32), ((8,), (8,)), (8,), False),
