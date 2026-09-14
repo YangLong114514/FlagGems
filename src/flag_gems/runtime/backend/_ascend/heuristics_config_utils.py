@@ -43,6 +43,26 @@ def bmm_heur_divisible_k(args):
     return args["K"] % args["TILE_K"] == 0
 
 
+def rrelu_with_noise_heur_block(args):
+    if args["N"] <= 512:
+        return 512
+    elif args["N"] <= 4096:
+        return 1024
+    else:
+        # Large tiles pipeline GM<->UB transfers best; 8192 overflows the
+        # 192 KB UB for the fp32 eval kernel (in+out tiles with buffering).
+        return 4096
+
+
+def rrelu_with_noise_heur_num_warps(args):
+    if args["N"] <= 512:
+        return 4
+    elif args["N"] <= 1024:
+        return 8
+    else:
+        return 16
+
+
 def dropout_heur_block(args):
     if args["N"] <= 512:
         return 512
@@ -317,6 +337,14 @@ HEURISTICS_CONFIGS = {
     "randn": {
         "BLOCK": randn_heur_block,
         "num_warps": randn_heur_num_warps,
+    },
+    "rrelu_with_noise_train": {
+        "BLOCK": rrelu_with_noise_heur_block,
+        "num_warps": rrelu_with_noise_heur_num_warps,
+    },
+    "rrelu_with_noise_eval": {
+        "BLOCK": rrelu_with_noise_heur_block,
+        "num_warps": rrelu_with_noise_heur_num_warps,
     },
     "softmax_non_inner": {
         "TILE_K": softmax_heur_tile_k,
