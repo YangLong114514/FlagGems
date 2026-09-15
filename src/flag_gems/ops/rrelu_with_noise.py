@@ -19,28 +19,7 @@ import torch
 import triton
 import triton.language as tl
 
-from flag_gems.ops.rrelu_with_noise_backward import rrelu_with_noise_backward
 from flag_gems.utils import pointwise_dynamic
-
-
-class RReLUWithNoiseFunction(torch.autograd.Function):
-    @staticmethod
-    def forward(ctx, input, noise, lower, upper, training, generator=None):
-        output = _rrelu_with_noise_impl(input, noise, lower, upper, training, generator)
-        ctx.save_for_backward(input, noise)
-        ctx.lower = lower
-        ctx.upper = upper
-        ctx.training = training
-        return output
-
-    @staticmethod
-    def backward(ctx, grad_output):
-        input, noise = ctx.saved_tensors
-        grad_input = rrelu_with_noise_backward(
-            grad_output, input, noise, ctx.lower, ctx.upper, ctx.training, False
-        )
-        return grad_input, None, None, None, None, None
-
 
 logger = logging.getLogger(__name__)
 
@@ -154,9 +133,16 @@ def rrelu_with_noise(
     training=False,
     generator=None,
 ):
-    """FlagGems implementation of aten.rrelu_with_noise."""
+    """FlagGems implementation of aten.rrelu_with_noise.
+
+    Backward is not built here.  This operator is registered on the device
+    dispatch key, so ``aten::rrelu_with_noise`` keeps the autograd kernel PyTorch
+    generates from its derivative formula, and that kernel calls the separately
+    registered ``aten::rrelu_with_noise_backward`` op.  Calling this Python API
+    outside the dispatcher therefore returns a forward-only result.
+    """
     logger.debug("GEMS RRELU_WITH_NOISE")
-    return RReLUWithNoiseFunction.apply(self, noise, lower, upper, training, generator)
+    return _rrelu_with_noise_impl(self, noise, lower, upper, training, generator)
 
 
 def rrelu_with_noise_(
@@ -167,10 +153,14 @@ def rrelu_with_noise_(
     training=False,
     generator=None,
 ):
-    """FlagGems implementation of aten.rrelu_with_noise_."""
+    """FlagGems implementation of aten.rrelu_with_noise_.
+
+    Backward is provided the same way as ``rrelu_with_noise``.
+    """
     logger.debug("GEMS RRELU_WITH_NOISE_")
-    _rrelu_with_noise_impl(self, noise, lower, upper, training, generator, out=self)
-    return self
+    return _rrelu_with_noise_impl(
+        self, noise, lower, upper, training, generator, out=self
+    )
 
 
 __all__ = ["rrelu_with_noise", "rrelu_with_noise_"]
