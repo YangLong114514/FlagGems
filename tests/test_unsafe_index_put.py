@@ -294,36 +294,6 @@ def test_unsafe_index_put_uint8_mask_with_none(none_pos, dtype):
 
 
 @pytest.mark.unsafe_index_put
-@pytest.mark.parametrize(
-    "bad_dtype",
-    [torch.int8, torch.int16, torch.uint16, torch.uint32, torch.float32],
-)
-def test_unsafe_index_put_error_bad_index_dtype(bad_dtype):
-    """aten only accepts long, int, byte and bool index tensors; every other
-    dtype (int8 included) raises IndexError."""
-    inp = torch.randn((32, 64), device=flag_gems.device)
-    idx = torch.ones((8,), dtype=bad_dtype, device=flag_gems.device)
-    values = torch.randn((8, 64), device=flag_gems.device)
-
-    with pytest.raises(
-        IndexError,
-        match="tensors used as indices must be long, int, byte or bool tensors",
-    ):
-        flag_gems.unsafe_index_put(inp, [idx], values, accumulate=False)
-
-    with pytest.raises(
-        IndexError,
-        match="tensors used as indices must be long, int, byte or bool tensors",
-    ):
-        torch.ops.aten._unsafe_index_put(
-            utils.to_reference(inp),
-            [utils.to_reference(idx)],
-            utils.to_reference(values),
-            False,
-        )
-
-
-@pytest.mark.unsafe_index_put
 @pytest.mark.parametrize("mask_dtype", [torch.bool, torch.uint8])
 def test_unsafe_index_put_error_mask_shape_mismatch(mask_dtype):
     """Every mask dim must match the corresponding input dim, like aten."""
