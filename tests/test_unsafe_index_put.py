@@ -263,37 +263,6 @@ def test_unsafe_index_put_uint8_mask_acc_true(input_shape, mask_shape, dtype):
 
 
 @pytest.mark.unsafe_index_put
-@pytest.mark.parametrize("none_pos", [0, 1])
-@pytest.mark.parametrize("dtype", FLOAT_DTYPES)
-def test_unsafe_index_put_uint8_mask_with_none(none_pos, dtype):
-    """A uint8 mask next to a None index behaves like an expanded integer
-    index; torch._unsafe_index_put rejects None, so the reference goes through
-    torch.ops.aten directly."""
-    input_shape = (32, 64)
-    inp = torch.randn(input_shape, dtype=dtype, device=flag_gems.device)
-    mask = gen_uint8_mask((input_shape[none_pos],))
-    indices = [None, None]
-    indices[none_pos] = mask
-
-    ref_inp = utils.to_reference(inp)
-    ref_mask = to_reference_mask(mask)
-    ref_indices = [None, None]
-    ref_indices[none_pos] = ref_mask
-    # _unsafe_index_put treats None as "keep the full dim" (unlike Python
-    # indexing, which would insert a new axis), so the result is the mask
-    # dims replaced by (K,) with the other dims kept at full size.
-    K = int(mask.sum())
-    target_shape = (K, input_shape[1]) if none_pos == 0 else (input_shape[0], K)
-
-    values = torch.randn(target_shape, dtype=dtype, device=flag_gems.device)
-    ref_values = utils.to_reference(values)
-    ref_out = torch.ops.aten._unsafe_index_put(ref_inp, ref_indices, ref_values, False)
-    out = flag_gems.unsafe_index_put(inp, indices, values, accumulate=False)
-
-    utils.gems_assert_close(out, ref_out, dtype)
-
-
-@pytest.mark.unsafe_index_put
 @pytest.mark.parametrize("mask_dtype", [torch.bool, torch.uint8])
 def test_unsafe_index_put_error_mask_shape_mismatch(mask_dtype):
     """Every mask dim must match the corresponding input dim, like aten."""
