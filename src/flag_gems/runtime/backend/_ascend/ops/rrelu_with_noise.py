@@ -260,24 +260,26 @@ def _rrelu_with_noise_ascend_impl(
         and (out is None or out.is_contiguous())
     )
     if not contiguous:
+        # Bounce through contiguous buffers: for training this also keeps the
+        # torch_npu-aligned sampling semantics (x < 0) on strided layouts,
+        # and for eval it avoids the generic pointwise_dynamic path, whose
+        # aliased strided out0 writes are miscompiled on triton-ascend.
+        self_c = self.contiguous()
         if training:
-            # Bounce through contiguous buffers so the torch_npu-aligned
-            # sampling semantics (x < 0) hold for strided layouts too; the
-            # generic fallback follows the CPU/CUDA convention (x <= 0).
-            self_c = self.contiguous()
             noise_c = torch.empty_like(self_c)
             out_c = torch.empty_like(self_c)
             _fused_rrelu_with_noise_train(
                 self_c, noise_c, out_c, lower, upper, generator
             )
             noise.copy_(noise_c)
-            if out is None:
-                return out_c
-            out.copy_(out_c)
-            return out
-        return _rrelu_with_noise_impl(
-            self, noise, lower, upper, training, generator, out
-        )
+        else:
+            slope = (float(lower) + float(upper)) * 0.5
+            out_c = torch.empty_like(self_c)
+            _rrelu_with_noise_eval_ascend(self_c, out_c, slope)
+        if out is None:
+            return out_c
+        out.copy_(out_c)
+        return out
 
     if training:
         if out is None:
