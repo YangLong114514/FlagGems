@@ -94,9 +94,14 @@ def _ref_solve_tri(A, B, **kwargs):
     which dwarfs the kernel's own ~3-6e-4 error and spuriously fails the test.
     Elsewhere use the torch reference."""
     if IS_THEAD:
-        return torch.linalg.solve_triangular(
+        # Solve in fp64 on CPU (LAPACK, accurate), then place the reference
+        # where the comparison machinery expects it: on the device in normal
+        # mode (assert_close checks device), on CPU in --ref=cpu quick mode
+        # (to_cpu asserts the ref is already CPU).
+        ref = torch.linalg.solve_triangular(
             A.double().cpu(), B.double().cpu(), **kwargs
         )
+        return ref if utils.TO_CPU else ref.to(A.device)
     ref_A = utils.to_reference(A)
     ref_B = utils.to_reference(B)
     if IS_ASCEND:
