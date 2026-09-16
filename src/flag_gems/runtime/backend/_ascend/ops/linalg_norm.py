@@ -1,5 +1,7 @@
 import logging
 
+import torch
+
 from flag_gems.ops.linalg_norm import _parse_ord, _v_norm
 
 from .linalg_matrix_norm import linalg_matrix_norm
@@ -25,6 +27,12 @@ def linalg_norm(A, ord=None, dim=None, keepdim=False, *, dtype=None):
     are rejected up front since they crash or hang CANN native.  Vector
     branch reuses the Ascend ``vector_norm``; the per-row p-norm cases run
     the fixed ``_v_norm`` kernel shared with the generic implementation.
+
+    ``ord`` and ``dtype`` are normalized at this boundary because the Ascend
+    ``vector_norm`` cannot take either as-is: an int ord reaches its p-norm
+    kernels as an i32 scalar that libdevice ``pow`` has no dispatch key for,
+    and its ``dtype=`` branch re-derives the dtype through ``torch.dtype``,
+    which raises for every input.
     """
     logger.debug("GEMS_ASCEND LINALG_NORM")
     ord = _parse_ord(ord)
@@ -60,6 +68,14 @@ def linalg_norm(A, ord=None, dim=None, keepdim=False, *, dtype=None):
             dtype=dtype,
         )
     ord = 2 if ord is None else ord
+    # The Ascend backend's libdevice ``pow`` dispatches through an exact
+    # (dtype, dtype) key table -- {(fp32, fp32), (fp16, fp16), (bf16, bf16)} --
+    # and never promotes, so ``pow(tl.abs(x), ord)`` in the p-norm kernels
+    # raises KeyError((float32, int32)) at compile time when ord arrives as an
+    # int (an i32 runtime scalar).  Hand the kernels a float so the exponent is
+    # fp32, matching the (fp32, fp32) key -- same workaround as the shared
+    # _v_norm kernel's ``ord.to(acc_dtype)`` and _ascend/ops/pow.py.
+    ord = float(ord)
     if (
         dim is not None
         and len(dim) == 1
@@ -67,4 +83,13 @@ def linalg_norm(A, ord=None, dim=None, keepdim=False, *, dtype=None):
         and ord not in (2, float("inf"), float("-inf"), 0)
     ):
         return _v_norm(A, ord, dim, keepdim, dtype)
-    return vector_norm(A, ord, dim, keepdim, dtype=dtype)
+    # Ascend's vector_norm cannot take dtype=: it re-derives it through
+    # torch.dtype(dtype), which raises for any input.  Convert the input here
+    # instead and let vector_norm read the dtype off x.
+    if dtype is not None:
+        if isinstance(dtype, str):
+            dtype = getattr(torch, dtype)
+        elif not isinstance(dtype, torch.dtype):
+            dtype = torch.float32
+        A = A.to(dtype)
+    return vector_norm(A, ord, dim, keepdim)
