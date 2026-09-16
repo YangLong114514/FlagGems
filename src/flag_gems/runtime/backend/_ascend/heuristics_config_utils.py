@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import torch
 import triton
 
 
@@ -51,6 +52,19 @@ def rrelu_with_noise_heur_block(args):
     else:
         # Large tiles pipeline GM<->UB transfers best; 8192 overflows the
         # 192 KB UB for the fp32 eval kernel (in+out tiles with buffering).
+        return 4096
+
+
+def rrelu_with_noise_eval_heur_block(args):
+    if args["N"] <= 512:
+        return 512
+    elif args["N"] <= 4096:
+        return 1024
+    # 8192-element tiles for 2-byte dtypes (1826 GB/s measured); fp32 at 8192
+    # overflows the 192 KB UB for this kernel, so it stays at 4096.
+    elif args["dtype"] in (torch.float16, torch.bfloat16):
+        return 8192
+    else:
         return 4096
 
 
@@ -343,7 +357,7 @@ HEURISTICS_CONFIGS = {
         "num_warps": rrelu_with_noise_heur_num_warps,
     },
     "rrelu_with_noise_eval": {
-        "BLOCK": rrelu_with_noise_heur_block,
+        "BLOCK": rrelu_with_noise_eval_heur_block,
         "num_warps": rrelu_with_noise_heur_num_warps,
     },
     "softmax_non_inner": {
