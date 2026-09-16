@@ -12,7 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import contextlib
 import logging
 import os
 import threading
@@ -26,7 +25,6 @@ from flag_gems.ops.rrelu_with_noise import (
     _check_rrelu_with_noise_args,
     _rrelu_with_noise_impl,
 )
-from flag_gems.ops.rrelu_with_noise_backward import rrelu_with_noise_backward
 from flag_gems.runtime import torch_device_fn
 from flag_gems.runtime.backend._ascend import heuristics_config_utils as _hcu
 from flag_gems.utils.random_utils import philox_backend_seed_offset
@@ -41,19 +39,20 @@ DEFAULT_UPPER = 0.3333333333333333
 _WIDE_NUMEL_THRESHOLD = 1 << 30
 
 
-@contextlib.contextmanager
-def _without_all_blocks_parallel():
+def _pop_all_blocks_parallel():
     # TRITON_ALL_BLOCKS_PARALLEL (set globally by the fused sparse-attention
-    # module at import) miscompiles kernels that read and write the same
-    # buffer (the in-place variants here); it is read at kernel compile time
-    # only, so pop it for the launch and restore it afterwards. Same pattern
-    # as linalg_matrix_rank.
-    saved = os.environ.pop("TRITON_ALL_BLOCKS_PARALLEL", None)
-    try:
-        yield
-    finally:
-        if saved is not None:
-            os.environ["TRITON_ALL_BLOCKS_PARALLEL"] = saved
+    # module at import) is read at BOTH kernel compile and launch time by this
+    # triton-ascend build, and the two must agree: with it set, kernels that
+    # read and write the same buffer (the in-place variants here) misbehave.
+    # Pop it around compile+launch and restore afterwards (same pattern as
+    # linalg_matrix_rank). Plain function pair instead of a contextmanager to
+    # keep the per-launch overhead minimal.
+    return os.environ.pop("TRITON_ALL_BLOCKS_PARALLEL", None)
+
+
+def _restore_all_blocks_parallel(saved):
+    if saved is not None:
+        os.environ["TRITON_ALL_BLOCKS_PARALLEL"] = saved
 
 
 @triton.jit
@@ -138,37 +137,66 @@ def rrelu_with_noise_eval_kernel(
 # pointwise op. Same approach as linalg_matrix_rank._fast_launch: the cache
 # key covers every property the compiled binary specializes on (constexprs,
 # grid, tensor alignment, pointer dtype); N/seed/offset are marked
-# do_not_specialize so they stay plain runtime arguments.
+# do_not_specialize so they stay plain runtime arguments. Everything slow
+# (compile lock, the TRITON_ALL_BLOCKS_PARALLEL pop, the device context)
+# happens only on the cache-miss branch; a cached launch is just a stream
+# query plus the C launcher call (~15 us).
 _FAST_LAUNCH_CACHE = {}
-_LAUNCH_LOCK = threading.Lock()
+_COMPILE_LOCK = threading.Lock()
+_DRV = None  # driver.active is a LazyProxy; resolve it once
 
 
-def _fast_launch(kernel, grid, key_extra, *args, **kwargs):
+def _compile_entry(kernel, grid, key, device, args, kwargs):
+    global _DRV
+    saved = _pop_all_blocks_parallel()
+    try:
+        with torch_device_fn.device(device):
+            compiled = kernel.warmup(*args, grid=grid, **kwargs)
+            compiled._init_handles()
+    finally:
+        _restore_all_blocks_parallel(saved)
+    if hasattr(kernel, "non_constexpr_indices"):
+        suffix = ()
+    else:
+        # Some frontends expect the constexpr values appended to the launch
+        # arguments; resolve that once at compile time.
+        suffix = tuple(kwargs[name] for name in kernel.arg_names[len(args) :])
+    entry = (
+        compiled.run,
+        compiled.function,
+        compiled.packed_metadata,
+        compiled.launch_metadata,
+        suffix,
+        compiled,
+    )
+    _FAST_LAUNCH_CACHE[key] = entry
+    _DRV = driver.active
+    return entry
+
+
+def _fast_launch(kernel, grid, key_extra, device, *args, **kwargs):
     key = (
         id(kernel),
-        tuple(grid),
+        grid[0],
         key_extra,
-        tuple(sorted(kwargs.items())),
+        tuple(kwargs.values()),
         tuple(a.data_ptr() % 16 == 0 if torch.is_tensor(a) else None for a in args),
     )
     entry = _FAST_LAUNCH_CACHE.get(key)
     if entry is None:
-        compiled = kernel.warmup(*args, grid=grid, **kwargs)
-        compiled._init_handles()
-        entry = (compiled.run, compiled.function, compiled.packed_metadata, compiled)
-        _FAST_LAUNCH_CACHE[key] = entry
-    run, function, md, compiled = entry
-    if hasattr(kernel, "non_constexpr_indices"):
-        launch_args = args
-    else:
-        launch_args = args + tuple(
-            kwargs[name] for name in kernel.arg_names[len(args) :]
-        )
-    device = driver.active.get_current_device()
-    stream = driver.active.get_current_stream(device)
-    lm = compiled.launch_metadata(grid, stream, *launch_args)
-    g0 = grid[0] if len(grid) > 0 else 1
-    run(g0, 1, 1, stream, function, md, lm, None, None, *launch_args)
+        with _COMPILE_LOCK:
+            entry = _FAST_LAUNCH_CACHE.get(key)
+            if entry is None:
+                entry = _compile_entry(kernel, grid, key, device, args, kwargs)
+    run, function, md, launch_metadata, suffix, _ = entry
+    launch_args = args + suffix
+    saved = _pop_all_blocks_parallel()
+    try:
+        stream = _DRV.get_current_stream(_DRV.get_current_device())
+        lm = launch_metadata(grid, stream, *launch_args)
+        run(grid[0], 1, 1, stream, function, md, lm, None, None, *launch_args)
+    finally:
+        _restore_all_blocks_parallel(saved)
 
 
 def _heur(name, N):
@@ -189,25 +217,23 @@ def _fused_rrelu_with_noise_train(self, noise, out, lower, upper, generator):
     wide = N > _WIDE_NUMEL_THRESHOLD
     BLOCK, num_warps = _heur("rrelu_with_noise_train", N)
     grid = (triton.cdiv(N, BLOCK),)
-    with _LAUNCH_LOCK:
-        with _without_all_blocks_parallel():
-            with torch_device_fn.device(self.device):
-                _fast_launch(
-                    fused_rrelu_with_noise_train_kernel,
-                    grid,
-                    (self.dtype, wide),
-                    self,
-                    out,
-                    noise,
-                    N,
-                    lower,
-                    span,
-                    seed,
-                    offset,
-                    BLOCK=BLOCK,
-                    WIDE=wide,
-                    num_warps=num_warps,
-                )
+    _fast_launch(
+        fused_rrelu_with_noise_train_kernel,
+        grid,
+        (self.dtype, wide),
+        self.device,
+        self,
+        out,
+        noise,
+        N,
+        lower,
+        span,
+        seed,
+        offset,
+        BLOCK=BLOCK,
+        WIDE=wide,
+        num_warps=num_warps,
+    )
     return out
 
 
@@ -216,21 +242,19 @@ def _rrelu_with_noise_eval_ascend(self, out, slope):
     wide = N > _WIDE_NUMEL_THRESHOLD
     BLOCK, num_warps = _heur("rrelu_with_noise_eval", N)
     grid = (triton.cdiv(N, BLOCK),)
-    with _LAUNCH_LOCK:
-        with _without_all_blocks_parallel():
-            with torch_device_fn.device(self.device):
-                _fast_launch(
-                    rrelu_with_noise_eval_kernel,
-                    grid,
-                    (self.dtype, wide),
-                    self,
-                    out,
-                    N,
-                    float(slope),
-                    BLOCK=BLOCK,
-                    WIDE=wide,
-                    num_warps=num_warps,
-                )
+    _fast_launch(
+        rrelu_with_noise_eval_kernel,
+        grid,
+        (self.dtype, wide),
+        self.device,
+        self,
+        out,
+        N,
+        float(slope),
+        BLOCK=BLOCK,
+        WIDE=wide,
+        num_warps=num_warps,
+    )
     return out
 
 
@@ -292,27 +316,6 @@ def _rrelu_with_noise_ascend_impl(
     return _rrelu_with_noise_eval_ascend(self, out, slope)
 
 
-class RReLUWithNoiseAscendFunction(torch.autograd.Function):
-    @staticmethod
-    def forward(ctx, input, noise, lower, upper, training, generator=None):
-        output = _rrelu_with_noise_ascend_impl(
-            input, noise, lower, upper, training, generator
-        )
-        ctx.save_for_backward(input, noise)
-        ctx.lower = lower
-        ctx.upper = upper
-        ctx.training = training
-        return output
-
-    @staticmethod
-    def backward(ctx, grad_output):
-        input, noise = ctx.saved_tensors
-        grad_input = rrelu_with_noise_backward(
-            grad_output, input, noise, ctx.lower, ctx.upper, ctx.training, False
-        )
-        return grad_input, None, None, None, None, None
-
-
 def rrelu_with_noise(
     self,
     noise,
@@ -321,11 +324,15 @@ def rrelu_with_noise(
     training=False,
     generator=None,
 ):
-    """Ascend implementation of aten.rrelu_with_noise."""
+    """Ascend implementation of aten.rrelu_with_noise.
+
+    Like the generic implementation, no Python autograd wrapper is built here:
+    once registered on the device dispatch key, ``aten::rrelu_with_noise``
+    keeps the autograd kernel PyTorch generates from its derivative formula,
+    which calls the separately registered ``aten::rrelu_with_noise_backward``.
+    """
     logger.debug("GEMS_ASCEND RRELU_WITH_NOISE")
-    return RReLUWithNoiseAscendFunction.apply(
-        self, noise, lower, upper, training, generator
-    )
+    return _rrelu_with_noise_ascend_impl(self, noise, lower, upper, training, generator)
 
 
 def rrelu_with_noise_(
