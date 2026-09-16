@@ -27,7 +27,6 @@ from flag_gems.ops.rrelu_with_noise import (
 )
 from flag_gems.runtime import torch_device_fn
 from flag_gems.runtime.backend._ascend import heuristics_config_utils as _hcu
-from flag_gems.utils.random_utils import philox_backend_seed_offset
 
 logger = logging.getLogger(__name__)
 
@@ -113,6 +112,51 @@ def fused_rrelu_with_noise_train_kernel(
 
 
 @triton.jit(do_not_specialize=["N"])
+def fused_rrelu_with_noise_train_graph_kernel(
+    x_ptr,
+    out_ptr,
+    noise_ptr,
+    so_ptr,
+    N,
+    lower,
+    span,
+    BLOCK: tl.constexpr,
+):
+    # Graph-captured variant: seed/offset come from a two-element int64
+    # device buffer so replays stay valid while the RNG stream advances
+    # (see _rrelu_advance_offset_kernel below).
+    seed = tl.load(so_ptr)
+    offset = tl.load(so_ptr + 1)
+    pid = tl.program_id(0)
+    off = pid * BLOCK + tl.arange(0, BLOCK)
+    mask = off < N
+    x = tl.load(x_ptr + off, mask=mask, other=0.0).to(tl.float32)
+    ctr = (off + offset.to(tl.int32)).to(tl.uint32) ^ seed.to(tl.uint32)
+    u = (_rrelu_noise_u32(ctr) & 0x007FFFFF).to(tl.int32, bitcast=True).to(
+        tl.float32
+    ) * (1.0 / 8388608.0)
+    n = lower + span * u
+    neg = x < 0.0
+    tl.store(
+        out_ptr + off,
+        tl.where(neg, x * n, x).to(out_ptr.dtype.element_ty),
+        mask=mask,
+    )
+    tl.store(
+        noise_ptr + off,
+        tl.where(neg, n, 1.0).to(noise_ptr.dtype.element_ty),
+        mask=mask,
+    )
+
+
+@triton.jit(do_not_specialize=["inc"])
+def _rrelu_advance_offset_kernel(so_ptr, inc):
+    # Runs after the training kernel inside the captured graph so each replay
+    # consumes a fresh counter range, matching philox increment semantics.
+    tl.store(so_ptr + 1, tl.load(so_ptr + 1) + inc)
+
+
+@triton.jit(do_not_specialize=["N"])
 def rrelu_with_noise_eval_kernel(
     x_ptr,
     out_ptr,
@@ -127,9 +171,11 @@ def rrelu_with_noise_eval_kernel(
     else:
         off = pid * BLOCK + tl.arange(0, BLOCK)
     mask = off < N
-    x = tl.load(x_ptr + off, mask=mask, other=0.0).to(tl.float32)
-    y = tl.where(x > 0.0, x, x * slope)
-    tl.store(out_ptr + off, y.to(out_ptr.dtype.element_ty), mask=mask)
+    # Compute in the element dtype: the upcast path is measurably slower for
+    # 2-byte dtypes, and the fp16/bf16 rounding matches torch_npu.
+    x = tl.load(x_ptr + off, mask=mask, other=0.0)
+    y = tl.where(x > 0.0, x, x * slope.to(out_ptr.dtype.element_ty))
+    tl.store(out_ptr + off, y, mask=mask)
 
 
 # Direct CompiledKernel launches bypass JITFunction.run, whose per-call
@@ -199,10 +245,214 @@ def _fast_launch(kernel, grid, key_extra, device, *args, **kwargs):
         _restore_all_blocks_parallel(saved)
 
 
-def _heur(name, N):
+def _heur(name, N, dtype=None):
     cfg = _hcu.HEURISTICS_CONFIGS[name]
-    args = {"N": N}
+    args = {"N": N, "dtype": dtype}
     return cfg["BLOCK"](args), cfg["num_warps"](args)
+
+
+# ---------------------------------------------------------------------------
+# NPUGraph path for small tensors.
+#
+# Below _GRAPH_MAX_NUMEL elements the fixed per-call overhead (arg checking,
+# generator bookkeeping, kernel launch) dwarfs the kernel time, so small
+# calls are replayed from a captured graph instead: pointer-stable callers
+# (training loops, benchmarks) then pay only a graph replay (~10 us).
+# Same capture pattern as linalg_matrix_rank.
+# ---------------------------------------------------------------------------
+_GRAPH_MAX_NUMEL = 1 << 20
+_GRAPH_MAX_ENTRIES = 64
+_GRAPH_ENTRIES = {}
+_GRAPH_LOCK = threading.Lock()
+
+
+class _GraphEntry:
+    __slots__ = ("graph", "out_s", "refs", "so", "expected", "inc")
+
+    def __init__(self, graph, out_s, refs, so=None, expected=None, inc=0):
+        self.graph = graph
+        self.out_s = out_s
+        self.refs = refs  # keep captured buffers alive
+        self.so = so  # device [seed, offset] counter (training only)
+        self.expected = expected  # expected host-side (seed, offset) (training)
+        self.inc = inc  # per-replay offset increment (training)
+
+
+def _graph_key(training, self, noise, lower, upper, out):
+    return (
+        training,
+        out is not None,
+        self.numel(),
+        self.dtype,
+        float(lower),
+        float(upper),
+        self.data_ptr(),
+        noise.data_ptr(),
+        self.device.index,
+    )
+
+
+def _graph_eval(self, noise, slope, out):
+    key = _graph_key(False, self, noise, slope, 0.0, out)
+    ent = _GRAPH_ENTRIES.get(key)
+    if ent is not None:
+        ent.graph.replay()
+        return self if out is not None else ent.out_s.clone()
+
+    if len(_GRAPH_ENTRIES) >= _GRAPH_MAX_ENTRIES:
+        return None
+    N = self.numel()
+    out_s = self if out is not None else torch.empty_like(self)
+    BLOCK, num_warps = _heur("rrelu_with_noise_eval", N, self.dtype)
+    grid = (triton.cdiv(N, BLOCK),)
+
+    def launch():
+        _fast_launch(
+            rrelu_with_noise_eval_kernel,
+            grid,
+            (self.dtype, False),
+            self.device,
+            self,
+            out_s,
+            N,
+            float(slope),
+            BLOCK=BLOCK,
+            WIDE=False,
+            num_warps=num_warps,
+        )
+
+    launch()  # compiles (illegal during capture) and computes the first result
+    torch.npu.synchronize()
+    graph = torch.npu.NPUGraph()
+    saved = _pop_all_blocks_parallel()
+    try:
+        with torch.npu.graph(graph):
+            launch()
+    except Exception:
+        logger.warning("NPUGraph capture failed for rrelu_with_noise eval; "
+                       "using direct launches")
+        _restore_all_blocks_parallel(saved)
+        return out_s if out is not None else out_s.clone()
+    _restore_all_blocks_parallel(saved)
+    _GRAPH_ENTRIES[key] = _GraphEntry(graph, out_s, (self, noise))
+    return self if out is not None else out_s.clone()
+
+
+def _lean_seed_offset(increment, generator, device):
+    # Ascend-local lean equivalent of philox_backend_seed_offset: the NPU
+    # generator state is [seed, offset] int64, and get_offset/set_offset hit
+    # the same fields with far less Python/Tensor overhead than manipulating
+    # the state ByteTensor. The offset increment is rounded to a multiple of
+    # 4 exactly like philox_backend_seed_offset.
+    if generator is None:
+        generator = torch_device_fn.default_generators[
+            device.index if device.index is not None else torch_device_fn.current_device()
+        ]
+    seed = generator.initial_seed()
+    offset = generator.get_offset()
+    inc = (increment + 3) // 4 * 4
+    generator.set_offset(offset + inc)
+    return generator, seed, offset, inc
+
+
+def _graph_train(self, noise, lower, upper, generator, out):
+    N = self.numel()
+    lower = float(lower)
+    span = float(upper) - lower
+
+    device = self.device
+    key = _graph_key(True, self, noise, lower, upper, out)
+    ent = _GRAPH_ENTRIES.get(key)
+    if ent is not None:
+        gen = generator
+        if gen is None:
+            gen = torch_device_fn.default_generators[
+                device.index
+                if device.index is not None
+                else torch_device_fn.current_device()
+            ]
+        seed = gen.initial_seed()
+        offset = gen.get_offset()
+        if (seed, offset) != ent.expected:
+            # The generator was reseeded externally: resync the device counter.
+            ent.so.copy_(torch.tensor([seed, offset], dtype=torch.int64))
+            ent.expected = (seed, offset)
+        ent.graph.replay()
+        result = self if out is not None else ent.out_s.clone()
+        ent.expected = (seed, offset + ent.inc)
+        gen.set_offset(offset + ent.inc)
+        return result
+
+    if len(_GRAPH_ENTRIES) >= _GRAPH_MAX_ENTRIES:
+        return None
+
+    gen, seed, offset, inc = _lean_seed_offset(N, generator, device)
+
+    so = torch.empty(2, dtype=torch.int64, device=device)
+    so.copy_(torch.tensor([seed, offset], dtype=torch.int64))
+    out_s = self if out is not None else torch.empty_like(self)
+    BLOCK, num_warps = _heur("rrelu_with_noise_train", N)
+    grid = (triton.cdiv(N, BLOCK),)
+
+    def launch_main():
+        _fast_launch(
+            fused_rrelu_with_noise_train_graph_kernel,
+            grid,
+            (self.dtype, False),
+            device,
+            self,
+            out_s,
+            noise,
+            so,
+            N,
+            lower,
+            span,
+            BLOCK=BLOCK,
+            num_warps=num_warps,
+        )
+
+    def launch_advance():
+        _fast_launch(
+            _rrelu_advance_offset_kernel,
+            (1,),
+            None,
+            device,
+            so,
+            inc,
+            num_warps=1,
+        )
+
+    launch_main()  # compiles and computes the first result
+    torch.npu.synchronize()
+    graph = torch.npu.NPUGraph()
+    saved = _pop_all_blocks_parallel()
+    captured = True
+    try:
+        with torch.npu.graph(graph):
+            launch_main()
+            launch_advance()
+    except Exception:
+        logger.warning("NPUGraph capture failed for rrelu_with_noise train; "
+                       "using direct launches")
+        captured = False
+    finally:
+        _restore_all_blocks_parallel(saved)
+    if captured:
+        launch_advance()  # bring the device counter in line with the host
+        _GRAPH_ENTRIES[key] = _GraphEntry(
+            graph, out_s, (self, noise, so), so=so, expected=(seed, offset + inc),
+            inc=inc,
+        )
+    return self if out is not None else out_s.clone()
+
+
+def _try_graph(self, noise, lower, upper, training, generator, out):
+    if self.numel() > _GRAPH_MAX_NUMEL:
+        return None
+    with _GRAPH_LOCK:
+        if training:
+            return _graph_train(self, noise, lower, upper, generator, out)
+        return _graph_eval(self, noise, (float(lower) + float(upper)) * 0.5, out)
 
 
 def _fused_rrelu_with_noise_train(self, noise, out, lower, upper, generator):
@@ -212,7 +462,7 @@ def _fused_rrelu_with_noise_train(self, noise, out, lower, upper, generator):
 
     # One hash counter per element; advancing the offset by N keeps successive
     # calls on disjoint counter ranges, matching philox increment semantics.
-    seed, offset = philox_backend_seed_offset(N, generator)
+    _, seed, offset, _ = _lean_seed_offset(N, generator, self.device)
 
     wide = N > _WIDE_NUMEL_THRESHOLD
     BLOCK, num_warps = _heur("rrelu_with_noise_train", N)
@@ -240,7 +490,7 @@ def _fused_rrelu_with_noise_train(self, noise, out, lower, upper, generator):
 def _rrelu_with_noise_eval_ascend(self, out, slope):
     N = self.numel()
     wide = N > _WIDE_NUMEL_THRESHOLD
-    BLOCK, num_warps = _heur("rrelu_with_noise_eval", N)
+    BLOCK, num_warps = _heur("rrelu_with_noise_eval", N, self.dtype)
     grid = (triton.cdiv(N, BLOCK),)
     _fast_launch(
         rrelu_with_noise_eval_kernel,
@@ -306,10 +556,16 @@ def _rrelu_with_noise_ascend_impl(
         return out
 
     if training:
+        graph_result = _try_graph(self, noise, lower, upper, True, generator, out)
+        if graph_result is not None:
+            return graph_result
         if out is None:
             out = torch.empty_like(self)
         return _fused_rrelu_with_noise_train(self, noise, out, lower, upper, generator)
 
+    graph_result = _try_graph(self, noise, lower, upper, False, generator, out)
+    if graph_result is not None:
+        return graph_result
     slope = (float(lower) + float(upper)) * 0.5
     if out is None:
         out = torch.empty_like(self)
