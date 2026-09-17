@@ -465,17 +465,25 @@ def _layout_inputs(dtype):
     ``torch.empty_like`` does by default) keeps the layout here, while ATen
     hands back a legacy contiguous result.
     """
-    channels_last = (
-        torch.linspace(-2.0, 2.0, 2 * 8 * 4 * 4, dtype=dtype, device=flag_gems.device)
-        .reshape(2, 8, 4, 4)
-        .to(memory_format=torch.channels_last)
-    )
+    layouts = []
+    channels_last_base = torch.linspace(
+        -2.0, 2.0, 2 * 8 * 4 * 4, dtype=dtype, device=flag_gems.device
+    ).reshape(2, 8, 4, 4)
+    try:
+        layouts.append(
+            ("channels_last", channels_last_base.to(memory_format=torch.channels_last))
+        )
+    except RuntimeError:
+        # Some backends (e.g. torch_npu) do not support the channels_last
+        # memory format at all; only the transposed case runs there.
+        pass
     transposed = (
         torch.linspace(-2.0, 2.0, 8 * 16, dtype=dtype, device=flag_gems.device)
         .reshape(8, 16)
         .t()
     )
-    return [("channels_last", channels_last), ("transposed", transposed)]
+    layouts.append(("transposed", transposed))
+    return layouts
 
 
 @pytest.mark.rrelu_with_noise
@@ -532,8 +540,24 @@ def test_rrelu_with_noise_inplace_output_strides(training):
             torch.zeros_like(inp, memory_format=torch.contiguous_format)
         )
 
+        ref_inp = inp.clone()
+        if ref_inp.stride() != inp.stride():
+            # The reference input must carry the caller's layout; on backends
+            # whose clone() materializes a contiguous tensor (e.g. torch_npu)
+            # rebuild it with an explicit strided allocation instead.
+            ref_inp = torch.empty_strided(
+                inp.shape, inp.stride(), dtype=inp.dtype, device=inp.device
+            ).copy_(inp)
+        ref_inp = utils.to_reference(ref_inp)
+        if ref_inp.stride() != inp.stride():
+            # The reference transfer itself normalized the layout (e.g.
+            # torch_npu's .to("cpu")), so the layout comparison cannot run.
+            pytest.skip(
+                f"{label}: the reference path does not preserve the input layout"
+            )
+
         ref_out = torch.ops.aten.rrelu_with_noise_(
-            utils.to_reference(inp.clone()), ref_noise, lower, upper, training
+            ref_inp, ref_noise, lower, upper, training
         )
 
         result = flag_gems.rrelu_with_noise_(inp, noise, lower, upper, training)

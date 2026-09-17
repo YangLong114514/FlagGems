@@ -96,9 +96,9 @@ def fused_rrelu_with_noise_train_kernel(
         tl.float32
     ) * (1.0 / 8388608.0)
     n = lower + span * u
-    # torch_npu samples only strictly-negative inputs; signed zero and NaN
-    # take the unit-slope path.
-    neg = x < 0.0
+    # CPU/CUDA ATen samples non-positive inputs; signed zero draws a slope and
+    # NaN takes the unit-slope path.
+    neg = x <= 0.0
     tl.store(
         out_ptr + off,
         tl.where(neg, x * n, x).to(out_ptr.dtype.element_ty),
@@ -136,7 +136,7 @@ def fused_rrelu_with_noise_train_graph_kernel(
         tl.float32
     ) * (1.0 / 8388608.0)
     n = lower + span * u
-    neg = x < 0.0
+    neg = x <= 0.0
     tl.store(
         out_ptr + off,
         tl.where(neg, x * n, x).to(out_ptr.dtype.element_ty),
@@ -548,7 +548,10 @@ def _rrelu_with_noise_ascend_impl(
     _check_rrelu_with_noise_args(self, noise, lower, upper)
 
     if self.numel() == 0:
-        return torch.empty_like(self) if out is None else out
+        # ATen returns the out-of-place result in legacy contiguous layout.
+        if out is None:
+            return torch.empty_like(self, memory_format=torch.contiguous_format)
+        return out
 
     supported_dtype = self.dtype in (torch.float16, torch.bfloat16, torch.float32)
     if not supported_dtype:
@@ -563,9 +566,10 @@ def _rrelu_with_noise_ascend_impl(
     )
     if not contiguous:
         # Bounce through contiguous buffers: for training this also keeps the
-        # torch_npu-aligned sampling semantics (x < 0) on strided layouts,
+        # CPU/CUDA-aligned sampling semantics (x <= 0) on strided layouts,
         # and for eval it avoids the generic pointwise_dynamic path, whose
-        # aliased strided out0 writes are miscompiled on triton-ascend.
+        # aliased strided out0 writes are miscompiled on triton-ascend. The
+        # bounced out-of-place result comes back contiguous, as ATen's does.
         self_c = self.contiguous()
         if training:
             noise_c = torch.empty_like(self_c)
