@@ -24,6 +24,10 @@ pytestmark = pytest.mark.filterwarnings(
 # import, so it is the Ascend kernel on Ascend.
 _DEVICE_REF = flag_gems.device not in ("cuda", "cpu")
 
+LINALG_LSTSQ_DTYPE = [torch.float32]
+if flag_gems.runtime.device.support_fp64:
+    LINALG_LSTSQ_DTYPE += [torch.float64]
+
 
 def _lstsq_via_qr(A, b, driver="gels"):
     """Least-squares from primitives that run ON DEVICE.
@@ -151,6 +155,6 @@ def test_linalg_lstsq():
         # PyTorch's reference, and complex is outside the native path. float64
         # is dropped where the backend has no kernel for it -- on Ascend the
         # device has no float64 unit, so the operator raises there by design.
-        dtypes=[torch.float32] if _DEVICE_REF else [torch.float32, torch.float64],
+        dtypes=LINALG_LSTSQ_DTYPE,
     )
     bench.run()
