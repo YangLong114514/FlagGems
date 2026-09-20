@@ -262,8 +262,11 @@ def _compile_entry(kernel, grid, key, device, args, kwargs):
 def _fast_launch(kernel, grid, key_extra, device, *args, **kwargs):
     # The cache key and the launch stream are both tied to the input's device:
     # a compiled function handle is only valid on the device it was loaded on,
-    # and the launch must go to that device's current stream even when the
-    # caller's current device differs.
+    # and the launch must go to that device's current stream. The runtime
+    # additionally rejects launches whose stream belongs to a device context
+    # other than the thread's current one ("stream is not in current ctx"),
+    # so cross-device calls must also switch the device context; the guard is
+    # only entered when the index actually differs.
     dev_idx = device.index
     if dev_idx is None:
         dev_idx = torch_device_fn.current_device()
@@ -285,9 +288,15 @@ def _fast_launch(kernel, grid, key_extra, device, *args, **kwargs):
     launch_args = args + suffix
     saved = _pop_all_blocks_parallel()
     try:
-        stream = _DRV.get_current_stream(dev_idx)
-        lm = launch_metadata(grid, stream, *launch_args)
-        run(grid[0], 1, 1, stream, function, md, lm, None, None, *launch_args)
+        if _DRV.get_current_device() == dev_idx:
+            stream = _DRV.get_current_stream(dev_idx)
+            lm = launch_metadata(grid, stream, *launch_args)
+            run(grid[0], 1, 1, stream, function, md, lm, None, None, *launch_args)
+        else:
+            with torch_device_fn.device(device):
+                stream = _DRV.get_current_stream(dev_idx)
+                lm = launch_metadata(grid, stream, *launch_args)
+                run(grid[0], 1, 1, stream, function, md, lm, None, None, *launch_args)
     finally:
         _restore_all_blocks_parallel(saved)
 
@@ -347,6 +356,16 @@ def _debug_graph_entry(training, self, noise, lower, upper, out):
     return _GRAPH_ENTRIES.get(_graph_key(training, self, noise, lower, upper, out))
 
 
+def _replay(ent, device):
+    # Replay queues the captured kernels on the current stream, so it must run
+    # under the graph's own device context; guard only when it differs.
+    if torch_device_fn.current_device() == _device_index(device):
+        ent.graph.replay()
+    else:
+        with torch_device_fn.device(device):
+            ent.graph.replay()
+
+
 class _GraphEntry:
     __slots__ = ("graph", "out_s", "refs", "so", "expected", "inc")
 
@@ -377,7 +396,7 @@ def _graph_eval(self, noise, slope, out):
     key = _graph_key(False, self, noise, slope, 0.0, out)
     ent = _GRAPH_ENTRIES.get(key)
     if ent is not None:
-        ent.graph.replay()
+        _replay(ent, self.device)
         return self
 
     if len(_GRAPH_ENTRIES) >= _GRAPH_MAX_ENTRIES:
@@ -476,7 +495,7 @@ def _graph_train(self, noise, lower, upper, generator, out):
             # The generator was reseeded externally: resync the device counter.
             ent.so.copy_(torch.tensor([_u64_as_i64(seed), offset], dtype=torch.int64))
             ent.expected = (seed, offset)
-        ent.graph.replay()
+        _replay(ent, device)
         ent.expected = (seed, offset + ent.inc)
         gen.set_offset(offset + ent.inc)
         return self
