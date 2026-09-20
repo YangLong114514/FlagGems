@@ -344,8 +344,10 @@ def _graph_eval(self, noise, slope, out):
         with torch.npu.graph(graph):
             launch()
     except Exception:
-        logger.warning("NPUGraph capture failed for rrelu_with_noise eval; "
-                       "using direct launches")
+        logger.warning(
+            "NPUGraph capture failed for rrelu_with_noise eval; "
+            "using direct launches"
+        )
         _restore_all_blocks_parallel(saved)
         return self
     _restore_all_blocks_parallel(saved)
@@ -361,7 +363,11 @@ def _lean_seed_offset(increment, generator, device):
     # 4 exactly like philox_backend_seed_offset.
     if generator is None:
         generator = torch_device_fn.default_generators[
-            device.index if device.index is not None else torch_device_fn.current_device()
+            (
+                device.index
+                if device.index is not None
+                else torch_device_fn.current_device()
+            )
         ]
     seed = generator.initial_seed()
     offset = generator.get_offset()
@@ -382,9 +388,11 @@ def _graph_train(self, noise, lower, upper, generator, out):
         gen = generator
         if gen is None:
             gen = torch_device_fn.default_generators[
-                device.index
-                if device.index is not None
-                else torch_device_fn.current_device()
+                (
+                    device.index
+                    if device.index is not None
+                    else torch_device_fn.current_device()
+                )
             ]
         seed = gen.initial_seed()
         offset = gen.get_offset()
@@ -456,15 +464,21 @@ def _graph_train(self, noise, lower, upper, generator, out):
             launch_main()
             launch_advance()
     except Exception:
-        logger.warning("NPUGraph capture failed for rrelu_with_noise train; "
-                       "using direct launches")
+        logger.warning(
+            "NPUGraph capture failed for rrelu_with_noise train; "
+            "using direct launches"
+        )
         captured = False
     finally:
         _restore_all_blocks_parallel(saved)
     if captured:
         launch_advance()  # bring the device counter in line with the host
         _GRAPH_ENTRIES[key] = _GraphEntry(
-            graph, self, (self, noise, so), so=so, expected=(seed, offset + inc),
+            graph,
+            self,
+            (self, noise, so),
+            so=so,
+            expected=(seed, offset + inc),
             inc=inc,
         )
     return self
