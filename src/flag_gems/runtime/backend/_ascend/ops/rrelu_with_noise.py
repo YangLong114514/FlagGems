@@ -21,6 +21,8 @@ import triton
 import triton.language as tl
 from triton.runtime import driver
 
+from flag_gems.ops.contiguous import contiguous as _gems_contiguous
+from flag_gems.ops.copy import copy_ as _gems_copy_
 from flag_gems.ops.rrelu_with_noise import (
     _check_rrelu_with_noise_args,
     _rrelu_with_noise_impl,
@@ -318,6 +320,32 @@ _GRAPH_LOCK = threading.Lock()
 _GRAPH_CAPTURE_AFTER = 8
 _GRAPH_SEEN = {}
 
+# torch.npu.graph without an explicit stream captures on a process-wide
+# default stream created on whichever device was current when the first graph
+# context was built; that stream stays bound to that device for every later
+# capture. Keep one capture stream per device so captures always run on the
+# input's device, matching the stream _fast_launch picks for the kernels.
+_CAPTURE_STREAMS = {}
+
+
+def _device_index(device):
+    if device.index is not None:
+        return device.index
+    return torch_device_fn.current_device()
+
+
+def _capture_stream(dev_idx):
+    stream = _CAPTURE_STREAMS.get(dev_idx)
+    if stream is None:
+        stream = torch.npu.Stream(device=dev_idx)
+        _CAPTURE_STREAMS[dev_idx] = stream
+    return stream
+
+
+def _debug_graph_entry(training, self, noise, lower, upper, out):
+    # Test-facing probe: the cached graph for this exact configuration, if any.
+    return _GRAPH_ENTRIES.get(_graph_key(training, self, noise, lower, upper, out))
+
 
 class _GraphEntry:
     __slots__ = ("graph", "out_s", "refs", "so", "expected", "inc")
@@ -387,7 +415,9 @@ def _graph_eval(self, noise, slope, out):
     saved = _pop_all_blocks_parallel()
     try:
         with torch_device_fn.device(self.device):
-            with torch.npu.graph(graph):
+            with torch.npu.graph(
+                graph, stream=_capture_stream(_device_index(self.device))
+            ):
                 launch()
     except Exception:
         logger.warning(
@@ -507,7 +537,7 @@ def _graph_train(self, noise, lower, upper, generator, out):
     captured = True
     try:
         with torch_device_fn.device(device):
-            with torch.npu.graph(graph):
+            with torch.npu.graph(graph, stream=_capture_stream(_device_index(device))):
                 launch_main()
                 launch_advance()
     except Exception:
@@ -632,21 +662,23 @@ def _rrelu_with_noise_ascend_impl(
         # and for eval it avoids the generic pointwise_dynamic path, whose
         # aliased strided out0 writes are miscompiled on triton-ascend. The
         # bounced out-of-place result comes back contiguous, as ATen's does.
-        self_c = self.contiguous()
+        # Layout copies go through the FlagGems copy ops (pointwise_dynamic);
+        # only allocations use torch directly.
+        self_c = _gems_contiguous(self)
         if training:
             noise_c = torch.empty_like(self_c)
             out_c = torch.empty_like(self_c)
             _fused_rrelu_with_noise_train(
                 self_c, noise_c, out_c, lower, upper, generator
             )
-            noise.copy_(noise_c)
+            _gems_copy_(noise, noise_c)
         else:
             slope = (float(lower) + float(upper)) * 0.5
             out_c = torch.empty_like(self_c)
             _rrelu_with_noise_eval_ascend(self_c, out_c, slope)
         if out is None:
             return out_c
-        out.copy_(out_c)
+        _gems_copy_(out, out_c)
         return out
 
     if training:
