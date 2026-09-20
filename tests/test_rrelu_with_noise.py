@@ -282,6 +282,71 @@ def test_rrelu_with_noise_inplace_generator():
     assert not torch.equal(noise, noise_a)
 
 
+@pytest.mark.rrelu_with_noise_
+def test_rrelu_with_noise_inplace_train_stream_advances():
+    """Pointer-stable repeated training calls consume a continuing RNG stream.
+
+    Backends that cache or graph-capture a recurring configuration (the Ascend
+    backend captures after several identical calls) must keep the per-call
+    semantics intact: every call draws fresh slopes, writes them through the
+    input alias, and a reseed reproduces the first draw exactly.
+    """
+    lower, upper = DEFAULT_LOWER, DEFAULT_UPPER
+    generator = torch.Generator(device=flag_gems.device)
+    generator.manual_seed(2026)
+    inp = torch.full((4096,), -1.0, device=flag_gems.device)
+    noise = torch.zeros_like(inp)
+
+    snapshots = []
+    for _ in range(12):
+        pre = inp.clone()
+        result = flag_gems.rrelu_with_noise_(inp, noise, lower, upper, True, generator)
+        assert result is inp
+        # Every element stays negative, so every one of them is sampled.
+        assert torch.all(noise >= lower) and torch.all(noise <= upper)
+        utils.gems_assert_close(result, utils.to_reference(pre * noise), torch.float32)
+        snapshots.append(noise.clone())
+
+    for earlier, later in zip(snapshots, snapshots[1:]):
+        assert not torch.equal(earlier, later)
+
+    generator.manual_seed(2026)
+    flag_gems.rrelu_with_noise_(inp, noise, lower, upper, True, generator)
+    assert torch.equal(noise, snapshots[0])
+
+
+@pytest.mark.rrelu_with_noise
+@pytest.mark.rrelu_with_noise_
+def test_rrelu_with_noise_train_high_seed():
+    """Seeds up to 2**64 - 1 are legal, reproducible, and not truncated.
+
+    The high halves of the seed must participate in the draw: two seeds that
+    share their low 32 bits must not produce the same slopes.
+    """
+    lower, upper = DEFAULT_LOWER, DEFAULT_UPPER
+    high_seed = 2**64 - 1
+
+    def draw(seed, calls):
+        generator = torch.Generator(device=flag_gems.device)
+        generator.manual_seed(seed)
+        inp = torch.full((4096,), -1.0, device=flag_gems.device)
+        noise = torch.zeros_like(inp)
+        drawn = []
+        for _ in range(calls):
+            flag_gems.rrelu_with_noise_(inp, noise, lower, upper, True, generator)
+            drawn.append(noise.clone())
+        return drawn
+
+    # Enough calls to cross backend-side caching/graph-capture thresholds.
+    first = draw(high_seed, 12)
+    assert torch.equal(draw(high_seed, 1)[0], first[0])
+    for earlier, later in zip(first, first[1:]):
+        assert not torch.equal(earlier, later)
+
+    same_low32 = 0x5A5A0000_00000000 | (high_seed & 0xFFFFFFFF)
+    assert not torch.equal(draw(same_low32, 1)[0], first[0])
+
+
 @pytest.mark.rrelu_with_noise
 def test_rrelu_with_noise_eval_is_side_effect_free():
     """Eval mode consumes no randomness and writes to neither input tensor."""
@@ -473,10 +538,12 @@ def _layout_inputs(dtype):
         layouts.append(
             ("channels_last", channels_last_base.to(memory_format=torch.channels_last))
         )
-    except RuntimeError:
-        # Some backends (e.g. torch_npu) do not support the channels_last
-        # memory format at all; only the transposed case runs there.
-        pass
+    except RuntimeError as exc:
+        # Some backends (e.g. torch_npu: "Only contiguous_format or
+        # preserve_format is supported.") lack the channels_last memory
+        # format entirely; only the transposed case runs there.
+        if "preserve_format" not in str(exc):
+            raise
     transposed = (
         torch.linspace(-2.0, 2.0, 8 * 16, dtype=dtype, device=flag_gems.device)
         .reshape(8, 16)

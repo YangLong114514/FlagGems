@@ -54,6 +54,35 @@ def _restore_all_blocks_parallel(saved):
         os.environ["TRITON_ALL_BLOCKS_PARALLEL"] = saved
 
 
+# Golden-ratio constant for folding high counter/seed bits into the hash key.
+_GOLDEN32 = 0x9E3779B9
+
+
+def _rng_key(seed, offset):
+    """Fold the 64-bit generator seed and offset into the kernel's hash inputs.
+
+    The kernels hash a 32-bit per-element counter; folding the high halves of
+    seed and offset into a per-call key keeps sequences distinct when seeds
+    differ only in their high bits or the counter wraps past 2**32 elements.
+    Both results are returned as signed int32 bit patterns so the triton
+    signature is stable for any generator state.
+    """
+    key = (seed ^ (seed >> 32)) & 0xFFFFFFFF
+    key ^= ((offset >> 32) * _GOLDEN32) & 0xFFFFFFFF
+    off_lo = offset & 0xFFFFFFFF
+    if key >= 1 << 31:
+        key -= 1 << 32
+    if off_lo >= 1 << 31:
+        off_lo -= 1 << 32
+    return key, off_lo
+
+
+def _u64_as_i64(v):
+    # torch.tensor rejects ints above the signed 64-bit range; store the
+    # seed's bit pattern instead (the graph kernel reads it back as uint64).
+    return v - (1 << 64) if v >= (1 << 63) else v
+
+
 @triton.jit
 def _rrelu_noise_u32(h):
     # lowbias32 integer finalizer: a few vectorized uint32 mul/shift/xor ops.
@@ -67,7 +96,7 @@ def _rrelu_noise_u32(h):
     return h
 
 
-@triton.jit(do_not_specialize=["seed", "offset", "N"])
+@triton.jit(do_not_specialize=["key", "off_lo", "N"])
 def fused_rrelu_with_noise_train_kernel(
     x_ptr,
     out_ptr,
@@ -75,8 +104,8 @@ def fused_rrelu_with_noise_train_kernel(
     N,
     lower,
     span,
-    seed,
-    offset,
+    key,
+    off_lo,
     BLOCK: tl.constexpr,
     WIDE: tl.constexpr,
 ):
@@ -90,8 +119,13 @@ def fused_rrelu_with_noise_train_kernel(
     mask = off < N
     x = tl.load(x_ptr + off, mask=mask, other=0.0).to(tl.float32)
     # Keep the counter arithmetic in 32 bits: int64 vector ops are emulated
-    # on the vector cores. Truncating seed/offset is fine for a hash input.
-    ctr = (ctr32 + offset.to(tl.int32)).to(tl.uint32) ^ seed.to(tl.uint32)
+    # on the vector cores. key (host-folded from the full seed and the high
+    # offset bits) keeps streams distinct across counter wraparounds.
+    ctr = (ctr32 + off_lo).to(tl.uint32) ^ key.to(tl.uint32)
+    if WIDE:
+        # Fold the high index bits in as well: tensors past 2**32 elements
+        # would otherwise repeat the sequence every 2**32 lanes.
+        ctr ^= ((off >> 32).to(tl.int32) * (-1640530511)).to(tl.uint32)
     u = (_rrelu_noise_u32(ctr) & 0x007FFFFF).to(tl.int32, bitcast=True).to(
         tl.float32
     ) * (1.0 / 8388608.0)
@@ -124,14 +158,17 @@ def fused_rrelu_with_noise_train_graph_kernel(
 ):
     # Graph-captured variant: seed/offset come from a two-element int64
     # device buffer so replays stay valid while the RNG stream advances
-    # (see _rrelu_advance_offset_kernel below).
-    seed = tl.load(so_ptr)
-    offset = tl.load(so_ptr + 1)
+    # (see _rrelu_advance_offset_kernel below). The 64-bit folding matches
+    # _rng_key exactly, so replayed and eager draws agree.
+    seed_u = tl.load(so_ptr).to(tl.uint64, bitcast=True)
+    off_u = tl.load(so_ptr + 1).to(tl.uint64, bitcast=True)
+    key = (seed_u ^ (seed_u >> 32) ^ ((off_u >> 32) * 0x9E3779B9)).to(tl.uint32)
+    off_lo = off_u.to(tl.int32)
     pid = tl.program_id(0)
     off = pid * BLOCK + tl.arange(0, BLOCK)
     mask = off < N
     x = tl.load(x_ptr + off, mask=mask, other=0.0).to(tl.float32)
-    ctr = (off + offset.to(tl.int32)).to(tl.uint32) ^ seed.to(tl.uint32)
+    ctr = (off + off_lo).to(tl.uint32) ^ key
     u = (_rrelu_noise_u32(ctr) & 0x007FFFFF).to(tl.int32, bitcast=True).to(
         tl.float32
     ) * (1.0 / 8388608.0)
@@ -221,8 +258,16 @@ def _compile_entry(kernel, grid, key, device, args, kwargs):
 
 
 def _fast_launch(kernel, grid, key_extra, device, *args, **kwargs):
+    # The cache key and the launch stream are both tied to the input's device:
+    # a compiled function handle is only valid on the device it was loaded on,
+    # and the launch must go to that device's current stream even when the
+    # caller's current device differs.
+    dev_idx = device.index
+    if dev_idx is None:
+        dev_idx = torch_device_fn.current_device()
     key = (
         id(kernel),
+        dev_idx,
         grid[0],
         key_extra,
         tuple(kwargs.values()),
@@ -238,7 +283,7 @@ def _fast_launch(kernel, grid, key_extra, device, *args, **kwargs):
     launch_args = args + suffix
     saved = _pop_all_blocks_parallel()
     try:
-        stream = _DRV.get_current_stream(_DRV.get_current_device())
+        stream = _DRV.get_current_stream(dev_idx)
         lm = launch_metadata(grid, stream, *launch_args)
         run(grid[0], 1, 1, stream, function, md, lm, None, None, *launch_args)
     finally:
@@ -341,8 +386,9 @@ def _graph_eval(self, noise, slope, out):
     graph = torch.npu.NPUGraph()
     saved = _pop_all_blocks_parallel()
     try:
-        with torch.npu.graph(graph):
-            launch()
+        with torch_device_fn.device(self.device):
+            with torch.npu.graph(graph):
+                launch()
     except Exception:
         logger.warning(
             "NPUGraph capture failed for rrelu_with_noise eval; "
@@ -398,7 +444,7 @@ def _graph_train(self, noise, lower, upper, generator, out):
         offset = gen.get_offset()
         if (seed, offset) != ent.expected:
             # The generator was reseeded externally: resync the device counter.
-            ent.so.copy_(torch.tensor([seed, offset], dtype=torch.int64))
+            ent.so.copy_(torch.tensor([_u64_as_i64(seed), offset], dtype=torch.int64))
             ent.expected = (seed, offset)
         ent.graph.replay()
         ent.expected = (seed, offset + ent.inc)
@@ -422,7 +468,7 @@ def _graph_train(self, noise, lower, upper, generator, out):
     gen, seed, offset, inc = _lean_seed_offset(N, generator, device)
 
     so = torch.empty(2, dtype=torch.int64, device=device)
-    so.copy_(torch.tensor([seed, offset], dtype=torch.int64))
+    so.copy_(torch.tensor([_u64_as_i64(seed), offset], dtype=torch.int64))
     BLOCK, num_warps = _heur("rrelu_with_noise_train", N)
     grid = (triton.cdiv(N, BLOCK),)
 
@@ -460,9 +506,10 @@ def _graph_train(self, noise, lower, upper, generator, out):
     saved = _pop_all_blocks_parallel()
     captured = True
     try:
-        with torch.npu.graph(graph):
-            launch_main()
-            launch_advance()
+        with torch_device_fn.device(device):
+            with torch.npu.graph(graph):
+                launch_main()
+                launch_advance()
     except Exception:
         logger.warning(
             "NPUGraph capture failed for rrelu_with_noise train; "
@@ -505,6 +552,7 @@ def _fused_rrelu_with_noise_train(self, noise, out, lower, upper, generator):
     # One hash counter per element; advancing the offset by N keeps successive
     # calls on disjoint counter ranges, matching philox increment semantics.
     _, seed, offset, _ = _lean_seed_offset(N, generator, self.device)
+    key, off_lo = _rng_key(seed, offset)
 
     wide = N > _WIDE_NUMEL_THRESHOLD
     BLOCK, num_warps = _heur("rrelu_with_noise_train", N)
@@ -520,8 +568,8 @@ def _fused_rrelu_with_noise_train(self, noise, out, lower, upper, generator):
         N,
         lower,
         span,
-        seed,
-        offset,
+        key,
+        off_lo,
         BLOCK=BLOCK,
         WIDE=wide,
         num_warps=num_warps,
