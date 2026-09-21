@@ -86,6 +86,34 @@ def _make_zero_pivot_input(shape, pos, device, dtype):
     return mat, zero_at
 
 
+def _lu_factor_no_pivot_zero_guard(lu):
+    """No-pivot LU under the convention under test: an exactly-zero pivot zeroes
+    the multipliers instead of dividing by it.
+
+    Self-contained on purpose.  ATen cannot be the value reference for this input
+    on *any* platform: it is the platform's own solver that decides, and the
+    observed answers disagree -- nvidia zeroes the degenerate column (its
+    ``nan_to_num`` cleanup mapping cuSOLVER's NaN to 0), iluvatar emits ``±inf``,
+    and metax leaves the column unscaled, exactly as LAPACK's ``dgetf2`` does
+    (``IF( A(J,J).NE.ZERO ) CALL DSCAL(...)``, then the update runs either way).
+    Two of those are finite, so no "skip if the reference is non-finite" guard can
+    separate them; a self-contained reference checks every value on every vendor
+    instead, including ascend, whose ATen cross-checks are skipped entirely.
+    """
+    *batch, m, n = lu.shape
+    k = min(m, n)
+    lu = lu.clone()
+    for i in range(k):
+        pivot = lu[..., i, i].clone()
+        scale = torch.where(pivot != 0, 1.0 / pivot, torch.zeros_like(pivot))
+        lu[..., i + 1 :, i] = lu[..., i + 1 :, i] * scale.unsqueeze(-1)
+        if i + 1 < m and i + 1 < n:
+            l_col = lu[..., i + 1 :, i].unsqueeze(-1)
+            u_row = lu[..., i : i + 1, i + 1 :]
+            lu[..., i + 1 :, i + 1 :] = lu[..., i + 1 :, i + 1 :] - l_col @ u_row
+    return lu
+
+
 def _assert_matches_aten_lu(res_lu, ref_lu, dtype, reduce_dim=1):
     """Cross-check against the local ATen factor, when its answer is usable.
 
@@ -105,6 +133,14 @@ def _assert_matches_aten_lu(res_lu, ref_lu, dtype, reduce_dim=1):
     *finite but wrong* values past the zero pivot.  Measured on iluvatar, 6 of
     the 9 entries disagreed while only the first row -- the one before any
     update -- matched.  Masking by ``isfinite`` would still fail on those.
+
+    This guard only covers the non-finite case, so it is usable only where the
+    degenerate region is convention-independent -- an all-zero pivot column, as
+    ``test_linalg_lu_factor_zero_pivot`` builds.  Where the column below the zero
+    pivot is non-zero the answer is a finite *choice* between conventions (metax
+    returns LAPACK's unscaled column), and no guard can rescue the comparison;
+    ``test_linalg_lu_factor_zero_pivot_no_pivot_dense`` therefore checks values
+    against ``_lu_factor_no_pivot_zero_guard`` instead of ATen.
     """
     if not bool(torch.isfinite(ref_lu).all()):
         return
@@ -397,9 +433,12 @@ def test_linalg_lu_factor_zero_pivot(shape, pos, dtype, pivot):
 @pytest.mark.parametrize(
     "inp_cpu",
     [
-        # Zero pivot at (0, 0) with a non-zero column below it, so the two
-        # candidate conventions differ: the multipliers must become 0 (ATen),
-        # not Inf/NaN and not "leave the column alone".
+        # Zero pivot at (0, 0) with a non-zero column below it -- the one input
+        # where the candidate conventions actually differ.  FlagGems zeroes the
+        # multipliers there; LAPACK (and so metax's ATen) leaves the column
+        # unscaled, iluvatar's emits +-inf, nvidia's ATen lands on zeros only
+        # because PyTorch cleans up cuSOLVER's NaN.  Values are therefore checked
+        # against ``_lu_factor_no_pivot_zero_guard``, not against ATen.
         [[0.0, 1.0, 1.0], [2.0, 3.0, 4.0], [5.0, 6.0, 7.0]],
         [[0.0, -2.0, 0.5], [1.0, 4.0, -3.0], [-6.0, 0.25, 2.0]],
     ],
@@ -412,16 +451,12 @@ def test_linalg_lu_factor_zero_pivot_no_pivot_dense(inp_cpu, dtype):
     (partial pivoting is what guarantees that), so this pins the convention
     rather than relying on it: an exactly-zero pivot yields zero multipliers and
     the rank-1 update still runs.  Reconstruction into the original matrix is
-    intentionally not asserted -- as in ATen, dropping the multiplier loses that
-    column of the factor -- only the absence of NaN/Inf and, where ATen's own
-    answer is usable, the agreement with it (see ``_assert_matches_aten_lu``).
+    intentionally not asserted -- dropping the multiplier loses that column of
+    the factor, in every convention.
     """
     inp = torch.tensor(inp_cpu, dtype=dtype, device=flag_gems.device)
     ref_inp = utils.to_reference(inp)
     k = min(inp.shape[-2], inp.shape[-1])
-
-    if flag_gems.vendor_name != "ascend":
-        ref_lu = torch.linalg.lu_factor_ex(ref_inp, pivot=False, check_errors=False).LU
 
     res_lu, _ = flag_gems.linalg_lu_factor(inp, pivot=False)
 
@@ -430,5 +465,10 @@ def test_linalg_lu_factor_zero_pivot_no_pivot_dense(inp_cpu, dtype):
     # Multipliers below the zero pivot are zeroed, not left unscaled.
     assert (res_lu[..., 1:, 0] == 0).all()
 
-    if flag_gems.vendor_name != "ascend":
-        _assert_matches_aten_lu(res_lu, ref_lu, dtype, reduce_dim=k)
+    # Every entry, on every vendor.  ATen cannot be the reference here: its
+    # answer is whichever convention the platform's solver picked (see above),
+    # and two of the three observed ones are finite, so `_assert_matches_aten_lu`
+    # cannot tell them apart.
+    utils.gems_assert_close(
+        res_lu, _lu_factor_no_pivot_zero_guard(ref_inp), dtype, reduce_dim=k
+    )
