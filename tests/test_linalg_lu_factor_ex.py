@@ -255,8 +255,7 @@ def test_linalg_lu_factor_ex(shape, dtype, pivot):
         ref_out = namedtuple("_RefResult", ["LU", "pivots", "info"])(
             ref_lu, ref_pivots, ref_info
         )
-    with flag_gems.use_gems():
-        res_out = torch.linalg.lu_factor_ex(inp, pivot=pivot)
+    res_out = flag_gems.linalg_lu_factor_ex(inp, pivot=pivot)
 
     batch_shape = inp.shape[:-2]
     m, n = inp.shape[-2], inp.shape[-1]
@@ -306,8 +305,7 @@ def test_linalg_lu_factor_ex_check_errors(shape, dtype, pivot):
         ref_out = namedtuple("_RefResult", ["LU", "pivots", "info"])(
             ref_lu, ref_pivots, ref_info
         )
-    with flag_gems.use_gems():
-        res_out = torch.linalg.lu_factor_ex(inp, pivot=pivot, check_errors=True)
+    res_out = flag_gems.linalg_lu_factor_ex(inp, pivot=pivot, check_errors=True)
 
     # Both should have info == 0 for well-conditioned input
     assert torch.all(res_out.info == 0)
@@ -330,8 +328,7 @@ def test_linalg_lu_factor_ex_singular(shape, dtype):
         ref_out = namedtuple("_RefResult", ["LU", "pivots", "info"])(
             ref_lu, ref_pivots, ref_info
         )
-    with flag_gems.use_gems():
-        res_out = torch.linalg.lu_factor_ex(inp, pivot=True, check_errors=False)
+    res_out = flag_gems.linalg_lu_factor_ex(inp, pivot=True, check_errors=False)
 
     # The last diagonal element should be zero, so info should indicate the position
     utils.gems_assert_equal(res_out.info, ref_out.info)
@@ -359,8 +356,7 @@ def test_linalg_lu_factor_ex_zero_pivot(shape, pos, dtype, pivot):
     if flag_gems.vendor_name != "ascend":
         ref_out = torch.linalg.lu_factor_ex(ref_inp, pivot=pivot, check_errors=False)
 
-    with flag_gems.use_gems():
-        res_out = torch.linalg.lu_factor_ex(inp, pivot=pivot, check_errors=False)
+    res_out = flag_gems.linalg_lu_factor_ex(inp, pivot=pivot, check_errors=False)
 
     # The regression: no NaN anywhere, so the factor past the zero pivot is
     # intact and the diagonal scan sees the real zero pivot.
@@ -383,7 +379,7 @@ def test_linalg_lu_factor_ex_check_errors_raises(shape, dtype):
 
     with flag_gems.use_gems():
         with pytest.raises(RuntimeError, match="lu_factor_ex"):
-            torch.linalg.lu_factor_ex(inp, pivot=True, check_errors=True)
+            flag_gems.linalg_lu_factor_ex(inp, pivot=True, check_errors=True)
 
 
 @pytest.mark.linalg_lu_factor_ex_out
@@ -426,8 +422,7 @@ def test_linalg_lu_factor_ex_out(shape, dtype, pivot):
     )
     res_info_out = torch.empty(batch_shape, dtype=torch.int32, device=inp.device)
     out = (res_LU_out, res_pivots_out, res_info_out)
-    with flag_gems.use_gems():
-        res_out = torch.linalg.lu_factor_ex(inp, pivot=pivot, out=out)
+    res_out = flag_gems.linalg_lu_factor_ex_out(inp, pivot=pivot, out=out)
 
     # Verify outputs are the same objects (in-place write)
     assert res_out.LU is res_LU_out

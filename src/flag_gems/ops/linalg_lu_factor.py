@@ -1421,7 +1421,23 @@ def linalg_lu_factor(input, *, pivot=True):
     return _linalg_lu_factor_impl(input, pivot=pivot)
 
 
-def _resolve_linalg_lu_factor_out_args(LU, pivots):
+def _resolve_linalg_lu_factor_out_args(LU, pivots, out):
+    # Two spellings reach here, and they must not be mixed:
+    #   * ``out=(LU, pivots)``, the one ``torch.linalg`` documents and the only
+    #     one a *direct* call needs -- the dispatcher never passes ``out`` (it
+    #     binds the schema's ``LU``/``pivots`` arguments instead), so this form
+    #     is invisible to the ``linalg_lu_factor.out`` registration;
+    #   * explicit ``LU=``/``pivots=``, which is what that registration uses.
+    # Mirrors ``_resolve_linalg_lu_factor_ex_out_args`` and the ascend backend.
+    if out is not None:
+        if LU is not None or pivots is not None:
+            raise TypeError("linalg_lu_factor(): out and LU/pivots cannot both be set")
+        if len(out) != 2:
+            raise TypeError(
+                "linalg_lu_factor(): out must be a tuple of 2 tensors, "
+                f"got {len(out)}"
+            )
+        return out
     if LU is None or pivots is None:
         raise TypeError(
             "linalg_lu_factor(): LU and pivots must both be provided " "for out variant"
@@ -1429,7 +1445,7 @@ def _resolve_linalg_lu_factor_out_args(LU, pivots):
     return LU, pivots
 
 
-def linalg_lu_factor_out(input, *, pivot=True, LU=None, pivots=None):
+def linalg_lu_factor_out(input, *, pivot=True, LU=None, pivots=None, out=None):
     logger.debug("GEMS LINALG_LU_FACTOR_OUT")
-    lu_out, pivots_out = _resolve_linalg_lu_factor_out_args(LU, pivots)
+    lu_out, pivots_out = _resolve_linalg_lu_factor_out_args(LU, pivots, out)
     return _linalg_lu_factor_impl(input, pivot=pivot, LU=lu_out, pivots=pivots_out)

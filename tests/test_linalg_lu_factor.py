@@ -207,8 +207,7 @@ def test_linalg_lu_factor(shape, dtype, pivot):
         ref_lu, ref_pivots = torch.linalg.lu_factor(ref_inp, pivot=pivot)
     else:
         ref_lu, ref_pivots = _run_torch_ops_path(ref_inp, pivot=pivot)
-    with flag_gems.use_gems():
-        res_lu, res_pivots = torch.linalg.lu_factor(inp, pivot=pivot)
+    res_lu, res_pivots = flag_gems.linalg_lu_factor(inp, pivot=pivot)
     batch_shape = inp.shape[:-2]
     m, n = inp.shape[-2], inp.shape[-1]
     k = min(m, n)
@@ -281,8 +280,7 @@ def test_linalg_lu_factor_out(shape, dtype, pivot):
         (*batch_shape, k), dtype=torch.int32, device=inp.device
     )
     out = (res_LU_out, res_pivots_out)
-    with flag_gems.use_gems():
-        res_LU, res_pivots = torch.linalg.lu_factor(inp, pivot=pivot, out=out)
+    res_LU, res_pivots = flag_gems.linalg_lu_factor_out(inp, pivot=pivot, out=out)
 
     assert res_LU is res_LU_out
     assert res_pivots is res_pivots_out
@@ -332,8 +330,7 @@ def test_linalg_lu_factor_zero_pivot(shape, pos, dtype, pivot):
     if flag_gems.vendor_name != "ascend":
         ref_lu = torch.linalg.lu_factor_ex(ref_inp, pivot=pivot, check_errors=False).LU
 
-    with flag_gems.use_gems():
-        res_lu, res_pivots = torch.linalg.lu_factor(inp, pivot=pivot)
+    res_lu, res_pivots = flag_gems.linalg_lu_factor(inp, pivot=pivot)
 
     # The regression itself: nothing past the zero pivot may be NaN/Inf.
     assert not torch.isnan(res_lu).any(), "zero pivot contaminated the factor"
@@ -401,8 +398,7 @@ def test_linalg_lu_factor_zero_pivot_no_pivot_dense(inp_cpu, dtype):
     if flag_gems.vendor_name != "ascend":
         ref_lu = torch.linalg.lu_factor_ex(ref_inp, pivot=False, check_errors=False).LU
 
-    with flag_gems.use_gems():
-        res_lu, _ = torch.linalg.lu_factor(inp, pivot=False)
+    res_lu, _ = flag_gems.linalg_lu_factor(inp, pivot=False)
 
     assert not torch.isnan(res_lu).any(), "zero pivot produced NaN multipliers"
     assert not torch.isinf(res_lu).any()
