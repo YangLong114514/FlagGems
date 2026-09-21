@@ -333,13 +333,17 @@ def _fast_launch(kernel, grid, key_extra, device, *args, **kwargs):
     # other than the thread's current one ("stream is not in current ctx"),
     # so cross-device calls must also switch the device context; the guard is
     # only entered when the index actually differs.
+    # The grid is deliberately NOT part of the key: every runtime int argument
+    # is do_not_specialize, so one compiled entry serves all grid sizes of the
+    # same constexpr/alignment configuration and a new shape on an already-seen
+    # configuration costs a plain dict lookup instead of a kernel.warmup call
+    # (which is slow enough to poison benchmark iteration-count estimates).
     dev_idx = device.index
     if dev_idx is None:
         dev_idx = torch_device_fn.current_device()
     key = (
         id(kernel),
         dev_idx,
-        grid[0],
         key_extra,
         tuple(kwargs.values()),
         tuple(a.data_ptr() % 16 == 0 if torch.is_tensor(a) else None for a in args),

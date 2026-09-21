@@ -69,22 +69,23 @@ def rrelu_with_noise_eval_heur_block(args):
 
 def rrelu_with_noise_eval_heur_unroll(args):
     # Tiles per program; every program pays a fixed setup cost on this
-    # backend, so larger inputs benefit from fewer, fatter programs.
+    # backend, so larger inputs benefit from fewer, fatter programs. Fewer
+    # buckets also means fewer kernel variants: benchmark sweeps and real
+    # workloads with mixed shapes then reuse one compiled binary per bucket
+    # instead of paying a fresh compile for every size class.
     if args["N"] <= 4096:
         return 1
     elif args["N"] < (1 << 20):
         return 2
-    elif args["N"] < (1 << 22):
-        return 4
     else:
         return 8
 
 
 def rrelu_with_noise_heur_num_warps(args):
+    # Keep the small-input tiers aligned with the BLOCK tiers so nearby sizes
+    # compile to the same kernel variant (see eval_heur_unroll's comment).
     if args["N"] <= 512:
         return 4
-    elif args["N"] <= 1024:
-        return 8
     else:
         return 16
 
