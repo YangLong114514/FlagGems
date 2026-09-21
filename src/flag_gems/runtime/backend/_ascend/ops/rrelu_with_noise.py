@@ -16,6 +16,7 @@ import inspect
 import logging
 import os
 import threading
+import time
 
 import torch
 import triton
@@ -244,6 +245,58 @@ _COMPILE_LOCK = threading.Lock()
 _DRV = None  # driver.active is a LazyProxy; resolve it once
 
 
+def _time_query(fn, arg, iters=200):
+    """Wall-time one device/stream query candidate; None when it fails."""
+    try:
+        fn() if arg is None else fn(arg)
+    except Exception:
+        return None
+    t0 = time.perf_counter()
+    for _ in range(iters):
+        fn() if arg is None else fn(arg)
+    return time.perf_counter() - t0
+
+
+def _pick_query(candidates, arg):
+    """Keep the fastest candidate: the shims' cost differs wildly across
+    torch_npu builds, so pick by measurement rather than by version."""
+    scored = [(_time_query(fn, arg), fn) for fn in candidates]
+    return min(scored, key=lambda t: float("inf") if t[0] is None else t[0])[1]
+
+
+_DEVICE_QUERY = None
+_STREAM_QUERY = None
+_DEVICE_COUNT = None
+
+
+def _device_count():
+    global _DEVICE_COUNT
+    if _DEVICE_COUNT is None:
+        _DEVICE_COUNT = torch.npu.device_count()
+    return _DEVICE_COUNT
+
+
+def _current_device():
+    global _DEVICE_QUERY
+    if _DEVICE_QUERY is None:
+        _DEVICE_QUERY = _pick_query(
+            [torch.npu.current_device, torch_device_fn.current_device], None
+        )
+    return _DEVICE_QUERY()
+
+
+def _current_stream(dev_idx):
+    global _STREAM_QUERY, _DRV
+    if _DRV is None:
+        _DRV = driver.active
+    if _STREAM_QUERY is None:
+        candidates = [_DRV.get_current_stream]
+        if _raw_stream is not None:
+            candidates.insert(0, _raw_stream)
+        _STREAM_QUERY = _pick_query(candidates, dev_idx)
+    return _STREAM_QUERY(dev_idx)
+
+
 def _compile_entry(kernel, grid, key, device, args, kwargs):
     global _DRV
     saved = _pop_all_blocks_parallel()
@@ -301,18 +354,14 @@ def _fast_launch(kernel, grid, key_extra, device, *args, **kwargs):
     launch_args = args + suffix
     saved = _pop_all_blocks_parallel()
     try:
-        # torch.npu.current_device() is a thin wrapper over the C binding and
-        # ~10x cheaper than the driver shim's get_current_device chain.
-        if torch.npu.current_device() == dev_idx:
-            if _raw_stream is not None:
-                stream = _raw_stream(dev_idx)
-            else:
-                stream = _DRV.get_current_stream(dev_idx)
+        # Single-device hosts never need the query at all.
+        if _device_count() == 1 or _current_device() == dev_idx:
+            stream = _current_stream(dev_idx)
             lm = launch_metadata(grid, stream, *launch_args)
             run(grid[0], 1, 1, stream, function, md, lm, None, None, *launch_args)
         else:
             with torch_device_fn.device(device):
-                stream = _DRV.get_current_stream(dev_idx)
+                stream = _current_stream(dev_idx)
                 lm = launch_metadata(grid, stream, *launch_args)
                 run(grid[0], 1, 1, stream, function, md, lm, None, None, *launch_args)
     finally:
@@ -405,7 +454,7 @@ def _debug_graph_entry(training, self, noise, lower, upper, out):
 def _replay(ent, device):
     # Replay queues the captured kernels on the current stream, so it must run
     # under the graph's own device context; guard only when it differs.
-    if torch.npu.current_device() == _device_index(device):
+    if _device_count() == 1 or _current_device() == _device_index(device):
         ent.graph.replay()
     else:
         with torch_device_fn.device(device):
@@ -494,8 +543,48 @@ def _graph_eval(self, noise, slope, out):
         _restore_all_blocks_parallel(saved)
         return self
     _restore_all_blocks_parallel(saved)
-    _GRAPH_ENTRIES[key] = _GraphEntry(graph, self, (self, noise))
+    # The timing replays re-apply the in-place kernel, so snapshot and
+    # restore the buffer around the check.
+    snap = self.clone()
+    if not _replay_beats_launch(graph, launch):
+        _GRAPH_FAILED.add(key)
+    else:
+        _GRAPH_ENTRIES[key] = _GraphEntry(graph, self, (self, noise, snap))
+    self.copy_(snap)
     return self
+
+
+def _replay_beats_launch(graph, launch):
+    """Keep the graph only when replay actually beats a direct launch.
+
+    Measured once per configuration at capture time: some torch_npu builds
+    replay slowly enough that the graph is a net loss.  The first replay pays
+    graph instantiation, and single timings are noisy, so warm up first and
+    average a few rounds.  The replays re-apply the (in-place) kernel, so
+    callers snapshot the buffers beforehand and restore them afterwards.
+    """
+    torch.npu.synchronize()
+    for _ in range(3):
+        graph.replay()
+    t0 = time.perf_counter()
+    for _ in range(5):
+        launch()
+    torch.npu.synchronize()
+    direct_s = (time.perf_counter() - t0) / 5
+    t0 = time.perf_counter()
+    for _ in range(5):
+        graph.replay()
+    torch.npu.synchronize()
+    replay_s = (time.perf_counter() - t0) / 5
+    if replay_s <= direct_s * 1.5:
+        return True
+    logger.warning(
+        "NPUGraph replay is slower than a direct launch for rrelu_with_noise "
+        "(%.0f us vs %.0f us); using direct launches",
+        replay_s * 1e6,
+        direct_s * 1e6,
+    )
+    return False
 
 
 def _lean_seed_offset(increment, generator, device):
@@ -620,15 +709,26 @@ def _graph_train(self, noise, lower, upper, generator, out):
     finally:
         _restore_all_blocks_parallel(saved)
     if captured:
-        launch_advance()  # bring the device counter in line with the host
-        _GRAPH_ENTRIES[key] = _GraphEntry(
-            graph,
-            self,
-            (self, noise, so),
-            so=so,
-            expected=(seed, offset + inc),
-            inc=inc,
-        )
+        # The timing replays re-apply the in-place kernel and advance the
+        # device counter; snapshot/restore everything around the check.
+        snap_self = self.clone()
+        snap_noise = noise.clone()
+        replay_ok = _replay_beats_launch(graph, launch_main)
+        self.copy_(snap_self)
+        noise.copy_(snap_noise)
+        so.copy_(torch.tensor([_u64_as_i64(seed), offset], dtype=torch.int64))
+        if replay_ok:
+            launch_advance()  # bring the device counter in line with the host
+            _GRAPH_ENTRIES[key] = _GraphEntry(
+                graph,
+                self,
+                (self, noise, so, snap_self, snap_noise),
+                so=so,
+                expected=(seed, offset + inc),
+                inc=inc,
+            )
+        else:
+            _GRAPH_FAILED.add(key)
     return self
 
 
