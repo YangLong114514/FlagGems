@@ -391,8 +391,8 @@ def test_linalg_lu_factor_zero_pivot(shape, pos, dtype, pivot):
 
 @pytest.mark.linalg_lu_factor
 @pytest.mark.skipif(
-    utils.TO_CPU,
-    reason="linalg.lu_factor: LU without pivoting is not implemented on the CPU",
+    utils.TO_CPU or flag_gems.runtime.device == "ascend",
+    reason="linalg.lu_factor: LU without pivoting is not implemented on the CPU or ascend",
 )
 @pytest.mark.parametrize(
     "inp_cpu",
