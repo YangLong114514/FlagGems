@@ -915,8 +915,9 @@ def test_rrelu_with_noise_inplace_capture_failure_fallback_ascend(monkeypatch):
     """A failed graph capture must fall back to direct launches.
 
     Forces the capture context to raise, crosses the capture threshold while
-    it is broken, and checks the results stay correct throughout; once
-    restored, the same configuration captures successfully.
+    it is broken, and checks the results stay correct throughout; a failed
+    configuration is blacklisted instead of retrying capture on every call,
+    and a fresh configuration captures successfully once restored.
     """
     lower, upper = DEFAULT_LOWER, DEFAULT_UPPER
     generator = torch.Generator(device=flag_gems.device)
@@ -934,7 +935,7 @@ def test_rrelu_with_noise_inplace_capture_failure_fallback_ascend(monkeypatch):
         def __exit__(self, *args):
             return False
 
-    def run_call():
+    def run_call(inp, noise):
         inp.fill_(-1.0)
         flag_gems.rrelu_with_noise_(inp, noise, lower, upper, True, generator)
         assert torch.all(noise >= lower) and torch.all(noise <= upper)
@@ -943,11 +944,19 @@ def test_rrelu_with_noise_inplace_capture_failure_fallback_ascend(monkeypatch):
     with monkeypatch.context() as m:
         m.setattr(torch.npu, "graph", _FailingGraph)
         for _ in range(12):
-            run_call()
+            run_call(inp, noise)
         assert _ascend_graph_entry(True, inp, noise, lower, upper, inp) is None
 
-    run_call()
-    assert _ascend_graph_entry(True, inp, noise, lower, upper, inp) is not None
+    # The failed configuration stays blacklisted (no retry storm) ...
+    run_call(inp, noise)
+    assert _ascend_graph_entry(True, inp, noise, lower, upper, inp) is None
+
+    # ... while a fresh configuration captures normally.
+    inp2 = torch.full((4096,), -1.0, device=flag_gems.device)
+    noise2 = torch.zeros_like(inp2)
+    for _ in range(12):
+        run_call(inp2, noise2)
+    assert _ascend_graph_entry(True, inp2, noise2, lower, upper, inp2) is not None
 
 
 @_ON_NON_ASCEND

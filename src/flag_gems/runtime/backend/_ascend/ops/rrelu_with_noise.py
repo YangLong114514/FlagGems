@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import inspect
 import logging
 import os
 import threading
@@ -372,6 +373,30 @@ def _capture_stream(dev_idx):
     return stream
 
 
+# Older torch_npu builds take no stream argument in torch.npu.graph; detect
+# once. Without it the capture falls back to torch_npu's process-wide default
+# capture stream, which stays correct for single-device callers (it is created
+# lazily, inside our device context) and only multi-device captures lose the
+# per-device binding.
+try:
+    _GRAPH_ACCEPTS_STREAM = "stream" in inspect.signature(torch.npu.graph).parameters
+except (AttributeError, TypeError, ValueError):  # pragma: no cover
+    _GRAPH_ACCEPTS_STREAM = False
+
+
+def _graph_context(graph, device):
+    kwargs = {}
+    if _GRAPH_ACCEPTS_STREAM:
+        kwargs["stream"] = _capture_stream(_device_index(device))
+    return torch.npu.graph(graph, **kwargs)
+
+
+# Configurations whose capture already failed once: retrying capture on every
+# call costs ~0.2-0.3 ms each time (observed on a host whose torch_npu rejects
+# the capture), which is far worse than never graphing at all.
+_GRAPH_FAILED = set()
+
+
 def _debug_graph_entry(training, self, noise, lower, upper, out):
     # Test-facing probe: the cached graph for this exact configuration, if any.
     return _GRAPH_ENTRIES.get(_graph_key(training, self, noise, lower, upper, out))
@@ -420,7 +445,7 @@ def _graph_eval(self, noise, slope, out):
         _replay(ent, self.device)
         return self
 
-    if len(_GRAPH_ENTRIES) >= _GRAPH_MAX_ENTRIES:
+    if key in _GRAPH_FAILED or len(_GRAPH_ENTRIES) >= _GRAPH_MAX_ENTRIES:
         return None
 
     seen = _GRAPH_SEEN.get(key, 0) + 1
@@ -457,15 +482,15 @@ def _graph_eval(self, noise, slope, out):
     saved = _pop_all_blocks_parallel()
     try:
         with torch_device_fn.device(self.device):
-            with torch.npu.graph(
-                graph, stream=_capture_stream(_device_index(self.device))
-            ):
+            with _graph_context(graph, self.device):
                 launch()
     except Exception:
         logger.warning(
             "NPUGraph capture failed for rrelu_with_noise eval; "
-            "using direct launches"
+            "using direct launches",
+            exc_info=True,
         )
+        _GRAPH_FAILED.add(key)
         _restore_all_blocks_parallel(saved)
         return self
     _restore_all_blocks_parallel(saved)
@@ -523,7 +548,7 @@ def _graph_train(self, noise, lower, upper, generator, out):
         gen.set_offset(offset + ent.inc)
         return self
 
-    if len(_GRAPH_ENTRIES) >= _GRAPH_MAX_ENTRIES:
+    if key in _GRAPH_FAILED or len(_GRAPH_ENTRIES) >= _GRAPH_MAX_ENTRIES:
         return None
 
     # Defer capture until the configuration recurs; in particular this keeps
@@ -581,14 +606,16 @@ def _graph_train(self, noise, lower, upper, generator, out):
     captured = True
     try:
         with torch_device_fn.device(device):
-            with torch.npu.graph(graph, stream=_capture_stream(_device_index(device))):
+            with _graph_context(graph, device):
                 launch_main()
                 launch_advance()
     except Exception:
         logger.warning(
             "NPUGraph capture failed for rrelu_with_noise train; "
-            "using direct launches"
+            "using direct launches",
+            exc_info=True,
         )
+        _GRAPH_FAILED.add(key)
         captured = False
     finally:
         _restore_all_blocks_parallel(saved)
