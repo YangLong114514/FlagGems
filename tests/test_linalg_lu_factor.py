@@ -86,6 +86,31 @@ def _make_zero_pivot_input(shape, pos, device, dtype):
     return mat, zero_at
 
 
+def _assert_matches_aten_lu(res_lu, ref_lu, dtype, reduce_dim=1):
+    """Cross-check against the local ATen factor, when its answer is usable.
+
+    An exactly-zero pivot makes ATen's own value build-dependent rather than
+    contractual: for a non-pivoted LU PyTorch cleans the result with
+    ``nan_to_num_(x, 0, +inf, -inf)`` (``aten/src/ATen/native/cuda/linalg/
+    BatchLinearAlgebraLib.cpp``, a workaround for cuSOLVER returning NaN where
+    MAGMA returns 0), which maps a NaN pivot column to zeros but leaves a ``±inf``
+    one untouched.  Whether the degenerate entries come out NaN or inf is decided
+    by the platform's own solver -- cuSOLVER (nvidia) emits NaN, giving the zeros
+    FlagGems matches, while a solver that divides by the zero pivot emits ``±inf``
+    and keeps it (observed on iluvatar).
+
+    The whole tensor has to be dropped, not just the non-finite entries: the
+    ``±inf`` propagates through ATen's own rank-1 update (``inf - inf = NaN``,
+    which the same cleanup then turns into a 0), so ATen also ends up with
+    *finite but wrong* values past the zero pivot.  Measured on iluvatar, 6 of
+    the 9 entries disagreed while only the first row -- the one before any
+    update -- matched.  Masking by ``isfinite`` would still fail on those.
+    """
+    if not bool(torch.isfinite(ref_lu).all()):
+        return
+    utils.gems_assert_close(res_lu, ref_lu, dtype, reduce_dim=reduce_dim)
+
+
 def _swap_rows(lu, i, pivot_row):
     *batch_shape, m, n = lu.shape
     device = lu.device
@@ -361,7 +386,7 @@ def test_linalg_lu_factor_zero_pivot(shape, pos, dtype, pivot):
     if flag_gems.vendor_name != "ascend":
         # ATen's answer is bit-identical here: a diagonal matrix needs no
         # rounding in the elimination, so the comparison can be exact.
-        utils.gems_assert_close(res_lu, ref_lu, dtype)
+        _assert_matches_aten_lu(res_lu, ref_lu, dtype)
 
 
 @pytest.mark.linalg_lu_factor
@@ -388,8 +413,8 @@ def test_linalg_lu_factor_zero_pivot_no_pivot_dense(inp_cpu, dtype):
     rather than relying on it: an exactly-zero pivot yields zero multipliers and
     the rank-1 update still runs.  Reconstruction into the original matrix is
     intentionally not asserted -- as in ATen, dropping the multiplier loses that
-    column of the factor -- only the agreement with ATen and the absence of
-    NaN/Inf are.
+    column of the factor -- only the absence of NaN/Inf and, where ATen's own
+    answer is usable, the agreement with it (see ``_assert_matches_aten_lu``).
     """
     inp = torch.tensor(inp_cpu, dtype=dtype, device=flag_gems.device)
     ref_inp = utils.to_reference(inp)
@@ -406,4 +431,4 @@ def test_linalg_lu_factor_zero_pivot_no_pivot_dense(inp_cpu, dtype):
     assert (res_lu[..., 1:, 0] == 0).all()
 
     if flag_gems.vendor_name != "ascend":
-        utils.gems_assert_close(res_lu, ref_lu, dtype, reduce_dim=k)
+        _assert_matches_aten_lu(res_lu, ref_lu, dtype, reduce_dim=k)
