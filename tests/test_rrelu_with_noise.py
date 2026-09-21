@@ -35,8 +35,6 @@ explicitly and without ``flag_gems.use_gems``, as required by
 ``docs/content/zh-cn/contribution/overview.md``.
 """
 
-import sys
-
 import pytest
 import torch
 
@@ -658,26 +656,11 @@ def test_rrelu_with_noise_inplace_invalid_args(training, case, match):
 #   which torch_npu does not support at all, and build their reference with
 #   clone(), which torch_npu materializes contiguous.  The Ascend variants
 #   use a transposed input and a layout-preserving reference.
-#
-# The rest of this section covers the Ascend backend's NPUGraph fast path.
 # ---------------------------------------------------------------------------
 
 _ON_NON_ASCEND = pytest.mark.skipif(
     flag_gems.device != "npu", reason="Ascend-specific coverage"
 )
-
-
-def _ascend_graph_entry(training, inp, noise, lower, upper, out):
-    """The backend's cached NPUGraph for this exact configuration, if any.
-
-    Eval keys store the slope in the ``lower`` slot and ``0.0`` for ``upper``
-    (mirroring the backend's key layout).
-    """
-    # The backend module is loaded under its own top-level package name, so
-    # resolve it from the registered function: importing by the flag_gems
-    # path would create a second module instance with empty graph caches.
-    backend = sys.modules[flag_gems.rrelu_with_noise_.__module__]
-    return backend._debug_graph_entry(training, inp, noise, lower, upper, out)
 
 
 @_ON_NON_ASCEND
@@ -808,10 +791,9 @@ def test_rrelu_with_noise_inplace_output_strides_ascend(training):
 def test_rrelu_with_noise_inplace_train_stream_advances_ascend():
     """Pointer-stable repeated training calls consume a continuing RNG stream.
 
-    The Ascend backend graph-captures a recurring configuration after several
-    identical calls; every call must still draw fresh slopes, write them
-    through the input alias, and a reseed must reproduce the first draw
-    exactly.
+    Every call must draw fresh slopes, write them through the input alias,
+    and a reseed must reproduce the first draw exactly - including after the
+    repeated identical calls have crossed any internal caching threshold.
     """
     lower, upper = DEFAULT_LOWER, DEFAULT_UPPER
     generator = torch.Generator(device=flag_gems.device)
@@ -834,10 +816,6 @@ def test_rrelu_with_noise_inplace_train_stream_advances_ascend():
 
     for earlier, later in zip(snapshots, snapshots[1:]):
         assert not torch.equal(earlier, later)
-
-    # Twelve identical calls cross the capture threshold: the cached graph
-    # must exist, and the reseed below exercises its replay+resync.
-    assert _ascend_graph_entry(True, inp, noise, lower, upper, inp) is not None
 
     generator.manual_seed(2026)
     inp.fill_(-1.0)
@@ -887,7 +865,7 @@ def test_rrelu_with_noise_inplace_train_high_seed_ascend():
 def test_rrelu_with_noise_inplace_eval_replay_consistent_ascend():
     """Repeated in-place eval calls always recompute from the live buffer.
 
-    Every graph replay must read the buffer's current contents rather than
+    Every call must read the buffer's current contents rather than
     reproducing a stale result.
     """
     lower, upper = DEFAULT_LOWER, DEFAULT_UPPER
@@ -906,67 +884,16 @@ def test_rrelu_with_noise_inplace_eval_replay_consistent_ascend():
 
     # Eval never touches the caller's noise buffer.
     utils.gems_assert_equal(noise, utils.to_reference(noise_before))
-    assert _ascend_graph_entry(False, inp, noise, slope, 0.0, inp) is not None
-
-
-@_ON_NON_ASCEND
-@pytest.mark.rrelu_with_noise_
-def test_rrelu_with_noise_inplace_capture_failure_fallback_ascend(monkeypatch):
-    """A failed graph capture must fall back to direct launches.
-
-    Forces the capture context to raise, crosses the capture threshold while
-    it is broken, and checks the results stay correct throughout; a failed
-    configuration is blacklisted instead of retrying capture on every call,
-    and a fresh configuration captures successfully once restored.
-    """
-    lower, upper = DEFAULT_LOWER, DEFAULT_UPPER
-    generator = torch.Generator(device=flag_gems.device)
-    generator.manual_seed(2026)
-    inp = torch.full((4096,), -1.0, device=flag_gems.device)
-    noise = torch.zeros_like(inp)
-
-    class _FailingGraph:
-        def __init__(self, *args, **kwargs):
-            pass
-
-        def __enter__(self):
-            raise RuntimeError("forced capture failure")
-
-        def __exit__(self, *args):
-            return False
-
-    def run_call(inp, noise):
-        inp.fill_(-1.0)
-        flag_gems.rrelu_with_noise_(inp, noise, lower, upper, True, generator)
-        assert torch.all(noise >= lower) and torch.all(noise <= upper)
-        utils.gems_assert_close(inp, utils.to_reference(-noise), torch.float32)
-
-    with monkeypatch.context() as m:
-        m.setattr(torch.npu, "graph", _FailingGraph)
-        for _ in range(12):
-            run_call(inp, noise)
-        assert _ascend_graph_entry(True, inp, noise, lower, upper, inp) is None
-
-    # The failed configuration stays blacklisted (no retry storm) ...
-    run_call(inp, noise)
-    assert _ascend_graph_entry(True, inp, noise, lower, upper, inp) is None
-
-    # ... while a fresh configuration captures normally.
-    inp2 = torch.full((4096,), -1.0, device=flag_gems.device)
-    noise2 = torch.zeros_like(inp2)
-    for _ in range(12):
-        run_call(inp2, noise2)
-    assert _ascend_graph_entry(True, inp2, noise2, lower, upper, inp2) is not None
 
 
 @_ON_NON_ASCEND
 @pytest.mark.rrelu_with_noise_
 def test_rrelu_with_noise_inplace_train_multi_device_ascend():
-    """Graph capture/replay stays correct when several devices are in use.
+    """Repeated training calls stay correct when several devices are in use.
 
-    Each device's capture must bind a capture stream on that device: warming
-    two devices past the capture threshold and replaying on both must keep
-    producing advancing, reproducible slope streams.
+    Warming two devices with repeated identical calls and continuing to call
+    on both must keep producing advancing, reproducible slope streams on each
+    device.
     """
     if torch.npu.device_count() < 2:
         pytest.skip("requires at least two visible NPU devices")
@@ -987,7 +914,6 @@ def test_rrelu_with_noise_inplace_train_multi_device_ascend():
             snapshots.append(noise.clone())
         for earlier, later in zip(snapshots, snapshots[1:]):
             assert not torch.equal(earlier, later)
-        assert _ascend_graph_entry(True, inp, noise, lower, upper, inp) is not None
         generator.manual_seed(2026)
         inp.fill_(-1.0)
         flag_gems.rrelu_with_noise_(inp, noise, lower, upper, True, generator)

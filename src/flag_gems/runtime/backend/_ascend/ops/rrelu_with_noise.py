@@ -450,11 +450,6 @@ def _graph_context(graph, device):
 _GRAPH_FAILED = set()
 
 
-def _debug_graph_entry(training, self, noise, lower, upper, out):
-    # Test-facing probe: the cached graph for this exact configuration, if any.
-    return _GRAPH_ENTRIES.get(_graph_key(training, self, noise, lower, upper, out))
-
-
 def _replay(ent, device):
     # Replay queues the captured kernels on the current stream, so it must run
     # under the graph's own device context; guard only when it differs.
