@@ -30,6 +30,13 @@ from flag_gems.ops.rrelu_with_noise import (
 from flag_gems.runtime import torch_device_fn
 from flag_gems.runtime.backend._ascend import heuristics_config_utils as _hcu
 
+try:
+    # Direct C bindings, skipping the backend_register/python wrapper chain
+    # (~6 us per query through the driver shim vs ~1 us direct).
+    from torch_npu._C import _npu_getCurrentRawStream as _raw_stream
+except ImportError:  # pragma: no cover - torch_npu always ships it
+    _raw_stream = None
+
 logger = logging.getLogger(__name__)
 
 DEFAULT_LOWER = 0.125
@@ -203,18 +210,23 @@ def rrelu_with_noise_eval_kernel(
     slope,
     BLOCK: tl.constexpr,
     WIDE: tl.constexpr,
+    UNROLL: tl.constexpr,
 ):
     pid = tl.program_id(0)
-    if WIDE:
-        off = pid.to(tl.int64) * BLOCK + tl.arange(0, BLOCK)
-    else:
-        off = pid * BLOCK + tl.arange(0, BLOCK)
-    mask = off < N
-    # Compute in the element dtype: the upcast path is measurably slower for
-    # 2-byte dtypes, and the fp16/bf16 rounding matches torch_npu.
-    x = tl.load(x_ptr + off, mask=mask, other=0.0)
-    y = tl.where(x > 0.0, x, x * slope.to(out_ptr.dtype.element_ty))
-    tl.store(out_ptr + off, y, mask=mask)
+    # Several tiles per program: on this backend every program pays a fixed
+    # setup cost that dominates small tiles, so unrolling roughly doubles
+    # large-shape bandwidth (16M fp16: 74 -> 40 us; fp32: 148 -> 96 us).
+    for i in tl.static_range(UNROLL):
+        if WIDE:
+            off = pid.to(tl.int64) * (BLOCK * UNROLL) + i * BLOCK + tl.arange(0, BLOCK)
+        else:
+            off = pid * (BLOCK * UNROLL) + i * BLOCK + tl.arange(0, BLOCK)
+        mask = off < N
+        # Compute in the element dtype: the upcast path is measurably slower
+        # for 2-byte dtypes, and the fp16/bf16 rounding matches torch_npu.
+        x = tl.load(x_ptr + off, mask=mask, other=0.0)
+        y = tl.where(x > 0.0, x, x * slope.to(out_ptr.dtype.element_ty))
+        tl.store(out_ptr + off, y, mask=mask)
 
 
 # Direct CompiledKernel launches bypass JITFunction.run, whose per-call
@@ -288,8 +300,13 @@ def _fast_launch(kernel, grid, key_extra, device, *args, **kwargs):
     launch_args = args + suffix
     saved = _pop_all_blocks_parallel()
     try:
-        if _DRV.get_current_device() == dev_idx:
-            stream = _DRV.get_current_stream(dev_idx)
+        # torch.npu.current_device() is a thin wrapper over the C binding and
+        # ~10x cheaper than the driver shim's get_current_device chain.
+        if torch.npu.current_device() == dev_idx:
+            if _raw_stream is not None:
+                stream = _raw_stream(dev_idx)
+            else:
+                stream = _DRV.get_current_stream(dev_idx)
             lm = launch_metadata(grid, stream, *launch_args)
             run(grid[0], 1, 1, stream, function, md, lm, None, None, *launch_args)
         else:
@@ -304,21 +321,25 @@ def _fast_launch(kernel, grid, key_extra, device, *args, **kwargs):
 def _heur(name, N, dtype=None):
     cfg = _hcu.HEURISTICS_CONFIGS[name]
     args = {"N": N, "dtype": dtype}
-    return cfg["BLOCK"](args), cfg["num_warps"](args)
+    return {key: fn(args) for key, fn in cfg.items()}
 
 
 # ---------------------------------------------------------------------------
 # NPUGraph path for small tensors.
 #
-# Below _GRAPH_MAX_NUMEL elements the fixed per-call overhead (arg checking,
-# generator bookkeeping, kernel launch) dwarfs the kernel time, so small
-# in-place calls are replayed from a captured graph instead: pointer-stable
-# callers (training loops, benchmarks) then pay only a graph replay (~10 us).
-# Out-of-place calls are excluded: replaying into a static output buffer and
-# cloning it costs more than launching the kernel into a fresh output.
+# Below _GRAPH_MAX_NUMEL (training) / _GRAPH_MAX_NUMEL_EVAL elements the fixed
+# per-call overhead (arg checking, generator bookkeeping, kernel launch)
+# dwarfs the kernel time, so in-place calls are replayed from a captured graph
+# instead: pointer-stable callers (training loops, benchmarks) then pay only a
+# graph replay (~10 us).  Eval graphs pay off up to much larger sizes: replay
+# keeps the launch queue fed so the measured latency approaches the pure
+# kernel time.  Out-of-place calls are excluded: replaying into a static
+# output buffer and cloning it costs more than launching the kernel into a
+# fresh output.
 # Same capture pattern as linalg_matrix_rank.
 # ---------------------------------------------------------------------------
 _GRAPH_MAX_NUMEL = 1 << 20
+_GRAPH_MAX_NUMEL_EVAL = 1 << 24
 _GRAPH_MAX_ENTRIES = 64
 _GRAPH_ENTRIES = {}
 _GRAPH_LOCK = threading.Lock()
@@ -359,7 +380,7 @@ def _debug_graph_entry(training, self, noise, lower, upper, out):
 def _replay(ent, device):
     # Replay queues the captured kernels on the current stream, so it must run
     # under the graph's own device context; guard only when it differs.
-    if torch_device_fn.current_device() == _device_index(device):
+    if torch.npu.current_device() == _device_index(device):
         ent.graph.replay()
     else:
         with torch_device_fn.device(device):
@@ -410,8 +431,9 @@ def _graph_eval(self, noise, slope, out):
     if seen < _GRAPH_CAPTURE_AFTER:
         return None
     N = self.numel()
-    BLOCK, num_warps = _heur("rrelu_with_noise_eval", N, self.dtype)
-    grid = (triton.cdiv(N, BLOCK),)
+    heur = _heur("rrelu_with_noise_eval", N, self.dtype)
+    BLOCK = heur["BLOCK"]
+    grid = (triton.cdiv(N, BLOCK * heur["UNROLL"]),)
 
     def launch():
         _fast_launch(
@@ -425,7 +447,8 @@ def _graph_eval(self, noise, slope, out):
             float(slope),
             BLOCK=BLOCK,
             WIDE=False,
-            num_warps=num_warps,
+            UNROLL=heur["UNROLL"],
+            num_warps=heur["num_warps"],
         )
 
     launch()  # compiles (illegal during capture) and computes the first result
@@ -518,7 +541,9 @@ def _graph_train(self, noise, lower, upper, generator, out):
 
     so = torch.empty(2, dtype=torch.int64, device=device)
     so.copy_(torch.tensor([_u64_as_i64(seed), offset], dtype=torch.int64))
-    BLOCK, num_warps = _heur("rrelu_with_noise_train", N)
+    heur = _heur("rrelu_with_noise_train", N)
+    BLOCK = heur["BLOCK"]
+    num_warps = heur["num_warps"]
     grid = (triton.cdiv(N, BLOCK),)
 
     def launch_main():
@@ -585,7 +610,10 @@ def _try_graph(self, noise, lower, upper, training, generator, out):
     # while an out-of-place replay must additionally clone the static output
     # buffer (~50 us), which is slower than launching the kernel directly
     # into a fresh output tensor.
-    if out is None or self.numel() > _GRAPH_MAX_NUMEL:
+    if out is None:
+        return None
+    limit = _GRAPH_MAX_NUMEL if training else _GRAPH_MAX_NUMEL_EVAL
+    if self.numel() > limit:
         return None
     with _GRAPH_LOCK:
         if training:
@@ -604,8 +632,8 @@ def _fused_rrelu_with_noise_train(self, noise, out, lower, upper, generator):
     key, off_lo = _rng_key(seed, offset)
 
     wide = N > _WIDE_NUMEL_THRESHOLD
-    BLOCK, num_warps = _heur("rrelu_with_noise_train", N)
-    grid = (triton.cdiv(N, BLOCK),)
+    heur = _heur("rrelu_with_noise_train", N)
+    grid = (triton.cdiv(N, heur["BLOCK"]),)
     _fast_launch(
         fused_rrelu_with_noise_train_kernel,
         grid,
@@ -619,9 +647,9 @@ def _fused_rrelu_with_noise_train(self, noise, out, lower, upper, generator):
         span,
         key,
         off_lo,
-        BLOCK=BLOCK,
+        BLOCK=heur["BLOCK"],
         WIDE=wide,
-        num_warps=num_warps,
+        num_warps=heur["num_warps"],
     )
     return out
 
@@ -629,8 +657,9 @@ def _fused_rrelu_with_noise_train(self, noise, out, lower, upper, generator):
 def _rrelu_with_noise_eval_ascend(self, out, slope):
     N = self.numel()
     wide = N > _WIDE_NUMEL_THRESHOLD
-    BLOCK, num_warps = _heur("rrelu_with_noise_eval", N, self.dtype)
-    grid = (triton.cdiv(N, BLOCK),)
+    heur = _heur("rrelu_with_noise_eval", N, self.dtype)
+    BLOCK = heur["BLOCK"]
+    grid = (triton.cdiv(N, BLOCK * heur["UNROLL"]),)
     _fast_launch(
         rrelu_with_noise_eval_kernel,
         grid,
@@ -642,7 +671,8 @@ def _rrelu_with_noise_eval_ascend(self, out, slope):
         float(slope),
         BLOCK=BLOCK,
         WIDE=wide,
-        num_warps=num_warps,
+        UNROLL=heur["UNROLL"],
+        num_warps=heur["num_warps"],
     )
     return out
 

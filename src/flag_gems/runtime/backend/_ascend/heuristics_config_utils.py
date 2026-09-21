@@ -12,7 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import torch
 import triton
 
 
@@ -60,12 +59,25 @@ def rrelu_with_noise_eval_heur_block(args):
         return 512
     elif args["N"] <= 4096:
         return 1024
-    # 8192-element tiles for 2-byte dtypes (1826 GB/s measured); fp32 at 8192
-    # overflows the 192 KB UB for this kernel, so it stays at 4096.
-    elif args["dtype"] in (torch.float16, torch.bfloat16):
-        return 8192
-    else:
+    elif args["N"] < (1 << 20):
         return 4096
+    else:
+        # 8192-element tiles pipeline GM<->UB transfers best for every dtype
+        # (in+out tiles still fit the 192 KB UB for fp32).
+        return 8192
+
+
+def rrelu_with_noise_eval_heur_unroll(args):
+    # Tiles per program; every program pays a fixed setup cost on this
+    # backend, so larger inputs benefit from fewer, fatter programs.
+    if args["N"] <= 4096:
+        return 1
+    elif args["N"] < (1 << 20):
+        return 2
+    elif args["N"] < (1 << 22):
+        return 4
+    else:
+        return 8
 
 
 def rrelu_with_noise_heur_num_warps(args):
@@ -359,6 +371,7 @@ HEURISTICS_CONFIGS = {
     "rrelu_with_noise_eval": {
         "BLOCK": rrelu_with_noise_eval_heur_block,
         "num_warps": rrelu_with_noise_heur_num_warps,
+        "UNROLL": rrelu_with_noise_eval_heur_unroll,
     },
     "softmax_non_inner": {
         "TILE_K": softmax_heur_tile_k,
