@@ -381,21 +381,29 @@ def test_linalg_lu_factor_ex_zero_pivot(shape, pos, dtype, pivot):
     inp, zero_at = _make_zero_pivot_input(shape, pos, flag_gems.device, dtype)
     ref_inp = utils.to_reference(inp)
 
-    if flag_gems.vendor_name != "ascend":
+    # Only ``pivot=True``: ATen's ``pivot=False`` branch is the one that cleans up
+    # a result its own solver already contaminated, and on iluvatar the damage
+    # reached everything -- see the note on the cross-checks below.
+    if flag_gems.vendor_name != "ascend" and pivot:
         ref_out = torch.linalg.lu_factor_ex(ref_inp, pivot=pivot, check_errors=False)
 
     res_out = flag_gems.linalg_lu_factor_ex(inp, pivot=pivot, check_errors=False)
 
     # The regression: no NaN anywhere, so the factor past the zero pivot is
-    # intact and the diagonal scan sees the real zero pivot.
+    # intact and the diagonal scan sees the real zero pivot.  ``info`` is pinned
+    # to the value the input implies, which is what this test is about -- no
+    # reference needed, and stronger than agreeing with one.
     assert not torch.isnan(res_out.LU).any(), "zero pivot contaminated the factor"
     assert not torch.isinf(res_out.LU).any()
     assert (res_out.info == zero_at + 1).all()
 
-    if flag_gems.vendor_name != "ascend":
-        # ``info``/``pivots`` come straight out of getrf, so they are unaffected
-        # by the degenerate-value cleanup described in ``_assert_matches_aten_lu``
-        # and stay a real cross-check on every platform.
+    if flag_gems.vendor_name != "ascend" and pivot:
+        # ``pivot=False`` is excluded from all three cross-checks, ``info``
+        # included: on iluvatar ATen reported ``info == 0`` for a zero pivot in
+        # the last position -- where the factor plainly holds one, and numbers
+        # 128 here -- while the same call on nvidia reports 128.  ``getrf``'s
+        # info is no more portable than its values once a degenerate pivot is in
+        # play, so the absolute assertion above is the reference.
         utils.gems_assert_equal(res_out.info, ref_out.info)
         utils.gems_assert_equal(res_out.pivots, ref_out.pivots)
         _assert_matches_aten_lu(res_out.LU, ref_out.LU, dtype)

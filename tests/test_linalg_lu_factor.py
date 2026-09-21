@@ -378,17 +378,23 @@ def test_linalg_lu_factor_zero_pivot(shape, pos, dtype, pivot):
     kernels scaled the sub-diagonal column with ``col_vals / pivot`` inside a
     ``tl.where``, so an exactly-zero pivot produced ``0/0 = NaN`` in every lane
     and the following rank-1 update turned the entire trailing submatrix (and
-    every later panel, through the L21 @ U12 update) into NaN.  ATen instead
-    zeroes the multipliers, keeps the rest of the factor finite, and reports the
-    zero pivot through ``info``.
+    every later panel, through the L21 @ U12 update) into NaN.
+
+    The factor must instead stay finite, keep the zero pivot exactly where the
+    input put it, leave the entries past it intact, and reconstruct the input.
+    Those are checked against ``ref_inp`` rather than against ATen, because ATen's
+    own ``pivot=False`` answer is not a usable reference for a degenerate pivot
+    (see the note on the cross-check at the end of this test).
     """
     inp, zero_at = _make_zero_pivot_input(shape, pos, flag_gems.device, dtype)
     ref_inp = utils.to_reference(inp)
     k = min(shape[-2], shape[-1])
 
     # ``torch.linalg.lu_factor`` raises on a singular factor, so ATen's
-    # factorization is read through ``lu_factor_ex``.
-    if flag_gems.vendor_name != "ascend":
+    # factorization is read through ``lu_factor_ex`` -- and only for
+    # ``pivot=True``, the branch whose ATen path stays uncontaminated (see the
+    # cross-check at the end of this test).
+    if flag_gems.vendor_name != "ascend" and pivot:
         ref_lu = torch.linalg.lu_factor_ex(ref_inp, pivot=pivot, check_errors=False).LU
 
     res_lu, res_pivots = flag_gems.linalg_lu_factor(inp, pivot=pivot)
@@ -419,9 +425,21 @@ def test_linalg_lu_factor_zero_pivot(shape, pos, dtype, pivot):
     # mode it returns ``inp`` unchanged, so this is the same tensor.
     utils.gems_assert_close(reconstructed, ref_inp, dtype, reduce_dim=k)
 
-    if flag_gems.vendor_name != "ascend":
-        # ATen's answer is bit-identical here: a diagonal matrix needs no
-        # rounding in the elimination, so the comparison can be exact.
+    if flag_gems.vendor_name != "ascend" and pivot:
+        # Bit-identical for ``pivot=True``: a diagonal matrix needs no rounding
+        # in the elimination, so the comparison can be exact.
+        #
+        # ``pivot=False`` is excluded because ATen's answer is not a reference
+        # there.  It is the branch where PyTorch runs ``nan_to_num_`` over the
+        # result, and a solver that hands ``inf``/``NaN`` back for the degenerate
+        # column feeds that straight into its own rank-1 update: measured on
+        # iluvatar, ``ref`` came back with the entire trailing diagonal zeroed --
+        # 63 of the 128 entries, ``ref[127, 127] == 0`` where the factor holds 129
+        # -- so it is finite but *corrupted*, not merely a different convention,
+        # and no "skip if non-finite" guard can separate it from a real answer.
+        # The checks above already pin ``pivot=False`` down without ATen: finite,
+        # zero pivot in place, entries past it intact, and the reconstruction
+        # reproducing ``ref_inp``.
         _assert_matches_aten_lu(res_lu, ref_lu, dtype)
 
 
