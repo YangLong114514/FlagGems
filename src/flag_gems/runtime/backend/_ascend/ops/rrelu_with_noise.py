@@ -748,4 +748,3 @@ def rrelu_with_noise_(
     logger.debug("GEMS_ASCEND RRELU_WITH_NOISE_")
     _rrelu_with_noise_ascend_impl(self, noise, lower, upper, training, generator, self)
     return self
-
