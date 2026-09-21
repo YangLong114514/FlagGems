@@ -749,5 +749,3 @@ def rrelu_with_noise_(
     _rrelu_with_noise_ascend_impl(self, noise, lower, upper, training, generator, self)
     return self
 
-
-__all__ = ["rrelu_with_noise", "rrelu_with_noise_"]
