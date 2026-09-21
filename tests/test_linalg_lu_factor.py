@@ -61,6 +61,31 @@ def _make_input(shape, pivot, device, dtype):
 LinalgLUFactorResult = namedtuple("LinalgLUFactorResult", ["LU", "pivots"])
 
 
+def _make_zero_pivot_input(shape, pos, device, dtype):
+    """Diagonal matrix with an exactly-zero entry at ``pos`` along the diagonal.
+
+    A zero pivot at the *last* elimination step has no trailing submatrix, so it
+    is harmless.  At the first or a middle position the sub-diagonal column used
+    to be scaled by that zero pivot, and since ``tl.where`` evaluates both of its
+    branches, the kernel computed ``0/0 = NaN`` there; the rank-1 update then
+    spread it across the whole trailing submatrix (``NaN * 0 = NaN``), leaving
+    every column past the zero pivot -- and every later panel -- NaN.
+
+    A diagonal matrix is the cheapest way to place the zero pivot exactly: the
+    pivot search picks the diagonal entry itself, since the rest of the column is
+    zero.
+    """
+    k = min(shape[-2], shape[-1])
+    zero_at = {"first": 0, "middle": k // 2, "last": k - 1}[pos]
+
+    diag = torch.arange(1, k + 1, dtype=dtype, device=device) + 1.0
+    diag[zero_at] = 0.0
+    mat = torch.zeros(shape, dtype=dtype, device=device)
+    idx = torch.arange(k, device=device)
+    mat[..., idx, idx] = diag
+    return mat, zero_at
+
+
 def _swap_rows(lu, i, pivot_row):
     *batch_shape, m, n = lu.shape
     device = lu.device
@@ -280,3 +305,109 @@ def test_linalg_lu_factor_out(shape, dtype, pivot):
         reconstructed = res_l @ res_u
         ref_reconstructed = ref_l @ ref_u
     utils.gems_assert_close(reconstructed, ref_reconstructed, dtype, reduce_dim=k)
+
+
+@pytest.mark.linalg_lu_factor
+@pytest.mark.parametrize("shape", [(8, 8), (64, 32), (128, 128)])
+@pytest.mark.parametrize("pos", ["first", "middle", "last"])
+@pytest.mark.parametrize("dtype", _TEST_DTYPES)
+@pytest.mark.parametrize("pivot", _PIVOT_VALUES)
+def test_linalg_lu_factor_zero_pivot(shape, pos, dtype, pivot):
+    """A zero pivot must not contaminate the part of the factor past itself.
+
+    Regression test for the exact-zero-pivot divide: the panel/single-tile
+    kernels scaled the sub-diagonal column with ``col_vals / pivot`` inside a
+    ``tl.where``, so an exactly-zero pivot produced ``0/0 = NaN`` in every lane
+    and the following rank-1 update turned the entire trailing submatrix (and
+    every later panel, through the L21 @ U12 update) into NaN.  ATen instead
+    zeroes the multipliers, keeps the rest of the factor finite, and reports the
+    zero pivot through ``info``.
+    """
+    inp, zero_at = _make_zero_pivot_input(shape, pos, flag_gems.device, dtype)
+    ref_inp = utils.to_reference(inp)
+    k = min(shape[-2], shape[-1])
+
+    # ``torch.linalg.lu_factor`` raises on a singular factor, so ATen's
+    # factorization is read through ``lu_factor_ex``.
+    if flag_gems.vendor_name != "ascend":
+        ref_lu = torch.linalg.lu_factor_ex(ref_inp, pivot=pivot, check_errors=False).LU
+
+    with flag_gems.use_gems():
+        res_lu, res_pivots = torch.linalg.lu_factor(inp, pivot=pivot)
+
+    # The regression itself: nothing past the zero pivot may be NaN/Inf.
+    assert not torch.isnan(res_lu).any(), "zero pivot contaminated the factor"
+    assert not torch.isinf(res_lu).any()
+
+    # The zero pivot stays where the input put it, and the columns after it are
+    # intact -- the input reconstruction below fails loudly if they are not.
+    diag_idx = torch.arange(k, device=res_lu.device)
+    assert (res_lu[..., diag_idx, diag_idx][..., zero_at] == 0).all()
+    if zero_at + 1 < k:
+        assert (
+            res_lu[..., diag_idx[zero_at + 1 :], diag_idx[zero_at + 1 :]] != 0
+        ).any(), "entries past the zero pivot were wiped out"
+
+    torch.backends.cuda.matmul.allow_tf32 = False
+    if pivot:
+        res_p, res_l, res_u = torch.lu_unpack(res_lu, res_pivots)
+        reconstructed = res_p @ res_l @ res_u
+    else:
+        res_l, res_u = _unpack_lu_no_pivot(res_lu)
+        reconstructed = res_l @ res_u
+    # Compare against ``ref_inp``, not ``inp``: under ``--ref cpu`` the reference
+    # must already live on the CPU (``accuracy_utils.to_cpu`` asserts it), and
+    # ``to_reference`` is what moves it there.  In the default device-reference
+    # mode it returns ``inp`` unchanged, so this is the same tensor.
+    utils.gems_assert_close(reconstructed, ref_inp, dtype, reduce_dim=k)
+
+    if flag_gems.vendor_name != "ascend":
+        # ATen's answer is bit-identical here: a diagonal matrix needs no
+        # rounding in the elimination, so the comparison can be exact.
+        utils.gems_assert_close(res_lu, ref_lu, dtype)
+
+
+@pytest.mark.linalg_lu_factor
+@pytest.mark.skipif(
+    utils.TO_CPU,
+    reason="linalg.lu_factor: LU without pivoting is not implemented on the CPU",
+)
+@pytest.mark.parametrize(
+    "inp_cpu",
+    [
+        # Zero pivot at (0, 0) with a non-zero column below it, so the two
+        # candidate conventions differ: the multipliers must become 0 (ATen),
+        # not Inf/NaN and not "leave the column alone".
+        [[0.0, 1.0, 1.0], [2.0, 3.0, 4.0], [5.0, 6.0, 7.0]],
+        [[0.0, -2.0, 0.5], [1.0, 4.0, -3.0], [-6.0, 0.25, 2.0]],
+    ],
+)
+@pytest.mark.parametrize("dtype", _TEST_DTYPES)
+def test_linalg_lu_factor_zero_pivot_no_pivot_dense(inp_cpu, dtype):
+    """``pivot=False`` with an exactly-zero pivot: multipliers become zero.
+
+    With ``pivot=False`` the column below a zero pivot is *not* necessarily zero
+    (partial pivoting is what guarantees that), so this pins the convention
+    rather than relying on it: an exactly-zero pivot yields zero multipliers and
+    the rank-1 update still runs.  Reconstruction into the original matrix is
+    intentionally not asserted -- as in ATen, dropping the multiplier loses that
+    column of the factor -- only the agreement with ATen and the absence of
+    NaN/Inf are.
+    """
+    inp = torch.tensor(inp_cpu, dtype=dtype, device=flag_gems.device)
+    ref_inp = utils.to_reference(inp)
+    k = min(inp.shape[-2], inp.shape[-1])
+
+    if flag_gems.vendor_name != "ascend":
+        ref_lu = torch.linalg.lu_factor_ex(ref_inp, pivot=False, check_errors=False).LU
+
+    with flag_gems.use_gems():
+        res_lu, _ = torch.linalg.lu_factor(inp, pivot=False)
+
+    assert not torch.isnan(res_lu).any(), "zero pivot produced NaN multipliers"
+    assert not torch.isinf(res_lu).any()
+    # Multipliers below the zero pivot are zeroed, not left unscaled.
+    assert (res_lu[..., 1:, 0] == 0).all()
+
+    if flag_gems.vendor_name != "ascend":
+        utils.gems_assert_close(res_lu, ref_lu, dtype, reduce_dim=k)

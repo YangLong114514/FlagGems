@@ -89,6 +89,26 @@ def _make_singular_input(shape, device, dtype):
     return A
 
 
+def _make_zero_pivot_input(shape, pos, device, dtype):
+    """Diagonal matrix with an exactly-zero entry at ``pos`` along the diagonal.
+
+    ``_make_singular_input`` above only ever places the zero pivot at the *last*
+    elimination step, where nothing trails it -- which is why the NaN that the
+    first/middle positions used to produce went unnoticed.  Here the zero is
+    placed exactly, and the trailing submatrix is deliberately non-empty so the
+    contamination has somewhere to spread.
+    """
+    k = min(shape[-2], shape[-1])
+    zero_at = {"first": 0, "middle": k // 2, "last": k - 1}[pos]
+
+    diag = torch.arange(1, k + 1, dtype=dtype, device=device) + 1.0
+    diag[zero_at] = 0.0
+    mat = torch.zeros(shape, dtype=dtype, device=device)
+    idx = torch.arange(k, device=device)
+    mat[..., idx, idx] = diag
+    return mat, zero_at
+
+
 # ---------------------------------------------------------------------------
 # Manual Python reference implementation for Ascend
 # (matches the pattern in test_linalg_lu_factor.py)
@@ -315,6 +335,43 @@ def test_linalg_lu_factor_ex_singular(shape, dtype):
 
     # The last diagonal element should be zero, so info should indicate the position
     utils.gems_assert_equal(res_out.info, ref_out.info)
+
+
+@pytest.mark.linalg_lu_factor_ex
+@pytest.mark.parametrize("shape", [(8, 8), (64, 32), (128, 128)])
+@pytest.mark.parametrize("pos", ["first", "middle", "last"])
+@pytest.mark.parametrize("dtype", _TEST_DTYPES)
+@pytest.mark.parametrize("pivot", _PIVOT_VALUES)
+def test_linalg_lu_factor_ex_zero_pivot(shape, pos, dtype, pivot):
+    """A zero pivot before the last step must still yield the right ``info``.
+
+    Regression test: an exactly-zero pivot made the kernels compute
+    ``0/0 = NaN`` for the sub-diagonal column (``tl.where`` evaluates both
+    branches), and the rank-1 update spread it over the whole trailing
+    submatrix.  Two things broke at once -- the factor became NaN, and since
+    the blocked path derives ``info`` by scanning the diagonal of the finished
+    factor, the reported position became the position of the first NaN instead
+    of the zero pivot (ATen reported 3 and 61 where gems reported 1).
+    """
+    inp, zero_at = _make_zero_pivot_input(shape, pos, flag_gems.device, dtype)
+    ref_inp = utils.to_reference(inp)
+
+    if flag_gems.vendor_name != "ascend":
+        ref_out = torch.linalg.lu_factor_ex(ref_inp, pivot=pivot, check_errors=False)
+
+    with flag_gems.use_gems():
+        res_out = torch.linalg.lu_factor_ex(inp, pivot=pivot, check_errors=False)
+
+    # The regression: no NaN anywhere, so the factor past the zero pivot is
+    # intact and the diagonal scan sees the real zero pivot.
+    assert not torch.isnan(res_out.LU).any(), "zero pivot contaminated the factor"
+    assert not torch.isinf(res_out.LU).any()
+    assert (res_out.info == zero_at + 1).all()
+
+    if flag_gems.vendor_name != "ascend":
+        utils.gems_assert_equal(res_out.info, ref_out.info)
+        utils.gems_assert_equal(res_out.pivots, ref_out.pivots)
+        utils.gems_assert_close(res_out.LU, ref_out.LU, dtype)
 
 
 @pytest.mark.linalg_lu_factor_ex

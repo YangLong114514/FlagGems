@@ -235,3 +235,36 @@ def test_invalid_shape_rejected(shape):
     )
     with pytest.raises(RuntimeError):
         torch.ops.aten.linalg_matrix_power(A, 2)
+
+
+@pytest.mark.linalg_matrix_power
+@pytest.mark.parametrize("n, zero_at", [(128, 0), (128, 2), (128, 96), (32, 1)])
+@pytest.mark.parametrize("dtype", [torch.float32])
+def test_negative_exponent_singular_raises(n, zero_at, dtype):
+    """A singular input must be reported as singular, not inverted into inf/NaN.
+
+    Regression test for two coupled defects, both only observable through the
+    blocked/parallel LU path (n > _LU_FACTOR_MAX):
+
+    * the panel kernels divided the sub-diagonal column by an exactly-zero pivot
+      (``0/0 = NaN``), which the rank-1 update spread over the whole trailing
+      submatrix; and
+    * ``_lu_panel_par`` is launched once per panel and *stored* its ``info``
+      unconditionally, so a later panel -- which has no zero pivot of its own --
+      overwrote the singular report with 0.
+
+    The NaN factor used to make the second defect invisible: every panel after
+    the singular one saw NaN pivots and reported an error by accident, with a
+    meaningless position.  With the division guarded, ``info`` must carry the
+    real position and the inverse must refuse the matrix.
+    """
+    diag = torch.arange(1, n + 1, dtype=dtype, device=flag_gems.device) + 1.0
+    diag[zero_at] = 0.0
+    A = torch.diag(diag)
+
+    # Call the gems op directly: under plain ``torch.linalg.matrix_power`` the
+    # ATen fallback would raise its own ``_LinAlgError`` (also a RuntimeError,
+    # message also matching "singular") and the assertion would pass without
+    # ever touching the kernel under test.
+    with pytest.raises(RuntimeError, match="singular"):
+        flag_gems.linalg_matrix_power(A, -1)
