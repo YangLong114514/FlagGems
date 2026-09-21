@@ -562,9 +562,11 @@ def _replay_beats_launch(graph, launch):
     """Keep the graph only when replay actually beats a direct launch.
 
     Measured once per configuration at capture time: some torch_npu builds
-    replay slowly enough that the graph is a net loss.  The first replay pays
-    graph instantiation, and single timings are noisy, so warm up first and
-    average a few rounds.  The replays re-apply the (in-place) kernel, so
+    replay slowly enough that the graph is a net loss (on one CANN 9.0 host a
+    single-kernel replay costs ~50 us, on par with a direct launch, and
+    back-to-back replays then run *slower* than launches).  The first replay
+    pays graph instantiation, and single timings are noisy, so warm up first
+    and average a few rounds.  The replays re-apply the (in-place) kernel, so
     callers snapshot the buffers beforehand and restore them afterwards.
     """
     torch.npu.synchronize()
@@ -580,7 +582,7 @@ def _replay_beats_launch(graph, launch):
         graph.replay()
     torch.npu.synchronize()
     replay_s = (time.perf_counter() - t0) / 5
-    if replay_s <= direct_s * 1.5:
+    if replay_s <= direct_s * 1.1:
         return True
     logger.warning(
         "NPUGraph replay is slower than a direct launch for rrelu_with_noise "
