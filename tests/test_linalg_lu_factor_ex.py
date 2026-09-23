@@ -416,9 +416,8 @@ def test_linalg_lu_factor_ex_check_errors_raises(shape, dtype):
     """Test that check_errors=True raises RuntimeError for singular matrices."""
     inp = _make_singular_input(shape, flag_gems.device, dtype)
 
-    with flag_gems.use_gems():
-        with pytest.raises(RuntimeError, match="lu_factor_ex"):
-            flag_gems.linalg_lu_factor_ex(inp, pivot=True, check_errors=True)
+    with pytest.raises(RuntimeError, match="lu_factor_ex"):
+        flag_gems.linalg_lu_factor_ex(inp, pivot=True, check_errors=True)
 
 
 @pytest.mark.linalg_lu_factor_ex_out
