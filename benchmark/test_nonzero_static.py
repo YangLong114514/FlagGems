@@ -19,8 +19,7 @@ import torch
 
 import flag_gems
 
-from . import base, consts
-from .conftest import Config
+from . import base
 
 VENDOR = flag_gems.vendor_name
 
@@ -130,6 +129,4 @@ def test_perf_nonzero_static():
         input_fn=_input_fn,
         dtypes=BENCH_DTYPES,
     )
-    if VENDOR == "ascend":
-        Config.mode = consts.BenchMode.OPERATOR
     bench.run()

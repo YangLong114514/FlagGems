@@ -20,10 +20,7 @@ import torch
 import flag_gems
 from flag_gems import det
 
-from . import base, consts
-from .conftest import Config
-
-VENDOR = flag_gems.vendor_name
+from . import base
 
 
 def _small_ops_det(A):
@@ -105,7 +102,5 @@ def test_det():
         torch_op=_torch_det,
         dtypes=DET_DTYPES,
     )
-    if VENDOR == "ascend":
-        Config.mode = consts.BenchMode.OPERATOR
     bench.set_gems(det)
     bench.run()

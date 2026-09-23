@@ -6,10 +6,7 @@ import torch
 import flag_gems
 from flag_gems import linalg_det, linalg_det_out
 
-from . import base, consts
-from .conftest import Config
-
-VENDOR = flag_gems.vendor_name
+from . import base
 
 
 def _small_ops_det(A):
@@ -93,8 +90,6 @@ def test_linalg_det():
         torch_op=_torch_det,
         dtypes=DET_DTYPES,
     )
-    if VENDOR == "ascend":
-        Config.mode = consts.BenchMode.OPERATOR
     bench.set_gems(linalg_det)
     bench.run()
 
@@ -117,7 +112,5 @@ def test_linalg_det_out():
         torch_op=_torch_det_out,
         dtypes=DET_DTYPES,
     )
-    if VENDOR == "ascend":
-        Config.mode = consts.BenchMode.OPERATOR
     bench.set_gems(linalg_det_out)
     bench.run()

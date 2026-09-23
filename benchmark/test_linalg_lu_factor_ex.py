@@ -5,8 +5,7 @@ import torch
 
 import flag_gems
 
-from . import base, consts
-from .conftest import Config
+from . import base
 
 DEVICE = flag_gems.device
 VENDOR = flag_gems.vendor_name
@@ -234,8 +233,6 @@ def test_linalg_lu_factor_ex():
         gems_op=flag_gems.linalg_lu_factor_ex,
         dtypes=_TEST_DTYPES,
     )
-    if VENDOR == "ascend":
-        Config.mode = consts.BenchMode.OPERATOR
     bench.run()
 
 
@@ -271,8 +268,6 @@ def test_linalg_lu_factor_ex_out():
         torch_op=_torch_lu_factor_ex,
         dtypes=_TEST_DTYPES,
     )
-    if VENDOR == "ascend":
-        Config.mode = consts.BenchMode.OPERATOR
     if VENDOR == "ascend":
         bench.gems_op = flag_gems.linalg_lu_factor_ex_out
     bench.run()
