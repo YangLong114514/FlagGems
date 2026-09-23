@@ -22,9 +22,6 @@ if DEVICE == "cuda":
 else:
     _PIVOT_VALUES = [True]
 
-if VENDOR == "ascend":
-    Config.mode = consts.BenchMode.OPERATOR
-
 # Use the same shapes as linalg_lu_factor for consistency
 LU_SHAPES = [
     (16, 16),
@@ -217,6 +214,8 @@ def test_linalg_lu():
         gems_op=flag_gems.linalg_lu,
         dtypes=_TEST_DTYPES,
     )
+    if VENDOR == "ascend":
+        Config.mode = consts.BenchMode.OPERATOR
     bench.run()
 
 
@@ -251,6 +250,8 @@ def test_linalg_lu_out():
         torch_op=_torch_lu,
         dtypes=_TEST_DTYPES,
     )
+    if VENDOR == "ascend":
+        Config.mode = consts.BenchMode.OPERATOR
     if VENDOR == "ascend":
         bench.gems_op = flag_gems.linalg_lu_out
     bench.run()

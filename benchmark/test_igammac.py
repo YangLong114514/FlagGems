@@ -23,10 +23,6 @@ from .conftest import Config
 
 VENDOR = flag_gems.vendor_name
 
-# On ascend the general KERNEL-mode do_bench_npu is unreliable; use operator
-# (end-to-end) timing mode (same as det/lu_factor/linalg_solve_triangular).
-if VENDOR == "ascend":
-    Config.mode = consts.BenchMode.OPERATOR
 
 _IGAMMAC_DTYPES = [
     torch.float32,
@@ -154,6 +150,10 @@ def test_igammac():
         input_fn=_igammac_input,
         dtypes=_IGAMMAC_DTYPES,
     )
+    # On ascend the general KERNEL-mode do_bench_npu is unreliable; use operator
+    # (end-to-end) timing mode (same as det/lu_factor/linalg_solve_triangular).
+    if VENDOR == "ascend":
+        Config.mode = consts.BenchMode.OPERATOR
     bench.run()
 
 
@@ -166,4 +166,8 @@ def test_igammac_out():
         input_fn=_igammac_input_out,
         dtypes=_IGAMMAC_DTYPES,
     )
+    # On ascend the general KERNEL-mode do_bench_npu is unreliable; use operator
+    # (end-to-end) timing mode (same as det/lu_factor/linalg_solve_triangular).
+    if VENDOR == "ascend":
+        Config.mode = consts.BenchMode.OPERATOR
     bench.run()

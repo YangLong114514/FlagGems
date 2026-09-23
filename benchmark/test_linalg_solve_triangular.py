@@ -22,11 +22,6 @@ from .conftest import Config
 
 VENDOR = flag_gems.vendor_name
 
-# On ascend the general KERNEL-mode do_bench_npu is unreliable; use the
-# operator (end-to-end) timing mode (same as det/lu_factor/cholesky_solve).
-if VENDOR == "ascend":
-    Config.mode = consts.BenchMode.OPERATOR
-
 SOLVE_TRI_SHAPES = [
     (8, 16),
     (16, 32),
@@ -131,6 +126,10 @@ def test_linalg_solve_triangular():
         gems_op=flag_gems.linalg_solve_triangular,
         dtypes=SOLVE_TRI_DTYPES,
     )
+    # On ascend the general KERNEL-mode do_bench_npu is unreliable; use the
+    # operator (end-to-end) timing mode (same as det/lu_factor/cholesky_solve).
+    if VENDOR == "ascend":
+        Config.mode = consts.BenchMode.OPERATOR
     bench.run()
 
 
@@ -156,4 +155,8 @@ def test_linalg_solve_triangular_out():
         gems_op=flag_gems.linalg_solve_triangular_out,
         dtypes=SOLVE_TRI_DTYPES,
     )
+    # On ascend the general KERNEL-mode do_bench_npu is unreliable; use the
+    # operator (end-to-end) timing mode (same as det/lu_factor/cholesky_solve).
+    if VENDOR == "ascend":
+        Config.mode = consts.BenchMode.OPERATOR
     bench.run()

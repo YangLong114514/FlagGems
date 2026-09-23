@@ -12,10 +12,6 @@ from .conftest import Config
 VENDOR = flag_gems.vendor_name
 
 
-if VENDOR == "ascend":
-    Config.mode = consts.BenchMode.OPERATOR
-
-
 def _small_ops_det(A):
     n = A.shape[-1]
     batch_shape = A.shape[:-2]
@@ -97,6 +93,8 @@ def test_linalg_det():
         torch_op=_torch_det,
         dtypes=DET_DTYPES,
     )
+    if VENDOR == "ascend":
+        Config.mode = consts.BenchMode.OPERATOR
     bench.set_gems(linalg_det)
     bench.run()
 
@@ -119,5 +117,7 @@ def test_linalg_det_out():
         torch_op=_torch_det_out,
         dtypes=DET_DTYPES,
     )
+    if VENDOR == "ascend":
+        Config.mode = consts.BenchMode.OPERATOR
     bench.set_gems(linalg_det_out)
     bench.run()
