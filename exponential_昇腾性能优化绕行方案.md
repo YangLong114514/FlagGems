@@ -1,6 +1,10 @@
 # exponential 昇腾性能绕行调查
 
 调查对象：本仓库的 out-of-place `exponential`。
+
+> 最新状态：第一轮候选的设备失败结果见 §8；第二轮复查与后续实验方向见 §9。
+> §1–7 保留首次调查记录，不能将其中的 CPU 验证或初始建议视为设备优化结论。
+
 本文的 0.3×、Philox 占比约 85% 和 CANN 缺陷数据来自用户描述及仓库的
 `matrix_rank_昇腾工具链缺陷与精度问题.md`，不是本轮重新测出的设备数据。
 
@@ -366,10 +370,304 @@ if __name__ == "__main__":
   24.69µs vs 16.48µs）——5 处 int↔fp32 向量转换的成本与整数乘法相当，
   9 次 fp 乘加 cast 不敌 4 次整型乘。fp32 通路的吞吐优势被转换开销抵消。
 
-### 8.3 最终判断
+### 8.3 第一轮设备验证后的判断（后续复查见 §9）
 
 两条候选路径均被设备实测证伪；§4 的两轮前缀特化预期收益微小，未再投入。
 philox 在该后端的瓶颈是整型向量指令吞吐，仓库内手段已穷尽，剩余空间在
 CANN 一侧（`mului_extended`/i64 muli/uint32 shrui 的 lowering 修复）。
 本次新发现的 uint32 右移缺陷已补入
 `matrix_rank_昇腾工具链缺陷与精度问题.md` 第三部分（§3.1 条目 5）。
+
+---
+
+## 9. 第二轮复查：测量、XOR、UB 与 DSA（2026-10-12）
+
+依据：已更新的仓库方案 §8、缺陷文档 §3.1，以及当前 exponential 源码。
+原合并 mulhilo 慢约 6%、FP32 分段慢约 1.6 倍，均接受设备实测结论。
+本轮没有 NPU 实测，未修改生产算子；以下保留既有设备结果，并区分源码线索与待验证假设。
+
+### 9.1 首先复核 0.3× 的分母和分子
+
+发现了三个可以相互印证的源码线索：
+
+1. `FlagGems/benchmark/test_exponential.py` 直接使用 GenericBenchmark；
+   `benchmark/base.py:337` 在 kernel 模式直接调用 `do_bench_npu`，没有本算子的
+   多任务聚合。
+2. 本地 `FlagTree/third_party/ascend/backend/testing.py:245` 的取样公式是
+   `func_idx*(num_warmup+num_active)+num_warmup+active_index`，每次调用只取
+   一行 `Duration(us)`。当一次调用生成多个 task 时，它取到的是其中一段
+   记录，而非完整调用的设备耗时。该 checkout 为 `8ee267ff7`（2026-07-15）；
+   **仍须核对目标机器实际安装的 testing.py，不能把本地版本直接当成目标版本。**
+3. 官方 op-plugin master 的 `ExponentialKernelNpuOpApi.cpp` 在 950 分支之外，
+   依次调用 uniform、neg、add、比较、masked_fill、log、mul。
+   这是公开版本证据，不是目标 torch_npu 2.10.0 二进制调用链的实测证明。
+   [官方源码](https://raw.githubusercontent.com/Ascend/op-plugin/master/op_plugin/ops/opapi/ExponentialKernelNpuOpApi.cpp)
+
+所以：目前不能排除 exponential 和 matrix_rank 命中了同一计时问题。
+先保留目标环境 profiler 原始数据，按一次调用聚合全部有效设备任务，明确
+AI Vector、DSA、数据搬运是否均被捕获。不要只统计单条 AI Core 记录。
+如果 DSA 没出现在当前 profiler 输出中，应补齐采集，不能把未采集计成零。
+不要直接切到 operator 模式代替此核查；目标仍是完整调用的设备时间。
+
+计时修正不会让候选比原来的单 kernel 更快；它只会重新确定“离原生还有多远”。
+在基线核实前，上一轮按 0.3× 推导出的 5.7 倍目标也只能视为条件估算。
+
+### 9.2 纯 Triton 优先新实验：XOR lowering
+
+`Philox 总耗时占 85%` 不等于 `mulhi 独占 85%`。原始分项是 Philox / log /
+store，没有提供 mulhi、普通乘法、XOR、shift/mask 的独立归因数据。
+当前每轮四次 XOR，十轮共四十次（优化前源码数）。
+
+官方 A2 Xor 是需要临时空间的高阶接口，支持 int16/uint16，并不是据此就能
+假定 Triton 的一个 uint32 `^` 对应一条低成本硬件指令。不过，Triton 究竟
+如何展开，必须检查目标 CANN 生成的低层 IR/汇编。
+[官方 Xor 文档](https://www.hiascend.com/doc_center/source/zh/canncommercial/80RC3/apiref/ascendcopapi/atlasascendc_api_07_0591.html)
+
+值得 A/B 的精确恒等式：
+
+```python
+def xor(a, b):
+    return (a | b) - (a & b)
+```
+
+每一位 OR 含有 AND 的所有置位，减法恰好去掉双方均为 1 的位；完整 32 位
+输出与 XOR 相同。先只替换 Philox 内的 XOR，保留原乘高、低位乘法和输出转换。
+若原 XOR 展开为 AND/OR/NOT/临时复制，可能减少操作或 UB 占用；若后端已经
+同样优化，或把该写法重新规范化成 XOR，则没有收益。不能仅数源码指令下结论。
+
+停损条件：最小 kernel 无收益，且完整 Philox 指令/UB 也未减少，就停止此方向。
+不要直接重写整个 RNG。
+
+### 9.3 编译调度方向：十轮展开及 UB 生命周期
+
+现有扫参覆盖了 BLOCK、UNROLL、num_warps，但不等于覆盖了循环结构和 UB 分配。
+源码用 `tl.static_range(10)` 全展开；BLOCK=2048 的 UB overflow 也值得单独归因。
+可保持算术完全不变，对比：
+
+- 十轮全展开；
+- `tl.range(0, 10)` 动态十轮；
+- 五次动态循环 × 两轮静态展开。
+
+再分别对比 `multibuffer=False`、`enable_ubuf_saving=True`。本地 FlagTree
+`third_party/ascend/backend/compiler.py:337` 暴露了这两个选项；以目标环境支持
+的参数为准。这种无输入张量、以连续计算为主的 kernel，自动多缓冲不一定获益。
+
+观察 UB 分配、临时复制、同步和每个向量操作的 repeat 利用率；只有确认 UB
+下降后才试 BLOCK=2048/4096。动态循环可能增加开销或触发新编译问题，前述
+文档已经提示过循环携带张量风险，因此这只是受控实验，不是默认改法。
+若不同源码生成相同指令，或硬件向量流水线确实已饱和，则不继续扫。
+
+### 9.4 小幅算术备选：主动使用有符号右移
+
+新右移缺陷说明不能删除既有无符号算法的掩码，但可以换成数学上就需要
+算术右移的表达式。见 `round2_candidates.py:mulhi_signed_limbs`：
+
+```
+0xD2511F53 - 2^32 = 8019 + (-11695)*2^16
+0xCD9E8D57 - 2^32 = -29353 + (-12897)*2^16
+```
+
+输入两段仍为 0..65535，用 int32 计算带符号的部分积与进位。
+对这两个常数，全部中间值都在 int32 范围内。中间三个 `>>16` 的符号填充
+是算法所需，最后加回输入 a 恢复无符号乘高。输入高半字提取处的掩码仍保留。
+低位保持原来的单次乘法，避免重走已失败的 shift/or 重建路线。
+
+相对原版大致减少三个中间掩码，增加一次加法，预期只能是小优化，优先级低于
+XOR 和完整基线复核。所有有符号/无符号 bitcast 与负常数乘法仍须设备逐位验证。
+
+CPU 验证直接执行候选函数体（替换 Triton cast 为 NumPy view/cast）：
+
+- XOR：2,000,000 组逐位一致；
+- signed-limb mulhi：5,572,864 组逐位一致；
+- 两者组合的完整 Philox10：262,144 组四字 counter，四个输出全部逐位一致。
+
+命令：`python verify_round2_cpu.py`。此结果只验证算术，不是目标编译器正确性
+或性能证据；不能据此合入。
+
+### 9.5 若允许混合后端：DSA uniform + 一个 Triton 变换
+
+本地工作区中的 CANN 参考仓库（不在本仓库内）提供以下硬件路径线索：
+
+- `reference/cann-ops-math/random/dsa_random_uniform/op_host/op_api/aclnn_uniform.cpp:215`
+  的 DAV_2201 分支调用 DSARandomUniform；
+- 同目录 `dsa_random_uniform.cpp` 使用 `ADD_TO_LAUNCHER_LIST_DSA` 发射，
+  并不是普通的 AI Vector Philox kernel。
+
+设备若确认走该分支，可让原生 uniform 使用 DSA，再把 neg/add/边界处理/log/
+scale 融合成一个 Triton kernel。这将直接替换最贵的 RNG 阶段，而不是再省几条
+整数指令。代价是中间 uniform 张量的 GM 写读及至少两个设备任务。
+
+这不是“纯 Triton Philox 优化”：它需要项目允许使用原生 RNG/混合后端，并重新
+界定随机流语义。若要求当前 FlagGems Philox 输出与状态推进逐位不变，不能
+直接替换。若目标是对齐 native，则应由原生 generator 推进一次，避免 helper
+和 uniform 双重推进；也要处理 FlagGems dispatch 递归。
+
+特别注意 fp16/bf16 的逐步舍入、uniform 端点、正输出处理及 log 的输入精度。
+把全部变换直接改为 fp32 一次舍入，不自动等价于原生逐算子低精度路径。
+混合路径的性能必须按全部 task 计入，不可只测最后一个 Triton kernel。
+
+### 9.6 建议执行顺序
+
+先核实真实 baseline → XOR 最小实验 → 循环/UB 对照 → signed-limb 小实验。
+若允许混合后端，优先单独量 DSA uniform 的完整设备代价，再决定是否实现融合变换。
+目前没有证据支持“仓库内所有手段已穷尽”，但也没有证据能保证上述候选突破 1×。
+
+### 9.7 第二轮候选及 CPU 验证程序
+
+将下列两个代码块分别保存为同一目录中的 `round2_candidates.py` 和
+`verify_round2_cpu.py`，同时保存前述附录中的 `verify_cpu.py`（本轮复用其中的
+精确整数参考函数），安装 NumPy 后运行 `python verify_round2_cpu.py`。
+无需 Triton 即可做 CPU 算术检查；设备编译和性能测试仍须另行完成。
+
+**round2_candidates.py**
+
+```python
+"""Untested on Ascend: preserve Philox bits, change signed/boolean arithmetic.
+
+Keep the original low32 multiply and ten-round schedule when testing these.
+"""
+
+import triton
+import triton.language as tl
+
+
+@triton.jit
+def xor_via_or_and_sub(a, b):
+    return (a | b) - (a & b)
+
+
+@triton.jit
+def mulhi_signed_limbs(a, B: tl.constexpr):
+    tl.static_assert(B == 0xD2511F53 or B == 0xCD9E8D57)
+    # a1 remains the NONNEGATIVE upper half-word, despite signed shifts.
+    ai = a.to(tl.int32, bitcast=True)
+    a0 = ai & 0xFFFF
+    a1 = (ai >> 16) & 0xFFFF
+    if B == 0xD2511F53:
+        b0: tl.constexpr = 8019
+        b1: tl.constexpr = -11695
+    else:
+        b0: tl.constexpr = -29353
+        b1: tl.constexpr = -12897
+    # B - 2**32 = b0 + 2**16 * b1.
+    # All products, t, w1 and hs fit SIGNED int32 for these two constants.
+    # These are deliberate arithmetic shifts, not broken unsigned shifts.
+    w0 = a0 * b0
+    t = a1 * b0 + (w0 >> 16)
+    w1 = a0 * b1 + (t & 0xFFFF)
+    hs = a1 * b1 + (t >> 16) + (w1 >> 16)
+    return hs.to(tl.uint32, bitcast=True) + a
+```
+
+**verify_round2_cpu.py**
+
+```python
+"""CPU arithmetic check only; no Ascend lowering or timing validation."""
+
+import ast
+import json
+from pathlib import Path
+
+import numpy as np
+
+from verify_cpu import reference
+
+
+class Translate(ast.NodeTransformer):
+    def visit_FunctionDef(self, node):
+        node.decorator_list = []
+        for arg in node.args.args:
+            arg.annotation = None
+        return self.generic_visit(node)
+
+    def visit_AnnAssign(self, node):
+        return self.visit(ast.Assign(targets=[node.target], value=node.value))
+
+    def visit_Expr(self, node):
+        if (isinstance(node.value, ast.Call)
+            and isinstance(node.value.func, ast.Attribute)
+            and node.value.func.attr == 'static_assert'):
+            return ast.Pass()
+        return self.generic_visit(node)
+
+    def visit_Call(self, node):
+        node = self.generic_visit(node)
+        if isinstance(node.func, ast.Attribute) and node.func.attr == 'to':
+            bitcast = any(k.arg == 'bitcast' and k.value.value for k in node.keywords)
+            node.func.attr = 'view' if bitcast else 'astype'
+            node.keywords = []
+        return node
+
+    def visit_Attribute(self, node):
+        if isinstance(node.value, ast.Name) and node.value.id == 'tl':
+            node.value.id = 'np'
+        return self.generic_visit(node)
+
+
+def main():
+    path = Path(__file__).with_name('round2_candidates.py')
+    tree = ast.parse(path.read_text())
+    tree.body = [n for n in tree.body if isinstance(n, ast.FunctionDef)]
+    scope = {'np': np}
+    exec(compile(ast.fix_missing_locations(Translate().visit(tree)), str(path), 'exec'), scope)
+    mulhi = scope['mulhi_signed_limbs']
+    xor = scope['xor_via_or_and_sub']
+    rng = np.random.default_rng(42)
+    a = rng.integers(0, 2**32, 2_000_000, dtype=np.uint32)
+    b = rng.integers(0, 2**32, a.size, dtype=np.uint32)
+    np.testing.assert_array_equal(xor(a, b), a ^ b)
+    ramp = np.arange(65536, dtype=np.uint32)
+    inputs = [a]
+    for fixed in (0, 1, 0x7FFF, 0x8000, 0xFFFE, 0xFFFF):
+        inputs.extend([(ramp << 16) | fixed, ramp | (fixed << 16)])
+    for constant in (0xD2511F53, 0xCD9E8D57):
+        for values in inputs:
+            got = mulhi(values, constant)
+            assert got.dtype == np.uint32
+            np.testing.assert_array_equal(got, reference(values, constant)[0])
+    # Exercise both new helpers together across the full ten-round recurrence.
+    for seed in (0, 1, 0x8000000000000000, 0xFFFFFFFFFFFFFFFF):
+        original = [rng.integers(0, 2**32, 65536, dtype=np.uint32) for _ in range(4)]
+        actual = [x.copy() for x in original]
+        k0, k1 = seed & 0xFFFFFFFF, seed >> 32
+        for _ in range(10):
+            for state, candidate in ((original, False), (actual, True)):
+                hi0, lo0 = reference(state[0], 0xD2511F53)
+                hi1, lo1 = reference(state[2], 0xCD9E8D57)
+                if candidate:
+                    hi0 = mulhi(state[0], 0xD2511F53)
+                    hi1 = mulhi(state[2], 0xCD9E8D57)
+                    n0 = xor(xor(hi1, state[1]), np.uint32(k0))
+                    n2 = xor(xor(hi0, state[3]), np.uint32(k1))
+                else:
+                    n0 = hi1 ^ state[1] ^ k0
+                    n2 = hi0 ^ state[3] ^ k1
+                state[:] = [n0, lo1, n2, lo0]
+            k0 = (k0 + 0x9E3779B9) & 0xFFFFFFFF
+            k1 = (k1 + 0xBB67AE85) & 0xFFFFFFFF
+        for got, want in zip(actual, original):
+            np.testing.assert_array_equal(got, want)
+    print(json.dumps({
+        'validation': 'CPU arithmetic only; no NPU performance claim',
+        'xor_pairs': a.size,
+        'mulhi_pairs': sum(x.size for x in inputs) * 2,
+        'philox_10_round_counters': 65536 * 4,
+        'result': 'bitwise_equal',
+    }, indent=2))
+
+
+if __name__ == '__main__':
+    main()
+```
+
+### 9.8 第二轮 CPU 验证输出
+
+```json
+{
+  "validation": "CPU arithmetic only; no NPU performance claim",
+  "xor_pairs": 2000000,
+  "mulhi_pairs": 5572864,
+  "philox_10_round_counters": 262144,
+  "result": "bitwise_equal"
+}
+```
