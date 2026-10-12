@@ -3,6 +3,9 @@
 > 本文是 `matrix_rank_昇腾算子实现报告.md` 的专项提炼,聚焦两类问题:
 > **(一) 编译器/工具链缺陷** 与 **(二) 精度问题**。所有条目都在昇腾 910B
 > 真机上以最小复现确认过,并附规避方法与当前状态。
+> 第三部分补充了 exponential 与 cholesky_solve 两个算子在 CANN 9.0.0
+> 环境命中的工具链缺陷(整数 mulhi 无可靠通路、bishengir-compile 段错误),
+> 定责结论:flagtree 生成的 IR 正确,缺陷均在 CANN bishengir-compile 一侧。
 >
 > 环境:
 > - 原始开发/性能环境:昇腾 910B4(20 AI Core × 2 Vector = 40 Vector 核,
@@ -309,6 +312,102 @@ store、改一个 batch 索引方式,故障就在不同 shape/常数之间漂移
   不一致——不是后端缺陷,保留在扫描允许清单中。
 - **fp64 输入**:fp32-only 后端,所有 shape dispatch 之前 fail-fast(先校验
   dtype 再做尺度归一化——归一化的位掩码是 fp32-only 操作)。
+
+---
+
+# 三、exponential / cholesky_solve 补充缺陷(CANN 9.0.0 环境)
+
+> 本节条目来自另外两个算子的开发实践:**exponential**(指数分布随机采样,
+> 命中整数乘高缺陷)与 **cholesky_solve**(Cholesky 求解,命中编译器段错误)。
+> 环境:昇腾 910B4,CANN 9.0.0,flagtree 0.7.0+ascend3.5(triton 3.5.1),
+> torch 2.10.0+cpu / torch_npu 2.10.0。
+> 所有条目均对照 flagtree ttadapter 生成的 Linalg MLIR 定过责:**IR 语义
+> 全部正确,缺陷均在 CANN bishengir-compile 一侧**(flagtree 无 lowering
+> 错误,仅缺规避逻辑)。
+
+## 3.1 exponential 命中:整数 mulhi 无可靠硬件通路
+
+exponential 用 philox4x32-10 生成均匀随机数(与 torch 随机流对齐),philox
+的核心是 32 位无符号乘高(mulhi),实测占 kernel 纯设备时间约 85%(1G fp32:
+philox ~80ms / log 变换 ~10ms / 存储 ~5ms)。下面三条替代路径全部被工具链
+堵死,只能维持 16 位分段软件实现(~15 条整型指令/mulhi),这是该算子大
+shape 只有原生 1/3.6 速度的直接原因。
+
+### 1. `tl.umulhi` 被编译成有符号 mulhi,且慢 60 倍
+
+- **现象**:`tl.umulhi(a, b)` 编译通过但返回**有符号**乘高:
+  `umulhi(0xffffffff, 0xffffffff)` 返回 0(正确值 0xfffffffe),
+  `umulhi(1, 0xffffffff)` 返回 0xffffffff(正确值 0)——恰为有符号
+  (-1)×(-1) 的高位。加符号修正(`hi += (a<0 ? b : 0) + (b<0 ? a : 0)`,
+  1M 随机值验证全对)后结果正确,但**性能从 85ms 劣化到 5408ms(60 倍)**,
+  lowering 走了灾难性慢路径。
+- **定责**:dump ttadapter 输出,flagtree 正确生成 `arith.mului_extended`
+  (无符号扩展乘);错误的符号语义与慢路径均在 CANN bishengir-compile 一侧。
+- **规避**:维持 `exponential.py` 的 `_mulhi_u32_limb` 16 位分段实现
+  (4 次 32 位乘 + 移位/加法)。
+
+### 2. uint64 乘法高位同样按有符号执行,同样慢 60 倍
+
+- **现象**:作为 mulhi 替代路径,`(a.to(u64) * b.to(u64)) >> 32` 的结果
+  仍是有符号乘高的值,且同样慢 60 倍。
+- **定责**:flagtree 生成的 IR 完全正确(`arith.extui` + `arith.muli i64`
+  + `arith.shrui`);CANN 对 i64 muli 的 lowering 符号错误且极慢。
+- **注意(Triton 语言规范,非缺陷)**:整型扩展按**源类型**符号性决定
+  (`semantic.py` 中 `sign_extend = src.is_int_signed()`),int32→uint64 是
+  符号扩展;要零扩展必须先 bitcast 到 uint32 再转 uint64。
+- **结论**:与 §1.4-15 的 fp64 不可用同一代际特征——**昇腾后端 64 位
+  整数乘同样不可用**。
+
+### 3. int32→f64 向量 cast 不支持(编译失败)
+
+- **现象**:第三条 mulhi 路径(f64 尾数 53 位可精确容纳 16 位分段乘的
+  全部中间值)编译即失败:`'hivm.hir.vcast' op currently don't support cast
+  int32_t_to_double_rintmode`;uint32→f64 同样不支持。
+- **结论**:整数→f64 的任何向量通路都不存在,hivm vcast 只覆盖有限类型对。
+
+### 4. philox 是吞吐瓶颈,ILP 与调参均无效(性能行为类)
+
+- 双流 ILP(两条独立 philox 链交错隐藏串行依赖)反而**慢 2 倍**(N=4096:
+  26.7µs vs 14.5µs;1G: 166ms vs 85ms)——瓶颈是整型向量指令吞吐,不是
+  延迟,加并行流只增加指令数。
+- 配置空间已扫完:BLOCK∈{128..1024} × UNROLL∈{1,2,4} × num_warps∈{1..16}
+  在大 N 下全部等价(85.14~85.15ms),**num_warps 在该后端无实际影响**;
+  BLOCK=2048 触发 UB overflow。
+- 小 N(4096)有 ~16.4µs 固定设备开销(同签名空 kernel 仅 0.8µs),grid
+  从 1 加到 32 无变化——philox 串行链的单核延迟地板。
+- **残余方向(未采用)**:减少 philox 轮数会破坏与 torch 的随机流一致性
+  (`philox_backend_seed_offset` 语义),属语义变更,需 maintainer 决策。
+
+## 3.2 cholesky_solve 命中:bishengir-compile 段错误
+
+### 5. `--enable-auto-bind-sub-block=True` 下 bishengir-compile SIGSEGV
+
+- **现象**:`cholesky_solve_ub_blocked_kernel` 在 FlagGems 代码更新后
+  (kernel IR 中 `tl.sum` 从内联变为 `triton/spec/ascend/language/standard.py`
+  的显式调用)必现编译期段错误:
+  `subprocess.CalledProcessError: ... bishengir-compile ... died with
+  <Signals.SIGSEGV: 11>`,stage 为 ConvertLinalgIRToBinary。
+- **定位**:dump 出的 kernel MLIR 独立喂给 `bishengir-compile` 稳定复现;
+  同一 MLIR 仅把 `--enable-auto-bind-sub-block` 改为 False 即编译通过——
+  触发点是编译器内部的子块绑定 pass,不是 IR 本身非法。
+- **规避**:launch 时传 `enable_auto_bind_sub_block=False`,并按 PR 评审
+  意见用 `torch_npu.utils.get_cann_version(module="CANN")` 做版本门控
+  (仅 CANN 9.0.0 禁用,其他版本保持编译器默认;检测失败保守禁用)。
+  实测性能影响可忽略((64,8): 0.198ms vs 0.190ms)。
+- **教训**:与 §1.6 的代际结论一致——任何环境/代码代际变化后编译稳定性
+  结论都要重测;编译器 workaround 参数一律带 CANN 版本判断,不要把
+  workaround 无差别地施加到未受影响的环境。
+
+## 3.3 测量口径备忘(重要)
+
+- `do_bench_npu`(KERNEL 模式)测的是**纯设备 kernel 时间**(mspti/
+  profiler 抓取),host 开销完全不进指标;`--mode operator` 是墙钟+sync。
+  两者结论可以相反:exponential 在 kernel 模式 speedup 0.36(philox 设备
+  时间的真实差距),operator 模式 0.97(原生 aten 的 host 调度开销计入后,
+  gems 单 kernel 形态反而占优,大 shape fp32 达 1.6~1.75×)。**报性能数据
+  必须注明口径**;两个模式的 speedup 差异本身就是"host 开销占比"的度量。
+- 同 signature 空 kernel 设备时间 ~0.8µs(910B4),可作为 kernel 启动地板
+  的基准值。
 
 ---
 
