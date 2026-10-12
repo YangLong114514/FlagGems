@@ -378,9 +378,25 @@ shape 只有原生 1/3.6 速度的直接原因。
 - **残余方向(未采用)**:减少 philox 轮数会破坏与 torch 的随机流一致性
   (`philox_backend_seed_offset` 语义),属语义变更,需 maintainer 决策。
 
+### 5. uint32 逻辑右移被编译成算术右移(符号填充高位)
+
+- **现象**:uint32 张量的 `>>` 全部按**算术**右移执行——符号位置 1 的
+  输入高位被 0xffff 填充。最小复现:`0x80000000 >> 16` 得 0xffff8000
+  (应为 0x00008000),`0xffffffff >> 16` 得 0xffffffff(应为 0x0000ffff);
+  符号位为 0 的输入结果正确;int32 的算术右移本身正常。
+- **命中场景**:`exponential_昇腾性能优化绕行方案.md` 的合并 mulhilo
+  候选按数学推导删掉了 limb 分解里"冗余"的 `& 0xFFFF` 掩码,CPU(numpy)
+  逐位验证全对,但设备结果错——numpy 的 uint32 右移是正常逻辑移位,
+  这类后端误编译只有上设备才能暴露。
+- **规避**:**uint32 右移后必须紧跟 `&` 掩码清高位**。生产
+  `_mulhi_u32_limb` 里每个 `>>` 后的 `& 0xFFFF` 不是冗余,是承重墙,
+  不得删除。
+- **教训**:所有"逻辑上冗余"的整型掩码/截断,在该后端都应默认视为
+  对移位/扩展类 lowering 缺陷的补偿,删除前必须设备重验。
+
 ## 3.2 cholesky_solve 命中:bishengir-compile 段错误
 
-### 5. `--enable-auto-bind-sub-block=True` 下 bishengir-compile SIGSEGV
+### 6. `--enable-auto-bind-sub-block=True` 下 bishengir-compile SIGSEGV
 
 - **现象**:`cholesky_solve_ub_blocked_kernel` 在 FlagGems 代码更新后
   (kernel IR 中 `tl.sum` 从内联变为 `triton/spec/ascend/language/standard.py`
