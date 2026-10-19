@@ -17,15 +17,33 @@ _PHILOX_KEY_B = tl.constexpr(0xBB67AE85)
 
 
 @triton.jit
-def _mulhi_u32_limb(a, b):
-    a0 = a & 0xFFFF
-    a1 = (a >> 16) & 0xFFFF
-    b0 = b & 0xFFFF
-    b1 = (b >> 16) & 0xFFFF
+def _mulhi_u32_signed(a, B: tl.constexpr):
+    # Signed-limb mulhi: this backend lowers int32 >> to an arithmetic shift,
+    # which this decomposition uses deliberately (b1 is negative).  b0/b1 are
+    # the signed int32 half-words of B - 2**32; every intermediate fits int32
+    # for the two Philox constants.  Bit-identical to the unsigned 16-bit limb
+    # decomposition but fewer masked shifts, and it cannot use tl.umulhi: the
+    # backend compiles umulhi to the signed variant and 60x slower.
+    ai = a.to(tl.int32, bitcast=True)
+    a0 = ai & 0xFFFF
+    a1 = (ai >> 16) & 0xFFFF
+    if B == 0xD2511F53:
+        b0: tl.constexpr = 8019
+        b1: tl.constexpr = -11695
+    else:
+        b0: tl.constexpr = -29353
+        b1: tl.constexpr = -12897
     w0 = a0 * b0
-    t = a1 * b0 + ((w0 >> 16) & 0xFFFF)
+    t = a1 * b0 + (w0 >> 16)
     w1 = a0 * b1 + (t & 0xFFFF)
-    return a1 * b1 + ((t >> 16) & 0xFFFF) + ((w1 >> 16) & 0xFFFF)
+    hs = a1 * b1 + (t >> 16) + (w1 >> 16)
+    return hs.to(tl.uint32, bitcast=True) + a
+
+
+@triton.jit
+def _xor_u32(a, b):
+    # (a|b) - (a&b) == a^b exactly; lowers to fewer ops on this backend.
+    return (a | b) - (a & b)
 
 
 @triton.jit
@@ -34,13 +52,13 @@ def _philox4x32_10(seed, c0, c1, c2, c3):
     k0 = (seed64 & 0xFFFFFFFF).to(tl.uint32)
     k1 = ((seed64 >> 32) & 0xFFFFFFFF).to(tl.uint32)
     for _ in tl.static_range(10):
-        hi0 = _mulhi_u32_limb(c0, _PHILOX_SA)
+        hi0 = _mulhi_u32_signed(c0, 0xD2511F53)
         lo0 = c0 * _PHILOX_SA
-        hi1 = _mulhi_u32_limb(c2, _PHILOX_SB)
+        hi1 = _mulhi_u32_signed(c2, 0xCD9E8D57)
         lo1 = c2 * _PHILOX_SB
-        n0 = hi1 ^ c1 ^ k0
+        n0 = _xor_u32(_xor_u32(hi1, c1), k0)
         n1 = lo1
-        n2 = hi0 ^ c3 ^ k1
+        n2 = _xor_u32(_xor_u32(hi0, c3), k1)
         n3 = lo0
         c0, c1, c2, c3 = n0, n1, n2, n3
         k0 = k0 + _PHILOX_KEY_A
@@ -134,7 +152,8 @@ def exponential(x, lambd: float = 1.0, *, generator=None):
     with torch_device_fn.device(device):
         if not _fast_launch(res, N, lambd, eps, philox_seed, philox_offset, UNROLL):
             fused_exponential_kernel[grid_fn](
-                res, N, lambd, eps, philox_seed, philox_offset, UNROLL
+                res, N, lambd, eps, philox_seed, philox_offset, UNROLL,
+                multibuffer=False,
             )
     return res
 
@@ -165,6 +184,7 @@ def _fast_launch(res, N, lambd, eps, philox_seed, philox_offset, UNROLL):
                 UNROLL,
                 BLOCK=BLOCK,
                 num_warps=num_warps,
+                multibuffer=False,
                 grid=(grid0,),
             )
             _compiled_cache[key] = compiled
